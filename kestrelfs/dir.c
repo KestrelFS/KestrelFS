@@ -20,6 +20,10 @@
  * Helper: synchronously send an IPC request and wait for response.
  * Returns 0 on success with response event copied to *resp_out.
  * Returns negative errno on timeout/error.
+ *
+ * Timeout: 2 seconds (reduced from 10s to avoid hanging umount).
+ * Interruptible: returns -EINTR if interrupted by signal (e.g., Ctrl+C).
+ * Fast-fail: returns -EIO immediately if daemon is not attached.
  */
 static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
 				   struct kestrelfs_event *resp_out)
@@ -28,14 +32,26 @@ static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
 	int ret;
 	int i;
 
+	/* Fast-fail if daemon is not attached */
+	if (!kestrelfs_is_daemon_alive()) {
+		pr_err("kestrelfs: IPC failed - daemon not attached\n");
+		return -EIO;
+	}
+
 	ret = kestrelfs_req_push(req->opcode, req->flags, req->payload, &req_id);
 	if (ret) {
 		pr_err("kestrelfs: failed to push IPC request: %d\n", ret);
 		return ret;
 	}
 
-	/* Poll for response with timeout (10 seconds = 10000 iterations) */
-	for (i = 0; i < 10000; i++) {
+	/* Poll for response with timeout (2 seconds = 2000 iterations) */
+	for (i = 0; i < 2000; i++) {
+		/* Check if daemon disconnected during wait */
+		if (!kestrelfs_is_daemon_alive()) {
+			pr_err("kestrelfs: daemon detached while waiting for req_id %llu\n", req_id);
+			return -EIO;
+		}
+
 		ret = kestrelfs_check_resp(req_id, resp_out);
 		if (ret == 0) {
 			/* Got our response */
@@ -53,11 +69,18 @@ static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
 
 		/* No response yet, wait for daemon notification */
 		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(1));
-		if (ret == -ERESTARTSYS)
+		if (ret == -ERESTARTSYS) {
+			/* Interrupted by signal (Ctrl+C, umount, etc.) */
+			pr_info("kestrelfs: IPC call interrupted for req_id %llu\n", req_id);
 			return -EINTR;
+		}
+		if (ret == -ETIME) {
+			/* 1ms timeout expired, continue polling */
+			continue;
+		}
 	}
 
-	pr_err("kestrelfs: IPC timeout waiting for req_id %llu\n", req_id);
+	pr_err("kestrelfs: IPC timeout waiting for req_id %llu (daemon dead?)\n", req_id);
 	return -ETIMEDOUT;
 }
 

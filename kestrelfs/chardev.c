@@ -75,6 +75,7 @@ struct kestrelfs_shm {
 	wait_queue_head_t		req_wq;
 	wait_queue_head_t		resp_wq;
 	atomic_t			resp_generation;
+	atomic_t			daemon_alive;  /* 1 if daemon attached, 0 if detached */
 };
 
 static struct kestrelfs_shm kestrelfs_shm = {
@@ -210,6 +211,18 @@ long kestrelfs_wait_for_resp(long timeout_jiffies)
 EXPORT_SYMBOL_GPL(kestrelfs_wait_for_resp);
 
 /*
+ * kestrelfs_is_daemon_alive() - check if daemon is currently attached.
+ *
+ * Returns 1 if daemon has /dev/kestrel_ctl open, 0 otherwise.
+ * Used by IPC sync helpers to fail fast when daemon has disconnected.
+ */
+int kestrelfs_is_daemon_alive(void)
+{
+	return atomic_read(&kestrelfs_shm.daemon_alive);
+}
+EXPORT_SYMBOL_GPL(kestrelfs_is_daemon_alive);
+
+/*
  * kestrelfs_open() - fops->open for /dev/kestrel_ctl.
  *
  * The shared region is now allocated eagerly at module load time
@@ -224,8 +237,10 @@ static int kestrelfs_open(struct inode *inode, struct file *file)
 {
 	mutex_lock(&kestrelfs_shm.lock);
 	kestrelfs_shm.refcount++;
+	atomic_set(&kestrelfs_shm.daemon_alive, 1);  /* Daemon attached */
 	mutex_unlock(&kestrelfs_shm.lock);
 
+	pr_info("kestrelfs: daemon attached (refcount=%d)\n", kestrelfs_shm.refcount);
 	return 0;
 }
 
@@ -237,12 +252,25 @@ static int kestrelfs_open(struct inode *inode, struct file *file)
  * daemon restarts and is only ever released at module unload, which
  * keeps this path free of use-after-free risk against any stray
  * mapping.
+ *
+ * IMPORTANT: When the daemon disconnects, we mark daemon_alive=0 and
+ * wake all waiting VFS threads to prevent hanging umount.
  */
 static int kestrelfs_release(struct inode *inode, struct file *file)
 {
 	mutex_lock(&kestrelfs_shm.lock);
 	if (kestrelfs_shm.refcount > 0)
 		kestrelfs_shm.refcount--;
+	
+	/* Mark daemon as dead if last fd closed */
+	if (kestrelfs_shm.refcount == 0) {
+		atomic_set(&kestrelfs_shm.daemon_alive, 0);
+		pr_warn("kestrelfs: daemon detached, waking all waiters\n");
+		
+		/* Wake all threads waiting for responses (prevent hanging umount) */
+		atomic_inc(&kestrelfs_shm.resp_generation);
+		wake_up_interruptible_all(&kestrelfs_shm.resp_wq);
+	}
 	mutex_unlock(&kestrelfs_shm.lock);
 
 	return 0;
@@ -422,6 +450,7 @@ int kestrelfs_chardev_init(void)
 	init_waitqueue_head(&kestrelfs_shm.req_wq);
 	init_waitqueue_head(&kestrelfs_shm.resp_wq);
 	atomic_set(&kestrelfs_shm.resp_generation, 0);
+	atomic_set(&kestrelfs_shm.daemon_alive, 0);  /* No daemon initially */
 
 	ret = kestrelfs_shm_alloc();
 	if (ret)

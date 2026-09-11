@@ -82,6 +82,7 @@ void kestrelfs_chardev_exit(void);
 struct kestrelfs_shared_region *kestrelfs_shm_region(void);
 void kestrelfs_wake_req_waiters(void);
 long kestrelfs_wait_for_resp(long timeout_jiffies);
+int kestrelfs_is_daemon_alive(void);
 
 /*
  * ipc_ring.c: lock-free-consumer ring buffer push/pop primitives.
