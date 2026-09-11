@@ -1,0 +1,22 @@
+# Kernel module build artifacts (out-of-tree module builds, see kestrelfs/Makefile)
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+.module-common.o.cmd
+.*.cmd
+*.symvers
+*.order
+
+# Compiled test binaries (rebuild via gcc from the corresponding .c)
+kestrelfs/chardev_test
+
+# Rust build artifacts (for later phases)
+target/
+Cargo.lock
