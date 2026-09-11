@@ -67,33 +67,6 @@ const struct super_operations kestrelfs_super_ops = {
 };
 
 /*
- * kestrelfs_inode_test() - test callback for iget5_locked.
- * @inode: candidate inode from cache
- * @opaque: our search key (u64 *ino)
- *
- * Returns 1 if @inode matches the requested inode number.
- */
-static int kestrelfs_inode_test(struct inode *inode, void *opaque)
-{
-	u64 *ino = opaque;
-	return inode->i_ino == *ino;
-}
-
-/*
- * kestrelfs_inode_set() - set callback for iget5_locked.
- * @inode: newly allocated inode
- * @opaque: our search key (u64 *ino)
- *
- * Called when iget5_locked creates a new inode. We set i_ino here.
- */
-static int kestrelfs_inode_set(struct inode *inode, void *opaque)
-{
-	u64 *ino = opaque;
-	inode->i_ino = *ino;
-	return 0;
-}
-
-/*
  * kestrelfs_get_inode() - fetch or create an inode with given attributes.
  * @sb:		superblock
  * @ino:	inode number
@@ -101,8 +74,12 @@ static int kestrelfs_inode_set(struct inode *inode, void *opaque)
  * @size:	file size in bytes
  *
  * Used by dir.c's lookup/create handlers to instantiate inodes dynamically.
- * Uses iget5_locked() to cache inodes by i_ino, preventing multiple kernel
- * inodes for the same daemon inode (critical for correct umount refcounting).
+ * 
+ * NOTE: We use new_inode() instead of iget5_locked() because:
+ * 1. Daemon is the authoritative metadata store (no persistent inode cache needed)
+ * 2. VFS dentry cache already prevents duplicate lookups for the same path
+ * 3. iget5_locked() adds complexity and potential race conditions during evict
+ * 4. Each lookup creates a fresh inode, but dentry cache ensures path uniqueness
  *
  * Return: pointer to inode on success, ERR_PTR(-errno) on failure.
  */
@@ -111,41 +88,33 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 {
 	struct inode *inode;
 
-	/* Try to fetch cached inode, or allocate new one */
-	inode = iget5_locked(sb, ino, kestrelfs_inode_test, kestrelfs_inode_set, &ino);
+	inode = new_inode(sb);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 
-	/* If inode is new (I_NEW flag set), initialize it */
-	if (inode->i_state & I_NEW) {
-		inode->i_mode = mode;
-		inode->i_uid = GLOBAL_ROOT_UID;
-		inode->i_gid = GLOBAL_ROOT_GID;
-		inode->i_size = size;
-		inode_set_atime_to_ts(inode, current_time(inode));
-		inode_set_mtime_to_ts(inode, current_time(inode));
-		inode_set_ctime_to_ts(inode, current_time(inode));
+	inode->i_ino = ino;
+	inode->i_mode = mode;
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
+	inode->i_size = size;
+	inode_set_atime_to_ts(inode, current_time(inode));
+	inode_set_mtime_to_ts(inode, current_time(inode));
+	inode_set_ctime_to_ts(inode, current_time(inode));
 
-		if (S_ISDIR(mode)) {
-			/* Directory */
-			inode->i_op = &kestrelfs_dir_inode_operations;
-			inode->i_fop = &kestrelfs_dir_file_operations;
-			set_nlink(inode, 2);
-		} else if (S_ISREG(mode)) {
-			/* Regular file */
-			inode->i_op = &kestrelfs_reg_inode_ops;
-			inode->i_fop = &kestrelfs_reg_file_ops;
-			set_nlink(inode, 1);
-		} else {
-			/* Unsupported file type */
-			iget_failed(inode);
-			return ERR_PTR(-EINVAL);
-		}
-
-		unlock_new_inode(inode);
+	if (S_ISDIR(mode)) {
+		/* Directory */
+		inode->i_op = &kestrelfs_dir_inode_operations;
+		inode->i_fop = &kestrelfs_dir_file_operations;
+		set_nlink(inode, 2);
+	} else if (S_ISREG(mode)) {
+		/* Regular file */
+		inode->i_op = &kestrelfs_reg_inode_ops;
+		inode->i_fop = &kestrelfs_reg_file_ops;
+		set_nlink(inode, 1);
 	} else {
-		/* Inode exists in cache, update size (may have changed) */
-		i_size_write(inode, size);
+		/* Unsupported file type */
+		iput(inode);
+		return ERR_PTR(-EINVAL);
 	}
 
 	return inode;
