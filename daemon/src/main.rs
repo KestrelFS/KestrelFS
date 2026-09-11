@@ -55,12 +55,38 @@ mod object_store;
 mod ring;
 
 use abi::{AttrFields, KestrelfsEvent};
+use clap::Parser;
 use device::KestrelDevice;
 use fs_model::{Inode, Slice};
 use meta::{MetaError, MetaStore};
 use object_store::ObjectStore;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// KestrelFS control-plane daemon.
+///
+/// Attaches to /dev/kestrel_ctl and handles IPC requests from the kernel module.
+/// Metadata is stored in-memory, while block data is persisted to a local directory.
+#[derive(Parser, Debug)]
+#[command(name = "kestrelfs-daemon")]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Directory for storing block data (objects).
+    ///
+    /// If the directory doesn't exist, it will be created. Block data is stored
+    /// as individual files organized by slice UUID. Defaults to "./.kestrelfs-objects"
+    /// in the current working directory.
+    #[arg(long, default_value = "./.kestrelfs-objects")]
+    data_dir: PathBuf,
+
+    /// Use in-memory object store instead of local filesystem (for testing).
+    ///
+    /// When enabled, block data is stored in RAM and lost on daemon restart.
+    /// This is useful for tests but not recommended for production use.
+    #[arg(long)]
+    memory: bool,
+}
 
 /// Seeds the single block backing `remote.txt`'s initial content.
 ///
@@ -72,18 +98,12 @@ use std::sync::Arc;
 /// something obviously different from the old Phase 2 synthetic string
 /// ("KestrelFS remote chunk @ offset=...") that was generated on the fly.
 ///
-/// This function is called exactly once at daemon startup, before
-/// entering the event loop.
+/// This function is idempotent: if the block already exists in the ObjectStore
+/// (e.g., from a previous daemon run with persistent storage), it is NOT
+/// overwritten. This allows daemon restarts without losing seed data.
 async fn seed_remote_txt_block(store: &Arc<dyn ObjectStore>) -> io::Result<()> {
     const BLOCK_SIZE: usize = 512;
     const PATTERN: &[u8] = b"Phase3-seed-data! ";
-
-    let mut data = Vec::with_capacity(BLOCK_SIZE);
-    while data.len() < BLOCK_SIZE {
-        let remaining = BLOCK_SIZE - data.len();
-        let chunk = &PATTERN[..remaining.min(PATTERN.len())];
-        data.extend_from_slice(chunk);
-    }
 
     let seed_slice = Slice {
         chunk_index: 0,
@@ -93,6 +113,19 @@ async fn seed_remote_txt_block(store: &Arc<dyn ObjectStore>) -> io::Result<()> {
         written_at: 0,
     };
     let block_key = seed_slice.block_key(0);
+
+    // Check if block already exists (idempotent for persistent storage)
+    if store.get(&block_key).await.is_ok() {
+        return Ok(());
+    }
+
+    // Generate seed data
+    let mut data = Vec::with_capacity(BLOCK_SIZE);
+    while data.len() < BLOCK_SIZE {
+        let remaining = BLOCK_SIZE - data.len();
+        let chunk = &PATTERN[..remaining.min(PATTERN.len())];
+        data.extend_from_slice(chunk);
+    }
 
     store
         .put(block_key, data)
@@ -104,6 +137,8 @@ async fn seed_remote_txt_block(store: &Arc<dyn ObjectStore>) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     abi::compile_time_layout_asserts();
+
+    let args = Args::parse();
 
     println!("kestrelfs-daemon: opening /dev/kestrel_ctl ...");
     let dev = KestrelDevice::open()?;
@@ -126,7 +161,22 @@ fn main() -> io::Result<()> {
     // construction again.
     let runtime = tokio::runtime::Runtime::new()?;
 
-    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+    // Initialize ObjectStore based on CLI flags
+    let object_store: Arc<dyn ObjectStore> = if args.memory {
+        println!("kestrelfs-daemon: using in-memory object store (data will not persist)");
+        Arc::new(object_store::MemObjectStore::new())
+    } else {
+        println!(
+            "kestrelfs-daemon: using local filesystem object store at {}",
+            args.data_dir.display()
+        );
+        Arc::new(
+            runtime
+                .block_on(object_store::LocalFsObjectStore::new(&args.data_dir))
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        )
+    };
+
     let store: Arc<dyn MetaStore> = Arc::new(meta::MemStore::new());
 
     // Seed the block data for remote.txt's single Slice (see

@@ -29,8 +29,11 @@
 //! to multiple async tasks/threads without fear of data races.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 /// Errors returned by [`ObjectStore`] implementations.
 #[derive(Error, Debug, Clone)]
@@ -43,13 +46,12 @@ pub enum ObjectStoreError {
     /// S3 403, disk full, etc.). The inner string is a human-readable
     /// description; callers should generally surface this as `-EIO` to
     /// the kernel.
-    ///
-    /// Not yet returned by `MemObjectStore` (which is pure in-memory and
-    /// never fails beyond NotFound), but required by future Redis/S3
-    /// backends - allowed as dead_code until then.
-    #[allow(dead_code)]
     #[error("I/O error: {0}")]
     Io(String),
+
+    /// The provided key is invalid (e.g., contains ".." or is an absolute path).
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
 }
 
 pub type Result<T> = std::result::Result<T, ObjectStoreError>;
@@ -218,5 +220,272 @@ mod tests {
         assert_eq!(r1.unwrap(), b"v");
         assert_eq!(r2.unwrap(), b"v");
         assert_eq!(r3.unwrap(), b"v");
+    }
+}
+
+/// Local filesystem-based object store for persistent block storage.
+///
+/// Stores blocks as individual files under a root directory, organized by key.
+/// Keys are expected to be in the format "{uuid}/{block_idx}" and are sanitized
+/// to prevent directory traversal attacks.
+///
+/// # Atomicity
+///
+/// Writes use atomic rename: data is first written to a temporary file (with
+/// .tmp.{random} suffix), then atomically renamed to the final path. This ensures
+/// readers never see partial writes, even if the daemon crashes mid-write.
+///
+/// # Directory Structure
+///
+/// Given root `/data` and key `abc-123/0`, the block is stored at:
+///   `/data/abc-123/0`
+///
+/// The parent directory (`abc-123`) is created on-demand during put().
+#[derive(Clone)]
+pub struct LocalFsObjectStore {
+    root: Arc<PathBuf>,
+}
+
+impl LocalFsObjectStore {
+    /// Create a new LocalFsObjectStore with the given root directory.
+    ///
+    /// Creates the root directory if it doesn't exist. Returns an error if
+    /// the path exists but is not a directory, or if creation fails.
+    pub async fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+
+        // Create root directory if it doesn't exist
+        fs::create_dir_all(&root).await.map_err(|e| {
+            ObjectStoreError::Io(format!("Failed to create root directory: {}", e))
+        })?;
+
+        Ok(Self {
+            root: Arc::new(root),
+        })
+    }
+
+    /// Sanitize a key to prevent directory traversal attacks.
+    ///
+    /// Rejects keys containing ".." or absolute paths. Returns the safe
+    /// relative path within the root directory.
+    fn sanitize_key(&self, key: &str) -> Result<PathBuf> {
+        // Reject empty keys
+        if key.is_empty() {
+            return Err(ObjectStoreError::InvalidKey(
+                "Key cannot be empty".to_string(),
+            ));
+        }
+
+        // Reject absolute paths
+        if key.starts_with('/') {
+            return Err(ObjectStoreError::InvalidKey(
+                "Key cannot be absolute path".to_string(),
+            ));
+        }
+
+        // Check for ".." components (directory traversal)
+        for component in key.split('/') {
+            if component == ".." {
+                return Err(ObjectStoreError::InvalidKey(
+                    "Key cannot contain '..' component".to_string(),
+                ));
+            }
+        }
+
+        Ok(self.root.join(key))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LocalFsObjectStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let path = self.sanitize_key(key)?;
+
+        match fs::read(&path).await {
+            Ok(data) => Ok(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ObjectStoreError::NotFound(key.to_string()))
+            }
+            Err(e) => Err(ObjectStoreError::Io(format!(
+                "Failed to read {}: {}",
+                path.display(),
+                e
+            ))),
+        }
+    }
+
+    async fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
+        let final_path = self.sanitize_key(&key)?;
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                ObjectStoreError::Io(format!(
+                    "Failed to create parent directory for {}: {}",
+                    key, e
+                ))
+            })?;
+        }
+
+        // Write to temporary file first (atomic write pattern)
+        let temp_path = final_path.with_extension(format!(
+            "tmp.{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let mut file = fs::File::create(&temp_path).await.map_err(|e| {
+            ObjectStoreError::Io(format!("Failed to create temp file: {}", e))
+        })?;
+
+        file.write_all(&value).await.map_err(|e| {
+            ObjectStoreError::Io(format!("Failed to write data: {}", e))
+        })?;
+
+        file.sync_all().await.map_err(|e| {
+            ObjectStoreError::Io(format!("Failed to sync temp file: {}", e))
+        })?;
+
+        drop(file);
+
+        // Atomic rename
+        fs::rename(&temp_path, &final_path).await.map_err(|e| {
+            ObjectStoreError::Io(format!("Failed to rename temp file: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod localfs_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn new_creates_root_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("new_root");
+
+        assert!(!root.exists());
+
+        let _store = LocalFsObjectStore::new(&root).await.unwrap();
+
+        assert!(root.exists());
+        assert!(root.is_dir());
+    }
+
+    #[tokio::test]
+    async fn put_and_get_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        store
+            .put("test-key/0".to_string(), b"hello".to_vec())
+            .await
+            .unwrap();
+
+        let retrieved = store.get("test-key/0").await.unwrap();
+        assert_eq!(retrieved, b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_returns_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        let result = store.get("nonexistent").await;
+
+        assert!(matches!(result, Err(ObjectStoreError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn put_overwrites_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        store
+            .put("key/0".to_string(), b"old".to_vec())
+            .await
+            .unwrap();
+        store
+            .put("key/0".to_string(), b"new".to_vec())
+            .await
+            .unwrap();
+
+        let retrieved = store.get("key/0").await.unwrap();
+        assert_eq!(retrieved, b"new");
+    }
+
+    #[tokio::test]
+    async fn persistence_across_store_instances() {
+        let temp_dir = TempDir::new().unwrap();
+
+        {
+            let store1 = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+            store1
+                .put("persistent/0".to_string(), b"data".to_vec())
+                .await
+                .unwrap();
+        }
+
+        // Create new store instance pointing to same directory (simulates daemon restart)
+        let store2 = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+        let retrieved = store2.get("persistent/0").await.unwrap();
+
+        assert_eq!(retrieved, b"data");
+    }
+
+    #[tokio::test]
+    async fn rejects_directory_traversal_dotdot() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        let result = store.put("../etc/passwd".to_string(), b"bad".to_vec()).await;
+
+        assert!(matches!(result, Err(ObjectStoreError::InvalidKey(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        let result = store.put("/etc/passwd".to_string(), b"bad".to_vec()).await;
+
+        assert!(matches!(result, Err(ObjectStoreError::InvalidKey(_))));
+    }
+
+    #[tokio::test]
+    async fn handles_nested_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        store
+            .put("a/b/c/d".to_string(), b"nested".to_vec())
+            .await
+            .unwrap();
+
+        let retrieved = store.get("a/b/c/d").await.unwrap();
+        assert_eq!(retrieved, b"nested");
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_do_not_corrupt() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+
+        let (r1, r2, r3) = tokio::join!(
+            store.put("key1".to_string(), b"data1".to_vec()),
+            store.put("key2".to_string(), b"data2".to_vec()),
+            store.put("key3".to_string(), b"data3".to_vec()),
+        );
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r3.is_ok());
+
+        assert_eq!(store.get("key1").await.unwrap(), b"data1");
+        assert_eq!(store.get("key2").await.unwrap(), b"data2");
+        assert_eq!(store.get("key3").await.unwrap(), b"data3");
     }
 }

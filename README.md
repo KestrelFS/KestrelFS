@@ -253,6 +253,52 @@ Expected output includes ABI version / shared-region-size confirmation and a
 successful `mmap()` of the ring-buffer region — see
 [Verifying the Build](#verifying-the-build) for the full expected transcript.
 
+### Start the control-plane daemon (Phase 3+)
+
+Starting from Phase 3, the daemon handles block storage and metadata operations.
+Build and run the daemon:
+
+```bash
+cd daemon
+cargo build --release
+sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
+```
+
+**Command-line options:**
+
+- `--data-dir <PATH>` — Directory for persistent block storage (default: `./.kestrelfs-objects`)
+  - The daemon stores file data as individual blocks under this directory
+  - Blocks persist across daemon restarts, allowing data recovery
+  - Must be writable by the daemon process (requires `sudo` if using system paths)
+
+- `--memory` — Use in-memory storage (data lost on restart, for testing only)
+
+**Verifying persistence:**
+
+1. Start daemon with a data directory:
+   ```bash
+   sudo ./target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-data
+   ```
+
+2. Write data to the filesystem:
+   ```bash
+   echo "persistent data" > /mnt/kestrelfs/writable.dat
+   cat /mnt/kestrelfs/writable.dat  # Should show: persistent data
+   ```
+
+3. Stop the daemon (Ctrl+C) and restart it with the same `--data-dir`:
+   ```bash
+   sudo ./target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-data
+   ```
+
+4. Verify data persists:
+   ```bash
+   cat /mnt/kestrelfs/writable.dat  # Should still show: persistent data
+   ```
+
+The daemon must be running before accessing files that require IPC operations
+(`remote.txt`, `writable.dat`). Static files like `hello.txt` work without the daemon.
+
 ---
 
 ## Verifying the Build
