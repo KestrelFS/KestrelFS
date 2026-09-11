@@ -100,6 +100,7 @@
 #include <linux/errno.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/jiffies.h>
 
 #include "kestrelfs.h"
 #include "kestrelfs_ipc.h"
@@ -343,33 +344,53 @@ int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event)
 EXPORT_SYMBOL_GPL(kestrelfs_check_resp);
 
 /* ------------------------------------------------------------------
- * Self-test: debugfs trigger, proves push/scan don't crash and that
- * a round trip (push a REQ, then look for a RESP that will never
- * arrive since no Rust daemon exists yet) behaves exactly as
- * documented (-ENOENT), without touching any VFS code path.
+ * Self-test: debugfs trigger, proves push/scan don't crash and, when
+ * a Rust daemon is attached and draining the REQ ring, that a full
+ * round trip (push a REQ, block until notified, find the matching
+ * RESP) completes successfully - without touching any VFS code path.
  * ------------------------------------------------------------------ */
 
 static struct dentry *kestrelfs_debugfs_dir;
+
+/*
+ * KESTRELFS_SELFTEST_TIMEOUT_MS - how long kestrelfs_selftest_push_write()
+ * blocks waiting for a response before giving up. Generous enough for
+ * a Rust daemon woken from poll() to drain and answer under any
+ * normal scheduling latency, short enough that running the self-test
+ * with no daemon attached (see kestrelfs_check_resp()'s -ENOENT path)
+ * does not hang the calling shell for an unreasonable time.
+ */
+#define KESTRELFS_SELFTEST_TIMEOUT_MS	2000
 
 /*
  * kestrelfs_selftest_push() - debugfs write handler for
  * debugfs/kestrelfs/selftest_push.
  *
  * Writing anything to this file triggers one kestrelfs_req_push()
- * with a KESTRELFS_OP_NOP payload, immediately followed by one
- * kestrelfs_check_resp() call for the freshly-minted req_id. Since
- * nothing (yet) ever produces into the RESP ring, the expected and
- * logged outcome is always "push succeeded, resp not found (-ENOENT)"
- * - this proves the ring plumbing itself (locking, index math,
- * memory ordering annotations, EXPORT_SYMBOL linkage) executes
- * without corrupting state or crashing, ahead of any real consumer
- * existing on either side.
+ * with a KESTRELFS_OP_NOP payload, then BLOCKS (via
+ * kestrelfs_wait_for_resp()) for up to KESTRELFS_SELFTEST_TIMEOUT_MS
+ * waiting for a KESTRELFS_IOC_NOTIFY_RESP notification, retrying
+ * kestrelfs_check_resp() after each wakeup until either a matching
+ * response is found or the timeout elapses.
+ *
+ * This exercises the FULL round trip end-to-end, including the
+ * "block until woken" path that a real VFS caller would use (see
+ * kestrelfs_wait_for_resp()'s doc comment in chardev.c) - unlike an
+ * immediate, non-blocking check_resp() call, which would almost
+ * always race ahead of any userspace daemon's scheduling latency and
+ * spuriously report -ENOENT even when a daemon is correctly attached
+ * and responding.
+ *
+ * With no Rust daemon attached, this will reliably time out after
+ * KESTRELFS_SELFTEST_TIMEOUT_MS and log -ETIME - this is the expected
+ * "no consumer" outcome in that configuration.
  */
 static ssize_t kestrelfs_selftest_push_write(struct file *file,
 					      const char __user *buf,
 					      size_t count, loff_t *ppos)
 {
 	struct kestrelfs_event resp;
+	unsigned long deadline = jiffies + msecs_to_jiffies(KESTRELFS_SELFTEST_TIMEOUT_MS);
 	u64 req_id = 0;
 	int push_ret, resp_ret;
 
@@ -380,20 +401,44 @@ static ssize_t kestrelfs_selftest_push_write(struct file *file,
 		return count;
 	}
 
-	pr_info("kestrelfs: selftest_push: pushed req_id=%llu opcode=NOP\n",
-		(unsigned long long)req_id);
+	pr_info("kestrelfs: selftest_push: pushed req_id=%llu opcode=NOP, waiting up to %dms for response\n",
+		(unsigned long long)req_id, KESTRELFS_SELFTEST_TIMEOUT_MS);
 
-	resp_ret = kestrelfs_check_resp(req_id, &resp);
-	if (resp_ret == 0) {
-		pr_info("kestrelfs: selftest_push: unexpected resp found for req_id=%llu (opcode=%u error=%d)\n",
-			(unsigned long long)req_id, resp.opcode,
-			resp.error_code);
-	} else {
-		pr_info("kestrelfs: selftest_push: kestrelfs_check_resp(req_id=%llu) -> %d (expected -ENOENT, no Rust consumer exists yet)\n",
-			(unsigned long long)req_id, resp_ret);
+	for (;;) {
+		resp_ret = kestrelfs_check_resp(req_id, &resp);
+		if (resp_ret == 0) {
+			pr_info("kestrelfs: selftest_push: resp found for req_id=%llu (opcode=%u error=%d) - round trip OK\n",
+				(unsigned long long)req_id, resp.opcode,
+				resp.error_code);
+			return count;
+		}
+
+		if (time_after_eq(jiffies, deadline)) {
+			pr_info("kestrelfs: selftest_push: timed out after %dms waiting for req_id=%llu (no Rust consumer attached?)\n",
+				KESTRELFS_SELFTEST_TIMEOUT_MS,
+				(unsigned long long)req_id);
+			return count;
+		}
+
+		/*
+		 * Block until KESTRELFS_IOC_NOTIFY_RESP fires (or our
+		 * deadline passes, or a signal arrives), then loop back
+		 * to re-check: the notification only tells us "some
+		 * response arrived somewhere in the ring", not
+		 * specifically ours, so kestrelfs_check_resp() must
+		 * always be re-tried after every wakeup.
+		 */
+		resp_ret = kestrelfs_wait_for_resp(
+			msecs_to_jiffies(KESTRELFS_SELFTEST_TIMEOUT_MS));
+		if (resp_ret == -ERESTARTSYS) {
+			pr_info("kestrelfs: selftest_push: interrupted by signal while waiting for req_id=%llu\n",
+				(unsigned long long)req_id);
+			return count;
+		}
+		/* -ETIME just means "no notification yet"; loop back
+		 * around to the deadline check above, which will catch
+		 * genuine timeout. */
 	}
-
-	return count;
 }
 
 static const struct file_operations kestrelfs_selftest_push_fops = {

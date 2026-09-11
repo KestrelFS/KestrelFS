@@ -1,0 +1,13 @@
+[package]
+name = "kestrelfs-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "KestrelFS control-plane daemon (Phase 2 bootstrap: kernel<->Rust IPC bridge smoke test)"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
