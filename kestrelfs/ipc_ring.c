@@ -129,6 +129,64 @@ static DEFINE_SPINLOCK(req_push_lock);
 static atomic64_t req_id_counter = ATOMIC64_INIT(0);
 
 /*
+ * KESTRELFS_RESP_ORPHAN_TIMEOUT_MS - how long a response slot may sit
+ * at the RESP ring's current tail, unclaimed by any caller, before
+ * kestrelfs_check_resp() forcibly reaps it.
+ *
+ * WHY THIS EXISTS: kestrelfs_check_resp() only advances resp_ctrl.tail
+ * when the slot it finds a match in happens to sit exactly at tail
+ * (see that function's doc comment - this preserves correctness when
+ * multiple concurrent waiters are polling for different req_ids over
+ * the same physical ring). This is safe as long as every request's
+ * original caller eventually calls kestrelfs_check_resp() at least
+ * once more after its response is published - but a caller that gave
+ * up first (e.g. kestrelfs_remote_read() timing out via
+ * KESTRELFS_REMOTE_WAIT_MS in file.c, or a killed process) will never
+ * come back to claim its slot. That "orphan" response then sits
+ * forever at tail, blocking every subsequent response behind it from
+ * ever being claimed either - a slow, silent ring-buffer deadlock
+ * that manifests as every future kestrelfs_req_push() eventually
+ * failing with -EAGAIN once the RESP ring fills up completely behind
+ * the stuck orphan.
+ *
+ * This value must be strictly greater than any caller's own wait
+ * budget (see KESTRELFS_REMOTE_WAIT_MS in file.c and
+ * KESTRELFS_SELFTEST_TIMEOUT_MS in this file) so that a legitimate,
+ * still-waiting caller is never mistaken for an orphan and reaped out
+ * from under it.
+ */
+#define KESTRELFS_RESP_ORPHAN_TIMEOUT_MS	4000
+
+/*
+ * resp_head_of_line - tracks how long the RESP slot currently sitting
+ * at resp_ctrl.tail has been stuck there, for orphan detection in
+ * kestrelfs_check_resp().
+ *
+ * @req_id:      the req_id last observed at the current tail slot.
+ *               Compared against the slot's *current* req_id on each
+ *               call: if they differ, the head-of-line slot changed
+ *               (i.e. someone successfully claimed and advanced past
+ *               it) since our last check, so the timer resets.
+ * @first_seen:  jiffies timestamp of the first time we observed
+ *               @req_id sitting at tail. If KESTRELFS_RESP_ORPHAN_TIMEOUT_MS
+ *               elapses without the head-of-line slot changing, it is
+ *               declared an orphan and force-reaped.
+ * @valid:       false until the first observation, so we never treat
+ *               an uninitialized @first_seen of 0 as "ancient".
+ *
+ * Guarded by req_push_lock, exactly like the ring indices themselves
+ * - this is deliberately simple global state rather than a per-req_id
+ * tracking structure, since only the single slot at the current tail
+ * can ever be a deadlock risk (everything after it is, by
+ * construction, not yet head-of-line).
+ */
+static struct {
+	u64 req_id;
+	unsigned long first_seen;
+	bool valid;
+} resp_head_of_line;
+
+/*
  * kestrelfs_req_push() - publish one request event into the REQ
  * ring (kernel -> Rust).
  * @opcode:      one of KESTRELFS_OP_* (see kestrelfs_ipc.h).
@@ -253,9 +311,16 @@ EXPORT_SYMBOL_GPL(kestrelfs_req_push);
  *      safe to read, per the publish-side contract in
  *      kestrelfs_req_push()'s comment, mirrored on the Rust
  *      producer side for the RESP ring).
- *   2. Linearly scan every unconsumed slot in [tail, head) looking
+ *   2. ORPHAN REAP: if the slot currently at tail has sat there,
+ *      unclaimed, for longer than KESTRELFS_RESP_ORPHAN_TIMEOUT_MS,
+ *      force-advance tail past it (see resp_head_of_line's doc
+ *      comment for why this is necessary at all: a caller that gave
+ *      up waiting - e.g. kestrelfs_remote_read() timing out - will
+ *      never come back to claim its slot otherwise, permanently
+ *      wedging every response published after it).
+ *   3. Linearly scan every unconsumed slot in [tail, head) looking
  *      for slot->req_id == @req_id.
- *   3. If found: copy it out. If the found slot happens to be
+ *   4. If found: copy it out. If the found slot happens to be
  *      exactly at index `tail`, we can safely advance tail past it
  *      (smp_store_release) since we know it is now fully consumed.
  *      If the found slot is NOT at the current tail (i.e. some
@@ -305,6 +370,49 @@ int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event)
 	 * own req-ring publish discipline.
 	 */
 	head = smp_load_acquire(&region->resp_ctrl.head);
+
+	/*
+	 * Orphan reap: check whether the current head-of-line slot
+	 * (the one sitting at `tail`, if any) has been stuck there,
+	 * unclaimed, past KESTRELFS_RESP_ORPHAN_TIMEOUT_MS. See
+	 * resp_head_of_line's doc comment for the full rationale.
+	 *
+	 * This is checked on every kestrelfs_check_resp() call
+	 * (i.e. driven by whichever caller happens to be polling next,
+	 * not a separate timer/thread) - acceptable because as long as
+	 * at least one VFS caller anywhere is actively waiting on
+	 * *anything*, the ring keeps getting serviced; the pathological
+	 * case (ring wedged AND nobody is calling this function at all)
+	 * cannot cause user-visible harm since no caller is blocked
+	 * waiting for it to unwedge in the first place. Bounding the
+	 * timeout comparison strictly by KESTRELFS_RESP_ORPHAN_TIMEOUT_MS
+	 * (larger than any real caller's own wait budget) guarantees we
+	 * never reap a slot a still-waiting caller genuinely needs.
+	 */
+	if (tail != head) {
+		u64 tail_req_id = region->resp_slots[tail & KESTRELFS_RING_MASK].req_id;
+
+		if (!resp_head_of_line.valid || resp_head_of_line.req_id != tail_req_id) {
+			resp_head_of_line.req_id = tail_req_id;
+			resp_head_of_line.first_seen = jiffies;
+			resp_head_of_line.valid = true;
+		} else if (time_after(jiffies,
+				       resp_head_of_line.first_seen +
+				       msecs_to_jiffies(KESTRELFS_RESP_ORPHAN_TIMEOUT_MS))) {
+			pr_warn("kestrelfs: reaping orphaned resp for req_id=%llu, stuck at tail=%llu for >%dms (caller likely timed out before claiming it)\n",
+				(unsigned long long)tail_req_id,
+				(unsigned long long)tail,
+				KESTRELFS_RESP_ORPHAN_TIMEOUT_MS);
+
+			smp_store_release(&region->resp_ctrl.tail, tail + 1);
+			tail = tail + 1;
+			resp_head_of_line.valid = false;
+		}
+	} else {
+		/* Ring empty: nothing to be head-of-line, reset tracking
+		 * so a future arrival is timed from its actual arrival. */
+		resp_head_of_line.valid = false;
+	}
 
 	for (scan = tail; scan != head; scan++) {
 		idx = scan & KESTRELFS_RING_MASK;

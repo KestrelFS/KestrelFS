@@ -121,6 +121,38 @@
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
+/*
+ * Payload layout for KESTRELFS_OP_READ_CHUNK requests
+ * -----------------------------------------------------
+ *
+ * struct kestrelfs_read_chunk_req (packed manually into
+ * kestrelfs_event.payload, NOT a separate C struct on the wire - both
+ * sides must encode/decode these two fields at these exact byte
+ * offsets within the 32-byte payload array):
+ *
+ *   offset  0, 8 bytes, little-endian u64: requested file offset.
+ *   offset  8, 4 bytes, little-endian u32: requested byte count,
+ *            already clamped by the kernel producer to fit within a
+ *            single response payload (see
+ *            KESTRELFS_READ_CHUNK_MAX_LEN below) - the Rust daemon
+ *            need not re-clamp, only honor whatever value is present.
+ *   offset 12..32: reserved, must be zero.
+ *
+ * The matching KESTRELFS_OP_RESULT_OK response's payload carries the
+ * actual data bytes back, starting at payload offset 0, with the
+ * valid length given by... there is deliberately no explicit
+ * "length" field in the response: the daemon fills exactly
+ * KESTRELFS_READ_CHUNK_MAX_LEN bytes (zero-padding if the real
+ * content is shorter), and the kernel consumer clamps its own
+ * copy_to_user() to min(requested count, KESTRELFS_READ_CHUNK_MAX_LEN).
+ * This avoids needing a separate "actual length" field for this
+ * bootstrap protocol version; a real chunk-serving opcode in a later
+ * phase should carry an explicit length instead once responses can
+ * legitimately be shorter than the fixed clamp for reasons other than
+ * "caller asked for less".
+ */
+#define KESTRELFS_READ_CHUNK_MAX_LEN	KESTRELFS_EVENT_PAYLOAD_SIZE
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */

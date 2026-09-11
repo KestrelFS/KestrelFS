@@ -24,6 +24,17 @@
 /* Static payload served by hello.txt (file.c). */
 #define KESTRELFS_HELLO_CONTENT	"Hello from KestrelFS Kernel Module (Phase 1)!\n"
 
+/*
+ * KESTRELFS_REMOTE_FILE_SIZE - the logical size (in bytes) of
+ * remote.txt. Shared between file.c (which enforces it as the EOF
+ * boundary for kestrelfs_remote_read(), see that function's doc
+ * comment for the full rationale) and inode.c (which writes it into
+ * remote.txt's inode->i_size right after simple_fill_super() creates
+ * that inode with the default of 0, so stat()/ls -l report the
+ * correct size).
+ */
+#define KESTRELFS_REMOTE_FILE_SIZE	(16 * KESTRELFS_READ_CHUNK_MAX_LEN)
+
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;
 
@@ -32,6 +43,15 @@ extern const struct super_operations kestrelfs_super_ops;
 
 /* file.c: file_operations for the read-only hello.txt regular file. */
 extern const struct file_operations kestrelfs_file_ops;
+
+/*
+ * file.c: file_operations for remote.txt, whose reads round-trip
+ * through the Phase 2 kernel<->Rust IPC bridge (kestrelfs_req_push()/
+ * kestrelfs_wait_for_resp()/kestrelfs_check_resp()). This is the
+ * project's first VFS call path that depends on a Rust daemon being
+ * attached to /dev/kestrel_ctl.
+ */
+extern const struct file_operations kestrelfs_remote_file_ops;
 
 /*
  * chardev.c: Phase 2 IPC bridge infrastructure (/dev/kestrel_ctl).

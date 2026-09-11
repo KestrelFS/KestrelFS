@@ -133,7 +133,7 @@ fn drain_and_respond(dev: &KestrelDevice) {
                 event.seq, event.req_id, event.opcode, event.flags
             );
 
-            let response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            let response = build_response(event);
 
             // SAFETY: same reasoning as the `drain_requests` call
             // below - `dev.region_ptr()` is valid for the duration of
@@ -148,8 +148,8 @@ fn drain_and_respond(dev: &KestrelDevice) {
             if pushed {
                 responded += 1;
                 println!(
-                    "kestrelfs-daemon: -> RESP req_id={} opcode=RESULT_OK",
-                    event.req_id
+                    "kestrelfs-daemon: -> RESP req_id={} opcode={}",
+                    event.req_id, response.opcode
                 );
             } else {
                 eprintln!(
@@ -169,4 +169,60 @@ fn drain_and_respond(dev: &KestrelDevice) {
             eprintln!("kestrelfs-daemon: KESTRELFS_IOC_NOTIFY_RESP failed: {e}");
         }
     }
+}
+
+/// Builds the appropriate response event for one drained REQ event,
+/// dispatching on `event.opcode`.
+///
+/// This is the daemon's entire "business logic" for this Phase 2 VFS
+/// integration bootstrap step - deliberately trivial (a deterministic
+/// echo string, no real backing store) since its only purpose is to
+/// prove the full VFS -> kernel -> Rust -> kernel -> VFS round trip
+/// works, ahead of Phase 3 wiring this up to real chunk/metadata
+/// storage (Redis/S3).
+fn build_response(event: &KestrelfsEvent) -> KestrelfsEvent {
+    match event.opcode {
+        abi::OP_READ_CHUNK => handle_read_chunk(event),
+        abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
+        other => {
+            eprintln!(
+                "kestrelfs-daemon: unhandled opcode {other} for req_id={}, replying with generic OK",
+                event.req_id
+            );
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+    }
+}
+
+/// Answers a `KESTRELFS_OP_READ_CHUNK` request with a deterministic,
+/// synthetic payload describing the request itself - standing in for
+/// "fetch this byte range from the real backing store" until Phase 3
+/// wires this daemon up to Redis/S3.
+///
+/// The generated string always starts at payload byte 0 and is
+/// truncated (never padded past what actually fits) to
+/// `req.count.min(EVENT_PAYLOAD_SIZE)` bytes, matching
+/// `kestrelfs_remote_read()`'s clamping on the kernel side (see
+/// `file.c`) - the kernel already sent us a `count` that it will
+/// itself clamp its `copy_to_user()` to, so we never need to produce
+/// more than that many meaningful bytes.
+fn handle_read_chunk(event: &KestrelfsEvent) -> KestrelfsEvent {
+    let req = event.decode_read_chunk_req();
+
+    let text = format!(
+        "KestrelFS remote chunk @ offset={} served by Rust daemon\n",
+        req.offset
+    );
+    let text_bytes = text.as_bytes();
+
+    let len = (req.count as usize)
+        .min(abi::EVENT_PAYLOAD_SIZE)
+        .min(text_bytes.len());
+
+    println!(
+        "kestrelfs-daemon:    OP_READ_CHUNK offset={} count={} -> {len} bytes",
+        req.offset, req.count
+    );
+
+    KestrelfsEvent::read_chunk_response(event.req_id, &text_bytes[..len])
 }

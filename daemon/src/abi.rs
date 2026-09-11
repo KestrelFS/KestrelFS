@@ -139,6 +139,77 @@ impl KestrelfsEvent {
             payload: [0u8; EVENT_PAYLOAD_SIZE],
         }
     }
+
+    /// Decodes this event's payload as a `KESTRELFS_OP_READ_CHUNK`
+    /// request, per the byte layout documented in `kestrelfs_ipc.h`'s
+    /// "Payload layout for KESTRELFS_OP_READ_CHUNK requests" section:
+    /// a little-endian `u64` offset at byte 0, followed by a
+    /// little-endian `u32` count at byte 8.
+    ///
+    /// Callers are expected to have already checked `self.opcode ==
+    /// OP_READ_CHUNK` - this method does not itself inspect `opcode`,
+    /// since the payload bytes are meaningless without already
+    /// knowing which opcode produced them.
+    pub fn decode_read_chunk_req(&self) -> ReadChunkReq {
+        ReadChunkReq {
+            offset: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+            count: u32::from_le_bytes(self.payload[8..12].try_into().unwrap()),
+        }
+    }
+
+    /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
+    /// `KESTRELFS_OP_READ_CHUNK` request, with `data` copied into the
+    /// leading bytes of the payload and the remainder zero-padded, per
+    /// the "no explicit length field" convention documented in
+    /// `kestrelfs_ipc.h` (the kernel consumer clamps its own
+    /// `copy_to_user()` to the count it originally requested, which is
+    /// always `<= data.len()` here by construction - see
+    /// `main.rs::handle_read_chunk`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() > EVENT_PAYLOAD_SIZE` - this indicates a
+    /// bug in the caller, not a runtime/protocol condition, since
+    /// `data` is always produced by clamping to
+    /// `KESTRELFS_READ_CHUNK_MAX_LEN` (== `EVENT_PAYLOAD_SIZE`) before
+    /// reaching this function.
+    pub fn read_chunk_response(req_id: u64, data: &[u8]) -> Self {
+        assert!(
+            data.len() <= EVENT_PAYLOAD_SIZE,
+            "read_chunk_response: data.len()={} exceeds EVENT_PAYLOAD_SIZE={}",
+            data.len(),
+            EVENT_PAYLOAD_SIZE
+        );
+
+        let mut event = KestrelfsEvent::zeroed(OP_RESULT_OK, req_id);
+        event.payload[..data.len()].copy_from_slice(data);
+        event
+    }
+
+    /// Builds a `KESTRELFS_OP_RESULT_ERROR` response, with `errno`
+    /// (a negative errno-style value, matching the kernel consumer's
+    /// expectations - see `kestrelfs_remote_read()` in `file.c`)
+    /// placed in `error_code`.
+    ///
+    /// Not yet exercised by this Phase 2 bootstrap daemon (see
+    /// `main.rs::handle_read_chunk`, which currently always succeeds).
+    /// Kept ready for the first opcode handler that needs to report
+    /// a real failure (e.g. an out-of-range offset once `remote.txt`
+    /// gains an actual bounded backing store in a later phase).
+    #[allow(dead_code)]
+    pub fn error_response(req_id: u64, errno: i32) -> Self {
+        let mut event = KestrelfsEvent::zeroed(OP_RESULT_ERROR, req_id);
+        event.error_code = errno;
+        event
+    }
+}
+
+/// Decoded form of a `KESTRELFS_OP_READ_CHUNK` request payload. See
+/// [`KestrelfsEvent::decode_read_chunk_req`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReadChunkReq {
+    pub offset: u64,
+    pub count: u32,
 }
 
 // ---------------------------------------------------------------------
