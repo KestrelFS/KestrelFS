@@ -369,6 +369,8 @@ async fn build_response(
         abi::OP_READ_CHUNK => handle_read_chunk(event, store, object_store).await,
         abi::OP_WRITE_CHUNK => handle_write_chunk(event, store, object_store).await,
         abi::OP_TRUNCATE => handle_truncate(event, store).await,
+        abi::OP_CREATE => handle_create(event, store).await,
+        abi::OP_READDIR => handle_readdir(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -376,6 +378,115 @@ async fn build_response(
                 event.req_id
             );
             KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+    }
+}
+
+/// Handles `KESTRELFS_OP_CREATE` requests: creates a new file or directory.
+///
+/// Decodes the request payload (parent_inode, mode, name), calls
+/// [`MetaStore::create`], and returns the new inode's id + attributes.
+///
+/// Error mapping:
+/// - Malformed payload (invalid UTF-8) -> `-EINVAL`
+/// - [`MetaError::NotFound`] (parent doesn't exist) -> `-ENOENT`
+/// - [`MetaError::NotADirectory`] (parent is not a directory) -> `-ENOTDIR`
+/// - [`MetaError::AlreadyExists`] (name already exists in parent) -> `-EEXIST`
+async fn handle_create(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+    let req = match event.decode_create_req() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_CREATE malformed request: {:?}",
+                e
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    println!(
+        "kestrelfs-daemon:    OP_CREATE parent={} name=\"{}\" mode=0o{:o}",
+        req.parent_inode, req.name, req.mode
+    );
+
+    // Call MetaStore::create
+    match store.create(req.parent_inode, &req.name, req.mode).await {
+        Ok(new_inode_id) => {
+            // Fetch attributes of newly created inode
+            match store.getattr(new_inode_id).await {
+                Ok(inode) => {
+                    let attrs = inode_to_attr_fields(&inode);
+                    println!(
+                        "kestrelfs-daemon:    OP_CREATE -> new_inode={} size={} mode=0o{:o}",
+                        new_inode_id, attrs.size, attrs.mode
+                    );
+                    // Response layout same as LOOKUP (child_inode_id + attrs)
+                    KestrelfsEvent::lookup_response(event.req_id, new_inode_id, attrs)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "kestrelfs-daemon:    OP_CREATE created inode={} but getattr failed: {:?}",
+                        new_inode_id, e
+                    );
+                    KestrelfsEvent::error_response(event.req_id, -libc::EIO)
+                }
+            }
+        }
+        Err(e) => {
+            println!(
+                "kestrelfs-daemon:    OP_CREATE parent={} name=\"{}\" -> {:?}",
+                req.parent_inode, req.name, e
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+        }
+    }
+}
+
+/// Handles `KESTRELFS_OP_READDIR` requests: lists directory entries.
+///
+/// Decodes the request payload (dir_inode, offset), calls
+/// [`MetaStore::readdir`], and returns up to 2 entries per response
+/// (limited by payload size).
+///
+/// Error mapping:
+/// - [`MetaError::NotFound`] -> `-ENOENT`
+/// - [`MetaError::NotADirectory`] -> `-ENOTDIR`
+async fn handle_readdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+    let req = event.decode_readdir_req();
+
+    println!(
+        "kestrelfs-daemon:    OP_READDIR dir={} offset={}",
+        req.dir_inode, req.offset
+    );
+
+    // Call MetaStore::readdir
+    match store.readdir(req.dir_inode).await {
+        Ok(entries) => {
+            // Skip to requested offset and take up to 2 entries
+            let offset = req.offset as usize;
+            let chunk: Vec<(u64, &str)> = entries
+                .iter()
+                .skip(offset)
+                .take(2)
+                .map(|(inode, name)| (*inode, name.as_str()))
+                .collect();
+
+            println!(
+                "kestrelfs-daemon:    OP_READDIR dir={} offset={} -> {} entries (total {} in dir)",
+                req.dir_inode,
+                req.offset,
+                chunk.len(),
+                entries.len()
+            );
+
+            KestrelfsEvent::readdir_response(event.req_id, &chunk)
+        }
+        Err(e) => {
+            println!(
+                "kestrelfs-daemon:    OP_READDIR dir={} offset={} -> {:?}",
+                req.dir_inode, req.offset, e
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
         }
     }
 }

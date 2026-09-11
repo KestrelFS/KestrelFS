@@ -120,6 +120,8 @@
 #define KESTRELFS_OP_GETATTR		3	/* req: fetch inode attributes */
 #define KESTRELFS_OP_WRITE_CHUNK	4	/* req: write data to file */
 #define KESTRELFS_OP_TRUNCATE		5	/* req: set file size (truncate/ftruncate) */
+#define KESTRELFS_OP_CREATE		6	/* req: create new file/directory */
+#define KESTRELFS_OP_READDIR		7	/* req: list directory entries */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -310,6 +312,65 @@
  * for why errors never use the payload).
  */
 
+/*
+ * Payload layout for KESTRELFS_OP_CREATE requests/responses
+ * ----------------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: parent_inode_id (directory).
+ *   offset  8, 4 bytes, little-endian u32: mode (file type + permissions,
+ *            e.g., S_IFREG | 0644).
+ *   offset 12, 20 bytes: NUL-terminated filename (max 19 chars + NUL).
+ *   ------------------------------------------------------------
+ *   total: exactly 32 bytes.
+ *
+ * RESPONSE (Rust -> kernel), KESTRELFS_OP_RESULT_OK payload:
+ *
+ *   Same layout as KESTRELFS_OP_LOOKUP response (child_inode_id + attributes).
+ *   offset  0, 8 bytes, little-endian u64: new_inode_id.
+ *   offset  8, 8 bytes, little-endian u64: size (initially 0 for new files).
+ *   offset 16, 4 bytes, little-endian u32: mode.
+ *   offset 20, 4 bytes, little-endian u32: uid.
+ *   offset 24, 4 bytes, little-endian u32: gid.
+ *   offset 28, 4 bytes, little-endian u32: nlink.
+ *
+ * On failure: parent not found -> -ENOENT, not a directory -> -ENOTDIR,
+ * file exists -> -EEXIST.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 5.
+ */
+
+/*
+ * Payload layout for KESTRELFS_OP_READDIR requests/responses
+ * -----------------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: dir_inode_id.
+ *   offset  8, 4 bytes, little-endian u32: offset (entry index to start from).
+ *   offset 12..32: reserved, must be zero.
+ *
+ * RESPONSE (Rust -> kernel), KESTRELFS_OP_RESULT_OK payload:
+ *
+ *   offset  0, 1 byte: entry_count (number of entries in this response, 0-2).
+ *   offset  1, 8 bytes, little-endian u64: entry[0].inode_id (or 0 if no entry).
+ *   offset  9, 11 bytes: entry[0].name (NUL-terminated, max 10 chars + NUL).
+ *   offset 20, 8 bytes, little-endian u64: entry[1].inode_id (or 0 if no entry).
+ *   offset 28, 4 bytes: entry[1].name (truncated to 4 bytes for space).
+ *   ------------------------------------------------------------
+ *   total: exactly 32 bytes.
+ *
+ * Note: Due to payload size constraints, each READDIR response can return
+ * at most 2 entries. The kernel may need to issue multiple READDIR requests
+ * with increasing offsets to fetch all directory entries. entry_count=0
+ * signals end-of-directory.
+ *
+ * On failure: not a directory -> -ENOTDIR, inode not found -> -ENOENT.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 5.
+ */
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -438,7 +499,7 @@ struct kestrelfs_ring_ctrl {
  *       the daemon to accept writes from the kernel and persist them
  *       via MetaStore + ObjectStore, completing the read/write path.
  */
-#define KESTRELFS_ABI_VERSION		4
+#define KESTRELFS_ABI_VERSION		5
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.

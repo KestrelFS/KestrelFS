@@ -49,7 +49,7 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -81,6 +81,10 @@ pub const OP_GETATTR: u32 = 3;
 pub const OP_WRITE_CHUNK: u32 = 4;
 /// Request: set file size (truncate/ftruncate). Mirrors `KESTRELFS_OP_TRUNCATE`.
 pub const OP_TRUNCATE: u32 = 5;
+/// Request: create new file/directory. Mirrors `KESTRELFS_OP_CREATE`.
+pub const OP_CREATE: u32 = 6;
+/// Request: list directory entries. Mirrors `KESTRELFS_OP_READDIR`.
+pub const OP_READDIR: u32 = 7;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -201,6 +205,50 @@ impl KestrelfsEvent {
             inode_id,
             new_size,
         }
+    }
+
+    /// Decodes this event's payload as a `KESTRELFS_OP_CREATE` request:
+    /// parent_inode_id (8 bytes) + mode (4 bytes) + filename (20 bytes).
+    ///
+    /// Layout per `kestrelfs_ipc.h`:
+    ///   offset 0: parent_inode_id (u64)
+    ///   offset 8: mode (u32)
+    ///   offset 12: name (NUL-terminated, max 19 chars + NUL)
+    pub fn decode_create_req(&self) -> Result<CreateReq, LookupDecodeError> {
+        let parent_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let mode = u32::from_le_bytes(self.payload[8..12].try_into().unwrap());
+
+        // Find NUL terminator in name field (bytes 12..32)
+        let name_bytes = &self.payload[12..32];
+        let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(20);
+
+        if name_len == 0 {
+            return Err(LookupDecodeError::InvalidUtf8);
+        }
+
+        let name = std::str::from_utf8(&name_bytes[..name_len])
+            .map_err(|_| LookupDecodeError::InvalidUtf8)?
+            .to_string();
+
+        Ok(CreateReq {
+            parent_inode,
+            mode,
+            name,
+        })
+    }
+
+    /// Decodes this event's payload as a `KESTRELFS_OP_READDIR` request:
+    /// dir_inode_id (8 bytes) + offset (4 bytes).
+    ///
+    /// Layout per `kestrelfs_ipc.h`:
+    ///   offset 0: dir_inode_id (u64)
+    ///   offset 8: offset (u32, entry index to start from)
+    ///   offset 12..32: reserved
+    pub fn decode_readdir_req(&self) -> ReaddirReq {
+        let dir_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let offset = u32::from_le_bytes(self.payload[8..12].try_into().unwrap());
+
+        ReaddirReq { dir_inode, offset }
     }
 
     /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
@@ -333,6 +381,48 @@ impl KestrelfsEvent {
         p[24..32].copy_from_slice(&attrs.mtime.to_le_bytes());
         event
     }
+
+    /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
+    /// `KESTRELFS_OP_READDIR` request.
+    ///
+    /// Layout per `kestrelfs_ipc.h`:
+    ///   offset 0: entry_count (u8, 0-2)
+    ///   offset 1: entry[0].inode_id (u64)
+    ///   offset 9: entry[0].name (11 bytes, NUL-terminated)
+    ///   offset 20: entry[1].inode_id (u64)
+    ///   offset 28: entry[1].name (4 bytes, truncated)
+    ///
+    /// Due to payload size constraints, we can fit at most 2 entries per response.
+    /// entry_count=0 signals end-of-directory.
+    pub fn readdir_response(req_id: u64, entries: &[(u64, &str)]) -> Self {
+        let mut event = KestrelfsEvent::zeroed(OP_RESULT_OK, req_id);
+        let p = &mut event.payload;
+
+        let entry_count = entries.len().min(2) as u8;
+        p[0] = entry_count;
+
+        if entry_count >= 1 {
+            let (inode, name) = entries[0];
+            p[1..9].copy_from_slice(&inode.to_le_bytes());
+            let name_bytes = name.as_bytes();
+            let copy_len = name_bytes.len().min(10);
+            p[9..9 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+            // NUL terminator (implicit if name fits, or truncation marker)
+            if copy_len < 11 {
+                p[9 + copy_len] = 0;
+            }
+        }
+
+        if entry_count >= 2 {
+            let (inode, name) = entries[1];
+            p[20..28].copy_from_slice(&inode.to_le_bytes());
+            let name_bytes = name.as_bytes();
+            let copy_len = name_bytes.len().min(4);
+            p[28..28 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        }
+
+        event
+    }
 }
 
 /// Mirrors `KESTRELFS_LOOKUP_NAME_MAX` in `kestrelfs_ipc.h`: the
@@ -440,6 +530,19 @@ pub struct WriteChunkReq {
 pub struct TruncateReq {
     pub inode_id: u64,
     pub new_size: u64,
+}
+
+/// Decoded `KESTRELFS_OP_CREATE` request payload.
+pub struct CreateReq {
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub name: String,
+}
+
+/// Decoded `KESTRELFS_OP_READDIR` request payload.
+pub struct ReaddirReq {
+    pub dir_inode: u64,
+    pub offset: u32,
 }
 
 // ---------------------------------------------------------------------

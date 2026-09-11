@@ -194,6 +194,18 @@ pub trait MetaStore: Send + Sync {
     ///
     /// Returns [`MetaError::NotFound`] if `inode` does not exist.
     async fn truncate(&self, inode: u64, new_size: u64) -> Result<()>;
+
+    /// Lists directory entries for the given directory inode.
+    ///
+    /// Returns a vector of `(child_inode_id, name)` pairs. The order is
+    /// unspecified (implementation-defined). An empty vector is valid for
+    /// an empty directory.
+    ///
+    /// # Errors
+    ///
+    /// - [`MetaError::NotFound`] if `inode` does not exist.
+    /// - [`MetaError::NotADirectory`] if `inode` is not a directory.
+    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -543,6 +555,32 @@ impl MetaStore for MemStore {
         // inode's size limit and clamp reads to [0, size).
 
         Ok(())
+    }
+
+    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
+        let inner = self.inner.read().await;
+
+        // Check inode exists
+        let inode_meta = inner.inodes.get(&inode).ok_or(MetaError::NotFound)?;
+
+        // Check it's a directory
+        if !inode_meta.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Get directory entries (may be empty for empty directory)
+        let entries = inner
+            .dir_entries
+            .get(&inode)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|(name, &child_inode)| (child_inode, name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(entries)
     }
 }
 
