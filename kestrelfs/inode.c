@@ -46,134 +46,109 @@ const struct super_operations kestrelfs_super_ops = {
 };
 
 /*
- * kestrelfs_fixup_remote_size() - set remote.txt's reported i_size.
- * @sb:		superblock, already populated by simple_fill_super().
+ * kestrelfs_get_inode() - fetch or create an inode with given attributes.
+ * @sb:		superblock
+ * @ino:	inode number
+ * @mode:	file type and permissions (S_IFDIR | 0755, S_IFREG | 0644, etc.)
+ * @size:	file size in bytes
  *
- * simple_fill_super() has no concept of per-file size - every inode
- * it creates is left at i_size == 0 (see fs/libfs.c). That is
- * harmless for hello.txt (its length is implicitly bounded by
- * simple_read_from_buffer()'s own @len argument, never by i_size),
- * but for remote.txt it means stat()/ls -l would misleadingly report
- * "0 bytes" for a file that kestrelfs_remote_read() (file.c) actually
- * serves KESTRELFS_REMOTE_FILE_SIZE bytes from. This looks up the
- * freshly created remote.txt dentry directly under the root (no
- * subdirectories exist in this filesystem, so a single
- * lookup_one_len_unlocked() suffices - no need for a generic
- * recursive tree walk) and corrects its inode's i_size to match.
+ * Used by dir.c's lookup/create handlers to instantiate inodes dynamically.
+ * For simplicity, we always create a new inode (no caching yet - can be
+ * optimized with iget5_locked/ilookup if needed).
  *
- * Called once, right after simple_fill_super() succeeds, while no
- * other thread can yet be operating on this superblock (the VFS does
- * not publish a superblock/mount to any other context until
- * ->mount() returns) - so no additional inode locking around the
- * lookup itself is required here despite lookup_one_len() normally
- * asserting the parent is locked.
- *
- * Failure to find remote.txt (e.g. if the tree_descr table above is
- * ever changed to rename/remove it) is logged but not fatal - a
- * missing size fixup only affects stat() cosmetics, never read()
- * correctness (see kestrelfs_remote_read()'s own independent EOF
- * check against KESTRELFS_REMOTE_FILE_SIZE), so it must not fail the
- * entire mount.
+ * Return: pointer to inode on success, ERR_PTR(-errno) on failure.
  */
-static void kestrelfs_fixup_remote_size(struct super_block *sb)
+struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
+				  u32 mode, u64 size)
 {
-	struct dentry *dentry;
+	struct inode *inode;
 
-	dentry = lookup_one_len_unlocked("remote.txt", sb->s_root,
-					  strlen("remote.txt"));
-	if (IS_ERR(dentry)) {
-		pr_warn("kestrelfs: could not look up remote.txt to fix up i_size: %ld\n",
-			PTR_ERR(dentry));
-		return;
+	inode = new_inode(sb);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	inode->i_ino = ino;
+	inode->i_mode = mode;
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
+	inode->i_size = size;
+	inode_set_atime_to_ts(inode, current_time(inode));
+	inode_set_mtime_to_ts(inode, current_time(inode));
+	inode_set_ctime_to_ts(inode, current_time(inode));
+
+	if (S_ISDIR(mode)) {
+		/* Directory */
+		inode->i_op = &kestrelfs_dir_inode_operations;
+		inode->i_fop = &kestrelfs_dir_file_operations;
+		set_nlink(inode, 2);
+	} else if (S_ISREG(mode)) {
+		/* Regular file */
+		inode->i_op = &kestrelfs_reg_inode_ops;
+		inode->i_fop = &kestrelfs_reg_file_ops;
+		set_nlink(inode, 1);
+	} else {
+		/* Unsupported file type */
+		iput(inode);
+		return ERR_PTR(-EINVAL);
 	}
 
-	if (!dentry->d_inode) {
-		pr_warn("kestrelfs: remote.txt dentry has no inode, skipping i_size fixup\n");
-		dput(dentry);
-		return;
-	}
-
-	i_size_write(dentry->d_inode, KESTRELFS_REMOTE_FILE_SIZE);
-	dput(dentry);
-}
-
-/**
- * kestrelfs_setup_writable_inode_ops() - install custom inode_operations for writable.dat.
- * @sb: superblock
- *
- * After simple_fill_super() creates writable.dat with default simple_dir inode ops,
- * we replace i_op with kestrelfs_writable_inode_ops to support setattr (truncate).
- */
-static void kestrelfs_setup_writable_inode_ops(struct super_block *sb)
-{
-	struct dentry *dentry;
-
-	dentry = lookup_one_len_unlocked("writable.dat", sb->s_root,
-					  strlen("writable.dat"));
-	if (IS_ERR(dentry)) {
-		pr_warn("kestrelfs: could not look up writable.dat to set inode_operations: %ld\n",
-			PTR_ERR(dentry));
-		return;
-	}
-
-	if (!dentry->d_inode) {
-		pr_warn("kestrelfs: writable.dat dentry has no inode, skipping inode_operations setup\n");
-		dput(dentry);
-		return;
-	}
-
-	dentry->d_inode->i_op = &kestrelfs_writable_inode_ops;
-	dput(dentry);
+	return inode;
 }
 
 /*
  * kestrelfs_fill_super() - populate a freshly allocated superblock.
  * @sb:		superblock to fill in.
- * @data:	mount data (unused in Phase 1).
+ * @data:	mount data (unused).
  * @silent:	unused.
  *
- * Builds a tiny static tree_descr table describing our files and hands
- * it to simple_fill_super(), which takes care of allocating the root
- * inode/dentry and every entry in the table.
- *
- * The array indices matter: simple_fill_super() uses them as inode
- * numbers, and index [1] collides with the root directory (which
- * simple_fill_super() allocates separately as i_ino=1), so we leave
- * [0] and [1] unused and place files at [2] and [3] to match the Rust
- * daemon's MemStore (ROOT_INODE=1, REMOTE_TXT_INODE=3 - see
- * daemon/src/meta.rs). This alignment became mandatory once
- * KESTRELFS_OP_READ_CHUNK's request payload gained an inode_id field
- * (KESTRELFS_ABI_VERSION 2) - the daemon needs to resolve which file a
- * read targets, so kernel i_ino and MemStore inode_id must agree.
+ * Phase 3 Step 7b: manually creates the root inode (i_ino=1) with
+ * dynamic directory operations, replacing simple_fill_super().
+ * All files (hello.txt, remote.txt, writable.dat) now appear via
+ * dynamic LOOKUP from the daemon's MemStore, not static tree_descr.
  *
  * Return: 0 on success, negative errno on failure.
  */
 static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	static struct tree_descr kestrelfs_files[] = {
-		[2] = { "hello.txt", &kestrelfs_file_ops, S_IRUGO },
-		[3] = { "remote.txt", &kestrelfs_remote_file_ops, S_IRUGO },
-		[4] = { "writable.dat", &kestrelfs_writable_file_ops, S_IRUGO | S_IWUGO },
-		{ "" },
-	};
-	int ret;
+	struct inode *root_inode;
+	struct dentry *root_dentry;
 
-	ret = simple_fill_super(sb, KESTRELFS_MAGIC, kestrelfs_files);
-	if (ret) {
-		pr_err("kestrelfs: simple_fill_super failed: %d\n", ret);
-		return ret;
+	/* Set up superblock parameters */
+	sb->s_magic = KESTRELFS_MAGIC;
+	sb->s_op = &kestrelfs_super_ops;
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
+	sb->s_blocksize = PAGE_SIZE;
+	sb->s_blocksize_bits = PAGE_SHIFT;
+	sb->s_time_gran = 1;
+
+	/* Create root inode (i_ino=1, S_IFDIR | 0755) */
+	root_inode = new_inode(sb);
+	if (!root_inode) {
+		pr_err("kestrelfs: failed to allocate root inode\n");
+		return -ENOMEM;
 	}
 
-	/*
-	 * simple_fill_super() already set sb->s_op to its own default
-	 * simple_super_operations, so ours must be installed afterwards.
-	 */
-	sb->s_op = &kestrelfs_super_ops;
+	root_inode->i_ino = 1; /* ROOT_INODE */
+	root_inode->i_mode = S_IFDIR | 0755;
+	root_inode->i_uid = GLOBAL_ROOT_UID;
+	root_inode->i_gid = GLOBAL_ROOT_GID;
+	inode_set_atime_to_ts(root_inode, current_time(root_inode));
+	inode_set_mtime_to_ts(root_inode, current_time(root_inode));
+	inode_set_ctime_to_ts(root_inode, current_time(root_inode));
+	root_inode->i_op = &kestrelfs_dir_inode_operations;
+	root_inode->i_fop = &kestrelfs_dir_file_operations;
+	set_nlink(root_inode, 2); /* . and .. */
 
-	kestrelfs_fixup_remote_size(sb);
-	kestrelfs_setup_writable_inode_ops(sb);
+	/* Create root dentry */
+	root_dentry = d_make_root(root_inode);
+	if (!root_dentry) {
+		pr_err("kestrelfs: d_make_root failed\n");
+		return -ENOMEM;
+	}
 
-	pr_info("kestrelfs: superblock populated (root + hello.txt + remote.txt + writable.dat)\n");
+	sb->s_root = root_dentry;
+
+	pr_info("kestrelfs: dynamic superblock populated (root inode only, files via LOOKUP)\n");
 	return 0;
 }
 

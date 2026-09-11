@@ -100,4 +100,30 @@ int kestrelfs_req_push(u32 opcode, u32 flags, const u8 *payload,
 			u64 *out_req_id);
 int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event);
 
+/*
+ * dir.c: directory inode/file operations (Phase 3 Step 7b).
+ *
+ * Dynamic LOOKUP/CREATE/READDIR via IPC, replacing simple_fill_super().
+ */
+extern const struct inode_operations kestrelfs_dir_inode_operations;
+extern const struct file_operations kestrelfs_dir_file_operations;
+
+/*
+ * inode.c: inode cache management.
+ *
+ * kestrelfs_get_inode() - fetch or create an inode with given ino/mode/size.
+ * Used by dir.c's lookup/create handlers.
+ */
+struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
+				  u32 mode, u64 size);
+
+/*
+ * file.c: unified file operations for regular files.
+ *
+ * kestrelfs_reg_file_ops - generic read/write/llseek for all regular files.
+ * kestrelfs_reg_inode_ops - generic setattr (truncate) for all regular files.
+ */
+extern const struct file_operations kestrelfs_reg_file_ops;
+extern const struct inode_operations kestrelfs_reg_inode_ops;
+
 #endif /* _KESTRELFS_H */

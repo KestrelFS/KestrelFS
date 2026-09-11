@@ -14,7 +14,7 @@
 #
 
 obj-m += kestrelfs.o
-kestrelfs-objs := super.o inode.o file.o chardev.o ipc_ring.o
+kestrelfs-objs := super.o inode.o file.o chardev.o ipc_ring.o dir.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

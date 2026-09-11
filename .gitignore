@@ -21,3 +21,4 @@ kestrelfs/chardev_test
 # Rust build artifacts (for later phases)
 target/
 Cargo.lock
+daemon/.kestrelfs-objects/

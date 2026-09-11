@@ -506,3 +506,22 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 const struct inode_operations kestrelfs_writable_inode_ops = {
 	.setattr = kestrelfs_writable_setattr,
 };
+
+/*
+ * Unified file_operations and inode_operations for all regular files
+ * (Phase 3 Step 7b).
+ *
+ * These replace the per-file static ops (hello/remote/writable) with
+ * generic read/write/llseek/setattr that work on any inode, based on
+ * i_ino and dynamic i_size from MemStore.
+ */
+const struct file_operations kestrelfs_reg_file_ops = {
+	.owner	= THIS_MODULE,
+	.read	= kestrelfs_writable_read,
+	.write	= kestrelfs_writable_write,
+	.llseek	= kestrelfs_writable_llseek,
+};
+
+const struct inode_operations kestrelfs_reg_inode_ops = {
+	.setattr = kestrelfs_writable_setattr,
+};
