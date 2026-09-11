@@ -49,4 +49,21 @@ struct kestrelfs_shared_region *kestrelfs_shm_region(void);
 void kestrelfs_wake_req_waiters(void);
 long kestrelfs_wait_for_resp(long timeout_jiffies);
 
+/*
+ * ipc_ring.c: lock-free-consumer ring buffer push/pop primitives.
+ *
+ * kestrelfs_ipc_ring_init()/_exit() are called once from super.c's
+ * module_init/module_exit (sets up/tears down the debugfs self-test
+ * hook only). kestrelfs_req_push()/kestrelfs_check_resp() are
+ * exported (EXPORT_SYMBOL_GPL) for future VFS glue code in
+ * inode.c/file.c to issue requests and retrieve responses through
+ * the shared ring buffers defined in kestrelfs_ipc.h.
+ */
+void kestrelfs_ipc_ring_init(void);
+void kestrelfs_ipc_ring_exit(void);
+
+int kestrelfs_req_push(u32 opcode, u32 flags, const u8 *payload,
+			u64 *out_req_id);
+int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event);
+
 #endif /* _KESTRELFS_H */

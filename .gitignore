@@ -1,6 +1,7 @@
 # Kernel module build artifacts (out-of-tree module builds, see kestrelfs/Makefile)
 *.o
 *.o.cmd
+*.o.d
 *.ko
 *.ko.cmd
 *.mod

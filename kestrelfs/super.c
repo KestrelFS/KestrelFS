@@ -43,6 +43,8 @@ static int __init kestrelfs_init(void)
 		return ret;
 	}
 
+	kestrelfs_ipc_ring_init();
+
 	pr_info("kestrelfs: Phase 1+2 module loaded, filesystem + chardev registered\n");
 	return 0;
 }
@@ -61,6 +63,7 @@ static int __init kestrelfs_init(void)
  */
 static void __exit kestrelfs_exit(void)
 {
+	kestrelfs_ipc_ring_exit();
 	kestrelfs_chardev_exit();
 	unregister_filesystem(&kestrelfs_fs_type);
 	pr_info("kestrelfs: Phase 1+2 module unloaded, filesystem + chardev unregistered\n");

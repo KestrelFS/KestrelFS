@@ -42,17 +42,17 @@
  * kestrelfs_shm - singleton allocation backing /dev/kestrel_ctl.
  *
  * @region:    kernel virtual address of the vmalloc_user()-allocated
- *             struct kestrelfs_shared_region. NULL until the first
- *             successful open(); freed on module exit.
- * @refcount:  number of currently open file descriptors referencing
- *             @region. Guarded by @lock. The allocation is torn down
- *             only when this drops back to zero AND the module is
- *             unloading is not required in between - we keep the
- *             allocation alive for the lifetime of the module once
- *             created, to avoid use-after-free races against mmap'd
- *             VMAs outliving a close() in exotic fork() scenarios;
- *             we simply refuse to free while refcount > 0 and free
- *             at module exit regardless.
+ *             struct kestrelfs_shared_region. Allocated eagerly in
+ *             kestrelfs_chardev_init() (module load time), so it is
+ *             non-NULL for the entire lifetime of the module once
+ *             loaded successfully; freed on module exit.
+ * @refcount:  number of currently open file descriptors on
+ *             /dev/kestrel_ctl. Guarded by @lock. Purely diagnostic
+ *             bookkeeping in the current design - since @region's
+ *             lifetime is tied to the module rather than to any
+ *             open fd, nothing currently branches on this value, but
+ *             it is kept for future use (e.g. refusing a second
+ *             daemon instance, or diagnostics).
  * @lock:      protects @region and @refcount against concurrent
  *             open()/release().
  * @req_wq:    kernel producer -> Rust consumer signalling. Rust
@@ -212,21 +212,21 @@ EXPORT_SYMBOL_GPL(kestrelfs_wait_for_resp);
 /*
  * kestrelfs_open() - fops->open for /dev/kestrel_ctl.
  *
- * Lazily allocates the shared region on first open and bumps the
- * refcount. Multiple opens are allowed (e.g. daemon restart while an
- * old fd lingers) and all share the same underlying allocation.
+ * The shared region is now allocated eagerly at module load time
+ * (see kestrelfs_chardev_init()), not on first open - this lets
+ * in-tree kernel producers (kestrelfs_req_push() in ipc_ring.c, and
+ * therefore the debugfs self-test) use the ring buffers immediately
+ * after insmod, without requiring userspace to have opened
+ * /dev/kestrel_ctl first. open() here therefore only bumps the
+ * refcount for bookkeeping/diagnostics purposes.
  */
 static int kestrelfs_open(struct inode *inode, struct file *file)
 {
-	int ret;
-
 	mutex_lock(&kestrelfs_shm.lock);
-	ret = kestrelfs_shm_alloc();
-	if (!ret)
-		kestrelfs_shm.refcount++;
+	kestrelfs_shm.refcount++;
 	mutex_unlock(&kestrelfs_shm.lock);
 
-	return ret;
+	return 0;
 }
 
 /*
@@ -395,13 +395,24 @@ static struct miscdevice kestrelfs_miscdev = {
 /*
  * kestrelfs_chardev_init() - register /dev/kestrel_ctl.
  *
- * Called from super.c's module_init. Only registers the misc device
- * - the shared region itself is allocated lazily on first open() (see
- * kestrelfs_shm_alloc()), so a loaded-but-unused module has zero
- * extra memory footprint beyond this struct.
+ * Called from super.c's module_init. Eagerly allocates the shared
+ * region (kestrelfs_shm_alloc()) BEFORE registering the misc device,
+ * so that:
  *
- * Return: 0 on success, negative errno from misc_register() on
- * failure.
+ *   1. In-tree kernel producers (kestrelfs_req_push() in
+ *      ipc_ring.c) can safely call kestrelfs_shm_region() and get a
+ *      non-NULL pointer immediately after module load, without
+ *      requiring userspace to open() the device first. This is what
+ *      makes the debugfs self-test (and, later, real VFS call paths)
+ *      usable standalone.
+ *   2. By the time misc_register() makes /dev/kestrel_ctl visible to
+ *      userspace, the region is already guaranteed to exist - no
+ *      window where a fast userspace mmap() could race an
+ *      allocation that hasn't happened yet.
+ *
+ * Return: 0 on success, negative errno from kestrelfs_shm_alloc() or
+ * misc_register() on failure. On allocation failure the misc device
+ * is never registered, so /dev/kestrel_ctl simply does not appear.
  */
 int kestrelfs_chardev_init(void)
 {
@@ -412,9 +423,14 @@ int kestrelfs_chardev_init(void)
 	init_waitqueue_head(&kestrelfs_shm.resp_wq);
 	atomic_set(&kestrelfs_shm.resp_generation, 0);
 
+	ret = kestrelfs_shm_alloc();
+	if (ret)
+		return ret;
+
 	ret = misc_register(&kestrelfs_miscdev);
 	if (ret) {
 		pr_err("kestrelfs: misc_register(kestrel_ctl) failed: %d\n", ret);
+		kestrelfs_shm_free();
 		return ret;
 	}
 
