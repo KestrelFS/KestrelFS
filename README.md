@@ -338,6 +338,24 @@ See the extensive comments at the top of `kestrelfs/kestrelfs_ipc.h` for the
 full protocol rationale, and `kestrelfs/chardev.c` for the allocation
 (`vmalloc_user()`) and mapping (`remap_vmalloc_range()`) strategy.
 
+### Opcode payload layouts (metadata operations)
+
+`KESTRELFS_OP_LOOKUP` and `KESTRELFS_OP_GETATTR` each define a fixed,
+little-endian byte layout within the 32-byte payload (see
+`kestrelfs_ipc.h` for the authoritative, byte-offset-by-byte-offset
+documentation and matching `_Static_assert`s): `LOOKUP` requests carry
+`parent_inode(u64)` + `name_len(u8)` + up to 23 bytes of `name`;
+`LOOKUP`/`GETATTR` success responses each pack a different, fully
+payload-filling set of attribute fields (`child_inode_id`/`size`/`mode`/
+`uid`/`gid`/`nlink` for `LOOKUP`; `size`/`mode`/`uid`/`gid`/`nlink`/`mtime`
+for `GETATTR`, trading the repeated inode id for an `mtime` field since the
+requester already supplied that id and matches the response via `req_id`).
+Failures never use the payload - they are always carried in the event
+header's `error_code` field. This did not require an `KESTRELFS_ABI_VERSION`
+bump: it only adds interpretation rules for previously-reserved payload
+bytes of two opcodes that had no producer/consumer code on either side yet,
+without changing any existing struct's size, alignment, or field offsets.
+
 ### Coding standards
 
 - Kernel C code strictly follows the Linux kernel coding style and is built

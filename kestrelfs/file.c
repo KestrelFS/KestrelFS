@@ -130,11 +130,17 @@ const struct file_operations kestrelfs_file_ops = {
  *      returns a correctly short final chunk instead of overrunning
  *      the logical EOF boundary). A @count of 0 is short-circuited to
  *      return 0 immediately without pushing any request at all.
- *   2. Encode (*ppos, clamped count) into a request payload and
- *      push it via kestrelfs_req_push(KESTRELFS_OP_READ_CHUNK, ...).
- *      A full ring is surfaced to the caller as -EAGAIN, matching
- *      the same errno a normal socket/pipe read would use for "try
- *      again later" backpressure.
+ *   2. Encode (inode_id, *ppos, clamped count) into a request payload
+ *      and push it via kestrelfs_req_push(KESTRELFS_OP_READ_CHUNK, ...).
+ *      inode_id is taken from file->f_inode->i_ino, the same inode
+ *      number simple_fill_super() assigned to this file when parsing
+ *      the tree_descr array (see kestrelfs_fill_super() in inode.c).
+ *      This field was added in KESTRELFS_ABI_VERSION 2 (see
+ *      kestrelfs_ipc.h) - before that, the Rust daemon had no way to
+ *      know which of possibly many files a READ_CHUNK request actually
+ *      targeted. A full ring is surfaced to the caller as -EAGAIN,
+ *      matching the same errno a normal socket/pipe read would use for
+ *      "try again later" backpressure.
  *   3. Block on kestrelfs_wait_for_resp() in a retry loop, re-checking
  *      kestrelfs_check_resp(req_id, ...) after every wakeup, until a
  *      matching response arrives or KESTRELFS_REMOTE_WAIT_MS elapses
@@ -172,8 +178,9 @@ static ssize_t kestrelfs_remote_read(struct file *file, char __user *buf,
 				   (u64)(KESTRELFS_REMOTE_FILE_SIZE - *ppos));
 
 	memset(payload, 0, sizeof(payload));
-	put_unaligned_le64((u64)*ppos, &payload[0]);
-	put_unaligned_le32(clamped_count, &payload[8]);
+	put_unaligned_le64((u64)file->f_inode->i_ino, &payload[0]);
+	put_unaligned_le64((u64)*ppos, &payload[8]);
+	put_unaligned_le32(clamped_count, &payload[16]);
 
 	ret = kestrelfs_req_push(KESTRELFS_OP_READ_CHUNK, 0, payload, &req_id);
 	if (ret) {

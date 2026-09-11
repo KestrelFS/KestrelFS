@@ -127,16 +127,25 @@
  *
  * struct kestrelfs_read_chunk_req (packed manually into
  * kestrelfs_event.payload, NOT a separate C struct on the wire - both
- * sides must encode/decode these two fields at these exact byte
+ * sides must encode/decode these three fields at these exact byte
  * offsets within the 32-byte payload array):
  *
- *   offset  0, 8 bytes, little-endian u64: requested file offset.
- *   offset  8, 4 bytes, little-endian u32: requested byte count,
+ *   offset  0, 8 bytes, little-endian u64: inode_id - which file this
+ *            read targets. Introduced in KESTRELFS_ABI_VERSION 2 (see
+ *            that macro's doc comment): without it, the Rust daemon
+ *            had no way to distinguish which of possibly many files a
+ *            KESTRELFS_OP_READ_CHUNK request was actually for, and
+ *            had to assume a single hardcoded target. The kernel
+ *            producer supplies this from the calling ->read()'s own
+ *            `file->f_inode->i_ino` - see kestrelfs_remote_read() in
+ *            file.c.
+ *   offset  8, 8 bytes, little-endian u64: requested file offset.
+ *   offset 16, 4 bytes, little-endian u32: requested byte count,
  *            already clamped by the kernel producer to fit within a
  *            single response payload (see
  *            KESTRELFS_READ_CHUNK_MAX_LEN below) - the Rust daemon
  *            need not re-clamp, only honor whatever value is present.
- *   offset 12..32: reserved, must be zero.
+ *   offset 20..32: reserved, must be zero.
  *
  * The matching KESTRELFS_OP_RESULT_OK response's payload carries the
  * actual data bytes back, starting at payload offset 0, with the
@@ -150,8 +159,105 @@
  * phase should carry an explicit length instead once responses can
  * legitimately be shorter than the fixed clamp for reasons other than
  * "caller asked for less".
+ *
+ * NOTE ON THE v1 -> v2 BREAKING CHANGE: KESTRELFS_ABI_VERSION 1 placed
+ * offset at byte 0 and count at byte 8, with no inode_id field at
+ * all. That layout is retired as of ABI_VERSION 2 - there was no
+ * in-tree producer/consumer of a mixed v1/v2 fleet to preserve
+ * compatibility for (this whole IPC bridge is unreleased,
+ * project-internal software), so the byte offsets were simply
+ * shifted rather than versioned/unioned.
  */
 #define KESTRELFS_READ_CHUNK_MAX_LEN	KESTRELFS_EVENT_PAYLOAD_SIZE
+
+/*
+ * Payload layout for KESTRELFS_OP_LOOKUP requests/responses
+ * ------------------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust), packed into kestrelfs_event.payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: parent inode id.
+ *   offset  8, 1 byte,  u8: name_len, the number of valid bytes in
+ *            the `name` field below. MUST be <=
+ *            KESTRELFS_LOOKUP_NAME_MAX (23) - see that macro's doc
+ *            comment for the exact truncation/rejection rule.
+ *   offset  9, 23 bytes: name, the child's filename, NOT
+ *            NUL-terminated (name_len is authoritative; any bytes at
+ *            offset 9+name_len..32 are reserved/ignored padding, not
+ *            part of the name). Not required to be valid UTF-8 at
+ *            the wire level - the Rust daemon is responsible for
+ *            deciding how to handle non-UTF-8 names (this bootstrap
+ *            protocol's MemStore-backed implementation only ever
+ *            deals in ASCII names, so this does not yet matter in
+ *            practice).
+ *
+ * There is deliberately no separate "parent inode" vs "name" struct
+ * on the wire - both fields simply occupy fixed byte ranges within
+ * the flat 32-byte payload array, exactly like every other opcode's
+ * payload in this file.
+ *
+ * RESPONSE (Rust -> kernel), KESTRELFS_OP_RESULT_OK payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: child_inode_id.
+ *   offset  8, 8 bytes, little-endian u64: size (bytes, matches
+ *            struct kestrelfs_ipc's Inode.size on the Rust side).
+ *   offset 16, 4 bytes, little-endian u32: mode (POSIX S_IF type bits
+ *            OR'd with permission bits, matches Inode.mode on the
+ *            Rust side).
+ *   offset 20, 4 bytes, little-endian u32: uid.
+ *   offset 24, 4 bytes, little-endian u32: gid.
+ *   offset 28, 4 bytes, little-endian u32: nlink.
+ *   ------------------------------------------------------------
+ *   total: exactly 32 bytes - every byte of the payload is used.
+ *
+ * On failure (KESTRELFS_OP_RESULT_ERROR), the payload is unused
+ * (zeroed) and the failure reason is carried in the event header's
+ * error_code field (a negative errno value), NOT in the payload -
+ * see kestrelfs_event's error_code field doc comment. This is a
+ * deliberate, fixed design decision for this whole protocol: no
+ * opcode's error path ever needs to inspect payload bytes, keeping
+ * every error-handling code path opcode-agnostic. Recommended
+ * mappings for this opcode specifically: no such parent inode, or no
+ * child with this name -> -ENOENT; parent inode exists but is not a
+ * directory -> -ENOTDIR; name_len exceeds KESTRELFS_LOOKUP_NAME_MAX
+ * -> -ENAMETOOLONG.
+ */
+#define KESTRELFS_LOOKUP_NAME_MAX	23
+
+/*
+ * Payload layout for KESTRELFS_OP_GETATTR requests/responses
+ * -------------------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id to fetch
+ *            attributes for.
+ *   offset  8..32: reserved, must be zero.
+ *
+ * RESPONSE (Rust -> kernel), KESTRELFS_OP_RESULT_OK payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: size (bytes).
+ *   offset  8, 4 bytes, little-endian u32: mode.
+ *   offset 12, 4 bytes, little-endian u32: uid.
+ *   offset 16, 4 bytes, little-endian u32: gid.
+ *   offset 20, 4 bytes, little-endian u32: nlink.
+ *   offset 24, 8 bytes, little-endian u64: mtime (Unix epoch seconds).
+ *   ------------------------------------------------------------
+ *   total: exactly 32 bytes.
+ *
+ * Note this response does NOT repeat the inode_id (unlike
+ * KESTRELFS_OP_LOOKUP's response, which must return a *newly
+ * discovered* child_inode_id the caller did not already know) -
+ * the requester already supplied inode_id in the request and
+ * matches the response back to it via the event header's req_id
+ * field, exactly like every other opcode. This is what makes room
+ * for the extra mtime field within the same 32-byte budget that
+ * KESTRELFS_OP_LOOKUP spends on child_inode_id instead.
+ *
+ * On failure: no such inode -> -ENOENT, in the event header's
+ * error_code field (see KESTRELFS_OP_LOOKUP's response section above
+ * for why errors never use the payload).
+ */
 
 /* ------------------------------------------------------------------
  * Event payload
@@ -255,10 +361,27 @@ struct kestrelfs_ring_ctrl {
  * KESTRELFS_ABI_VERSION - bump whenever the layout of
  * kestrelfs_shared_region, kestrelfs_ring_ctrl or kestrelfs_event
  * changes in a way that is not purely additive-and-reserved-field
- * based. The Rust daemon must refuse to attach if this does not
- * match what it was built against.
+ * based - INCLUDING when an individual opcode's documented payload
+ * byte layout changes incompatibly (even though struct kestrelfs_event
+ * itself, as a fixed 64-byte container, does not change size/shape -
+ * see the KESTRELFS_OP_READ_CHUNK v1->v2 change below for exactly
+ * this kind of bump). The Rust daemon must refuse to attach if this
+ * does not match what it was built against.
+ *
+ * Version history:
+ *   1 - initial Phase 2 bridge (ring buffers, LOOKUP/GETATTR/
+ *       READ_CHUNK opcodes defined but READ_CHUNK's request payload
+ *       had no inode_id field - see below).
+ *   2 - KESTRELFS_OP_READ_CHUNK's request payload gained an inode_id
+ *       field (offset/count shifted from bytes 0/8 to bytes 8/16 to
+ *       make room - see "Payload layout for KESTRELFS_OP_READ_CHUNK
+ *       requests" above). Required once remote.txt's inode number was
+ *       corrected from 1 (colliding with the root directory - see
+ *       kestrelfs_files[] in inode.c) to 3, making it no longer safe
+ *       for the Rust daemon to assume every READ_CHUNK request targets
+ *       one single, implicit file.
  */
-#define KESTRELFS_ABI_VERSION		1
+#define KESTRELFS_ABI_VERSION		2
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -346,5 +469,33 @@ _Static_assert(sizeof(struct kestrelfs_shared_region) ==
 		(2 * KESTRELFS_CACHELINE_SIZE) +
 		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)),
 		"kestrelfs_shared_region layout drifted, check padding");
+
+/*
+ * KESTRELFS_OP_LOOKUP request payload: 8 bytes (parent_inode) + 1
+ * byte (name_len) + KESTRELFS_LOOKUP_NAME_MAX bytes (name) must fit
+ * within KESTRELFS_EVENT_PAYLOAD_SIZE. Guards against
+ * KESTRELFS_LOOKUP_NAME_MAX ever being widened without re-checking
+ * this arithmetic.
+ */
+_Static_assert(8 + 1 + KESTRELFS_LOOKUP_NAME_MAX <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_LOOKUP request payload (parent_inode + name_len + name) overflows KESTRELFS_EVENT_PAYLOAD_SIZE");
+
+/*
+ * KESTRELFS_OP_LOOKUP KESTRELFS_OP_RESULT_OK response payload:
+ * child_inode_id(8) + size(8) + mode(4) + uid(4) + gid(4) + nlink(4)
+ * must total exactly KESTRELFS_EVENT_PAYLOAD_SIZE (32) - this
+ * response is defined to use every payload byte, see the "Payload
+ * layout for KESTRELFS_OP_LOOKUP" section above.
+ */
+_Static_assert(8 + 8 + 4 + 4 + 4 + 4 == KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_LOOKUP response payload field layout no longer sums to KESTRELFS_EVENT_PAYLOAD_SIZE");
+
+/*
+ * KESTRELFS_OP_GETATTR KESTRELFS_OP_RESULT_OK response payload:
+ * size(8) + mode(4) + uid(4) + gid(4) + nlink(4) + mtime(8) must
+ * total exactly KESTRELFS_EVENT_PAYLOAD_SIZE (32).
+ */
+_Static_assert(8 + 4 + 4 + 4 + 4 + 8 == KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_GETATTR response payload field layout no longer sums to KESTRELFS_EVENT_PAYLOAD_SIZE");
 
 #endif /* _KESTRELFS_IPC_H */

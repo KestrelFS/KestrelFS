@@ -49,7 +49,7 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -142,9 +142,11 @@ impl KestrelfsEvent {
 
     /// Decodes this event's payload as a `KESTRELFS_OP_READ_CHUNK`
     /// request, per the byte layout documented in `kestrelfs_ipc.h`'s
-    /// "Payload layout for KESTRELFS_OP_READ_CHUNK requests" section:
-    /// a little-endian `u64` offset at byte 0, followed by a
-    /// little-endian `u32` count at byte 8.
+    /// "Payload layout for KESTRELFS_OP_READ_CHUNK requests" section.
+    /// As of KESTRELFS_ABI_VERSION 2, the layout is: little-endian u64
+    /// inode_id at byte 0, u64 offset at byte 8, u32 count at byte 16
+    /// (v1 had no inode_id field and placed offset/count at bytes 0/8 -
+    /// this decoder only handles v2).
     ///
     /// Callers are expected to have already checked `self.opcode ==
     /// OP_READ_CHUNK` - this method does not itself inspect `opcode`,
@@ -152,8 +154,9 @@ impl KestrelfsEvent {
     /// knowing which opcode produced them.
     pub fn decode_read_chunk_req(&self) -> ReadChunkReq {
         ReadChunkReq {
-            offset: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
-            count: u32::from_le_bytes(self.payload[8..12].try_into().unwrap()),
+            inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(self.payload[8..16].try_into().unwrap()),
+            count: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
         }
     }
 
@@ -202,12 +205,175 @@ impl KestrelfsEvent {
         event.error_code = errno;
         event
     }
+
+    /// Decodes this event's payload as a `KESTRELFS_OP_LOOKUP`
+    /// request, per the byte layout documented in `kestrelfs_ipc.h`'s
+    /// "Payload layout for KESTRELFS_OP_LOOKUP requests/responses"
+    /// section: a little-endian `u64` parent inode at byte 0, a `u8`
+    /// name length at byte 8, followed by that many name bytes at
+    /// byte 9.
+    ///
+    /// Callers are expected to have already checked `self.opcode ==
+    /// OP_LOOKUP`, exactly like [`Self::decode_read_chunk_req`].
+    ///
+    /// # Errors
+    ///
+    /// [`LookupDecodeError::NameTooLong`] if the wire `name_len` byte
+    /// exceeds [`LOOKUP_NAME_MAX`] (a malformed payload - a correct
+    /// producer never sends one). [`LookupDecodeError::InvalidUtf8`]
+    /// if the name bytes are not valid UTF-8.
+    pub fn decode_lookup_req(&self) -> Result<LookupReq, LookupDecodeError> {
+        let parent_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let name_len = self.payload[8];
+
+        if name_len as usize > LOOKUP_NAME_MAX {
+            return Err(LookupDecodeError::NameTooLong(name_len));
+        }
+
+        let name_bytes = &self.payload[9..9 + name_len as usize];
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| LookupDecodeError::InvalidUtf8)?
+            .to_string();
+
+        Ok(LookupReq { parent_inode, name })
+    }
+
+    /// Decodes this event's payload as a `KESTRELFS_OP_GETATTR`
+    /// request: a little-endian `u64` inode id at byte 0 (bytes
+    /// 8..32 are reserved/ignored, per `kestrelfs_ipc.h`).
+    ///
+    /// Callers are expected to have already checked `self.opcode ==
+    /// OP_GETATTR`.
+    pub fn decode_getattr_req(&self) -> GetattrReq {
+        GetattrReq {
+            inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+        }
+    }
+
+    /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
+    /// `KESTRELFS_OP_LOOKUP` request, per the exact byte layout
+    /// documented in `kestrelfs_ipc.h`: `child_inode_id`(8) +
+    /// `size`(8) + `mode`(4) + `uid`(4) + `gid`(4) + `nlink`(4),
+    /// summing to exactly [`EVENT_PAYLOAD_SIZE`] (32) bytes - every
+    /// byte of the payload is meaningful for this response, unlike
+    /// [`Self::read_chunk_response`]'s zero-padded tail.
+    pub fn lookup_response(req_id: u64, child_inode_id: u64, attrs: AttrFields) -> Self {
+        let mut event = KestrelfsEvent::zeroed(OP_RESULT_OK, req_id);
+        let p = &mut event.payload;
+        p[0..8].copy_from_slice(&child_inode_id.to_le_bytes());
+        p[8..16].copy_from_slice(&attrs.size.to_le_bytes());
+        p[16..20].copy_from_slice(&attrs.mode.to_le_bytes());
+        p[20..24].copy_from_slice(&attrs.uid.to_le_bytes());
+        p[24..28].copy_from_slice(&attrs.gid.to_le_bytes());
+        p[28..32].copy_from_slice(&attrs.nlink.to_le_bytes());
+        event
+    }
+
+    /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
+    /// `KESTRELFS_OP_GETATTR` request, per the exact byte layout
+    /// documented in `kestrelfs_ipc.h`: `size`(8) + `mode`(4) +
+    /// `uid`(4) + `gid`(4) + `nlink`(4) + `mtime`(8), summing to
+    /// exactly [`EVENT_PAYLOAD_SIZE`] (32) bytes. Note this response
+    /// does NOT repeat an inode id (see `kestrelfs_ipc.h`'s doc
+    /// comment on why: the requester already supplied it and matches
+    /// via `req_id`), freeing up room for `mtime` within the same
+    /// 32-byte budget [`Self::lookup_response`] spends on
+    /// `child_inode_id` instead.
+    pub fn getattr_response(req_id: u64, attrs: AttrFields) -> Self {
+        let mut event = KestrelfsEvent::zeroed(OP_RESULT_OK, req_id);
+        let p = &mut event.payload;
+        p[0..8].copy_from_slice(&attrs.size.to_le_bytes());
+        p[8..12].copy_from_slice(&attrs.mode.to_le_bytes());
+        p[12..16].copy_from_slice(&attrs.uid.to_le_bytes());
+        p[16..20].copy_from_slice(&attrs.gid.to_le_bytes());
+        p[20..24].copy_from_slice(&attrs.nlink.to_le_bytes());
+        p[24..32].copy_from_slice(&attrs.mtime.to_le_bytes());
+        event
+    }
+}
+
+/// Mirrors `KESTRELFS_LOOKUP_NAME_MAX` in `kestrelfs_ipc.h`: the
+/// maximum number of bytes a `KESTRELFS_OP_LOOKUP` request's `name`
+/// field may carry (see that macro's doc comment in the C header for
+/// the exact wire layout this bounds: `parent_inode`(8) +
+/// `name_len`(1) + `name`(this many bytes) must fit within
+/// [`EVENT_PAYLOAD_SIZE`]).
+pub const LOOKUP_NAME_MAX: usize = 23;
+
+/// Decoded form of a `KESTRELFS_OP_LOOKUP` request payload. See
+/// [`KestrelfsEvent::decode_lookup_req`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupReq {
+    pub parent_inode: u64,
+    pub name: String,
+}
+
+/// Errors [`KestrelfsEvent::decode_lookup_req`] can report.
+///
+/// Both variants indicate a malformed wire payload - under normal
+/// operation (a correctly-implemented producer respecting
+/// [`LOOKUP_NAME_MAX`]), neither should ever actually occur; they
+/// exist so a handler can defensively map a corrupt/malicious payload
+/// to a sensible error response instead of panicking or silently
+/// misinterpreting garbage bytes as a name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LookupDecodeError {
+    /// The wire `name_len` byte exceeded [`LOOKUP_NAME_MAX`]. A
+    /// correct producer must reject an over-length name at its own
+    /// call site (surfacing `-ENAMETOOLONG` to whatever caller asked
+    /// it to look up that name) rather than ever placing `name_len >
+    /// LOOKUP_NAME_MAX` on the wire in the first place - see
+    /// `KESTRELFS_LOOKUP_NAME_MAX`'s doc comment in `kestrelfs_ipc.h`.
+    #[error("name_len {0} exceeds LOOKUP_NAME_MAX ({LOOKUP_NAME_MAX})")]
+    NameTooLong(u8),
+    /// The `name_len` bytes at their wire offset were not valid
+    /// UTF-8. The wire format itself does not require UTF-8 (see the
+    /// "Payload layout for KESTRELFS_OP_LOOKUP" section in
+    /// `kestrelfs_ipc.h`), but every current `MetaStore` consumer
+    /// (see `meta.rs`) operates on `&str` names, so a non-UTF-8 name
+    /// cannot be resolved by this daemon today.
+    #[error("name bytes are not valid UTF-8")]
+    InvalidUtf8,
+}
+
+/// Decoded form of a `KESTRELFS_OP_GETATTR` request payload. See
+/// [`KestrelfsEvent::decode_getattr_req`].
+#[derive(Debug, Clone, Copy)]
+pub struct GetattrReq {
+    pub inode_id: u64,
+}
+
+/// Attribute fields carried by a successful `KESTRELFS_OP_LOOKUP` or
+/// `KESTRELFS_OP_GETATTR` response.
+///
+/// Deliberately a small, flat, `Copy` struct of exactly the
+/// wire-relevant fields - NOT `crate::fs_model::Inode` passed by
+/// reference. This keeps `abi.rs` fully decoupled from `fs_model.rs`:
+/// this module's whole purpose is to mirror `kestrelfs_ipc.h`'s wire
+/// format byte-for-byte (see the module doc comment), and the wire
+/// format is deliberately a *different, smaller* shape than `Inode`
+/// (no separate atime/ctime, no `inode_id` self-reference in the
+/// GETATTR response - see that response's doc comment above). Letting
+/// `fs_model::Inode` grow additional fields later (e.g. extended
+/// attributes) must never risk an accidental "just serialize the
+/// whole struct" shortcut here - every wire field is assembled
+/// explicitly by whichever caller (see `main.rs`) already holds both
+/// an `Inode` and, where relevant, a freshly resolved child inode id.
+#[derive(Debug, Clone, Copy)]
+pub struct AttrFields {
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub mtime: u64,
 }
 
 /// Decoded form of a `KESTRELFS_OP_READ_CHUNK` request payload. See
 /// [`KestrelfsEvent::decode_read_chunk_req`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReadChunkReq {
+    pub inode_id: u64,
     pub offset: u64,
     pub count: u32,
 }
@@ -338,3 +504,171 @@ pub fn compile_time_layout_asserts() {
 // deliberately deferred for this Phase 2 step to keep the diff reviewable
 // field-by-field against kestrelfs_ipc.h; the `compile_time_layout_asserts`
 // checks above are what stand in for that guarantee until then.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_attrs() -> AttrFields {
+        AttrFields {
+            size: 512,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            mtime: 1_700_000_000,
+        }
+    }
+
+    // --- KESTRELFS_OP_LOOKUP request encode/decode -----------------
+
+    /// Builds a raw LOOKUP request payload by hand (bypassing any
+    /// encoder), matching kestrelfs_ipc.h's documented byte layout
+    /// exactly - this is what pins the *wire offsets themselves*,
+    /// independent of whatever encoding helper this module provides,
+    /// so a bug in a future encoder can never accidentally validate
+    /// itself against its own (possibly also buggy) inverse.
+    fn raw_lookup_req(parent_inode: u64, name: &[u8]) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(OP_LOOKUP, 42);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        event.payload[8] = name.len() as u8;
+        event.payload[9..9 + name.len()].copy_from_slice(name);
+        event
+    }
+
+    #[test]
+    fn decode_lookup_req_reads_parent_inode_at_offset_0() {
+        let event = raw_lookup_req(0x0102_0304_0506_0708, b"x");
+        let decoded = event.decode_lookup_req().expect("valid payload");
+        assert_eq!(decoded.parent_inode, 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn decode_lookup_req_reads_name_len_at_offset_8_and_name_at_offset_9() {
+        let event = raw_lookup_req(1, b"remote.txt");
+        let decoded = event.decode_lookup_req().expect("valid payload");
+        assert_eq!(decoded.name, "remote.txt");
+    }
+
+    #[test]
+    fn decode_lookup_req_accepts_max_length_name() {
+        let name = vec![b'a'; LOOKUP_NAME_MAX];
+        let event = raw_lookup_req(1, &name);
+        let decoded = event.decode_lookup_req().expect("max-length name must be accepted");
+        assert_eq!(decoded.name.len(), LOOKUP_NAME_MAX);
+    }
+
+    #[test]
+    fn decode_lookup_req_rejects_name_len_over_max() {
+        // Hand-craft a payload with an out-of-spec name_len byte,
+        // rather than going through raw_lookup_req (which cannot
+        // itself express an invalid length without also overflowing
+        // the 32-byte payload array in the test helper itself).
+        let mut event = KestrelfsEvent::zeroed(OP_LOOKUP, 1);
+        event.payload[8] = (LOOKUP_NAME_MAX + 1) as u8;
+        let err = event.decode_lookup_req().unwrap_err();
+        assert_eq!(err, LookupDecodeError::NameTooLong((LOOKUP_NAME_MAX + 1) as u8));
+    }
+
+    #[test]
+    fn decode_lookup_req_rejects_invalid_utf8() {
+        let invalid_utf8 = [0xFFu8, 0xFE, 0xFD];
+        let event = raw_lookup_req(1, &invalid_utf8);
+        let err = event.decode_lookup_req().unwrap_err();
+        assert_eq!(err, LookupDecodeError::InvalidUtf8);
+    }
+
+    #[test]
+    fn decode_lookup_req_empty_name() {
+        let event = raw_lookup_req(1, b"");
+        let decoded = event.decode_lookup_req().expect("empty name is a valid (if unusual) payload");
+        assert_eq!(decoded.name, "");
+    }
+
+    // --- KESTRELFS_OP_LOOKUP response encode ------------------------
+
+    #[test]
+    fn lookup_response_uses_every_payload_byte_at_documented_offsets() {
+        let event = KestrelfsEvent::lookup_response(7, 2, sample_attrs());
+
+        assert_eq!(event.opcode, OP_RESULT_OK);
+        assert_eq!(event.req_id, 7);
+        assert_eq!(u64::from_le_bytes(event.payload[0..8].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(event.payload[8..16].try_into().unwrap()), 512);
+        assert_eq!(u32::from_le_bytes(event.payload[16..20].try_into().unwrap()), 0o100644);
+        assert_eq!(u32::from_le_bytes(event.payload[20..24].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(event.payload[24..28].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(event.payload[28..32].try_into().unwrap()), 1);
+    }
+
+    // --- KESTRELFS_OP_GETATTR request decode ------------------------
+
+    #[test]
+    fn decode_getattr_req_reads_inode_id_at_offset_0() {
+        let mut event = KestrelfsEvent::zeroed(OP_GETATTR, 1);
+        event.payload[0..8].copy_from_slice(&99u64.to_le_bytes());
+        let decoded = event.decode_getattr_req();
+        assert_eq!(decoded.inode_id, 99);
+    }
+
+    // --- KESTRELFS_OP_GETATTR response encode -----------------------
+
+    #[test]
+    fn getattr_response_uses_every_payload_byte_at_documented_offsets() {
+        let event = KestrelfsEvent::getattr_response(9, sample_attrs());
+
+        assert_eq!(event.opcode, OP_RESULT_OK);
+        assert_eq!(event.req_id, 9);
+        assert_eq!(u64::from_le_bytes(event.payload[0..8].try_into().unwrap()), 512);
+        assert_eq!(u32::from_le_bytes(event.payload[8..12].try_into().unwrap()), 0o100644);
+        assert_eq!(u32::from_le_bytes(event.payload[12..16].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(event.payload[16..20].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(event.payload[20..24].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_le_bytes(event.payload[24..32].try_into().unwrap()),
+            1_700_000_000
+        );
+    }
+
+    #[test]
+    fn getattr_response_does_not_repeat_an_inode_id() {
+        // Deliberate contrast with lookup_response: GETATTR's wire
+        // format spends its first 8 bytes on `size`, not an inode id
+        // - see kestrelfs_ipc.h's doc comment on why. Byte 0 must NOT
+        // equal the requested inode_id unless size happens to be
+        // equal by coincidence (it isn't, in this fixture).
+        let attrs = AttrFields {
+            size: 4096,
+            ..sample_attrs()
+        };
+        let event = KestrelfsEvent::getattr_response(1, attrs);
+        let first_field = u64::from_le_bytes(event.payload[0..8].try_into().unwrap());
+        assert_eq!(first_field, 4096);
+        assert_ne!(first_field, 2 /* some unrelated inode id */);
+    }
+
+    // --- Wire budget sanity (mirrors the C header's _Static_asserts) ---
+
+    #[test]
+    fn lookup_name_max_fits_request_payload_budget() {
+        // parent_inode(8) + name_len(1) + name(LOOKUP_NAME_MAX) must
+        // fit within EVENT_PAYLOAD_SIZE - mirrors the C header's
+        // _Static_assert of the same arithmetic. Wrapped in a `const`
+        // block (rather than a plain runtime `assert!`) since clippy
+        // correctly observes every operand here is already a
+        // compile-time constant - evaluating it at const-eval time
+        // is both more efficient and fails the build immediately if
+        // it were ever wrong, rather than only when this test runs.
+        const { assert!(8 + 1 + LOOKUP_NAME_MAX <= EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn lookup_response_fields_sum_to_full_payload() {
+        const { assert!(8 + 8 + 4 + 4 + 4 + 4 == EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn getattr_response_fields_sum_to_full_payload() {
+        const { assert!(8 + 4 + 4 + 4 + 4 + 8 == EVENT_PAYLOAD_SIZE) };
+    }
+}

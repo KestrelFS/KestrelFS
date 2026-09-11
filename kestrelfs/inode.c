@@ -103,17 +103,27 @@ static void kestrelfs_fixup_remote_size(struct super_block *sb)
  * @data:	mount data (unused in Phase 1).
  * @silent:	unused.
  *
- * Builds the tiny static tree_descr table describing our single
- * regular file and hands it to simple_fill_super(), which takes care
- * of allocating the root inode/dentry and every entry in the table.
+ * Builds a tiny static tree_descr table describing our files and hands
+ * it to simple_fill_super(), which takes care of allocating the root
+ * inode/dentry and every entry in the table.
+ *
+ * The array indices matter: simple_fill_super() uses them as inode
+ * numbers, and index [1] collides with the root directory (which
+ * simple_fill_super() allocates separately as i_ino=1), so we leave
+ * [0] and [1] unused and place files at [2] and [3] to match the Rust
+ * daemon's MemStore (ROOT_INODE=1, REMOTE_TXT_INODE=3 - see
+ * daemon/src/meta.rs). This alignment became mandatory once
+ * KESTRELFS_OP_READ_CHUNK's request payload gained an inode_id field
+ * (KESTRELFS_ABI_VERSION 2) - the daemon needs to resolve which file a
+ * read targets, so kernel i_ino and MemStore inode_id must agree.
  *
  * Return: 0 on success, negative errno on failure.
  */
 static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 {
 	static struct tree_descr kestrelfs_files[] = {
-		{ "hello.txt", &kestrelfs_file_ops, S_IRUGO },
-		{ "remote.txt", &kestrelfs_remote_file_ops, S_IRUGO },
+		[2] = { "hello.txt", &kestrelfs_file_ops, S_IRUGO },
+		[3] = { "remote.txt", &kestrelfs_remote_file_ops, S_IRUGO },
 		{ "" },
 	};
 	int ret;
