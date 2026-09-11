@@ -76,9 +76,12 @@ pub enum MetaError {
     /// is ever called) - this variant remains unconstructed for now,
     /// kept for a future `create()`-like addition that accepts a name
     /// directly rather than via the fixed-width wire format.
-    #[allow(dead_code)]
     #[error("invalid name: {0}")]
     InvalidName(String),
+    /// `create()` was called but the parent directory already has a
+    /// child with the requested name.
+    #[error("file already exists")]
+    AlreadyExists,
 }
 
 /// Convenience alias, matching the `Result<T>` naming used throughout
@@ -157,6 +160,40 @@ pub trait MetaStore: Send + Sync {
     /// own unit tests in the meantime.
     #[allow(dead_code)]
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>>;
+
+    /// Creates a new file (regular file) under `parent` with the given
+    /// `name` and `mode`. Returns the newly allocated inode id.
+    ///
+    /// # Errors
+    ///
+    /// - [`MetaError::NotFound`] if `parent` does not exist.
+    /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
+    /// - [`MetaError::AlreadyExists`] if `parent` already has a child named `name`.
+    /// - [`MetaError::InvalidName`] if `name` is empty, contains '/', or is too long.
+    async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64>;
+
+    /// Appends a new [`Slice`] to the given inode's slice list for the
+    /// specified chunk. Does not remove or modify existing slices (COW).
+    ///
+    /// Also updates the inode's `size` to max(current_size, slice_end_offset)
+    /// and `mtime` to the current time.
+    ///
+    /// # Errors
+    ///
+    /// [`MetaError::NotFound`] if `inode` does not exist.
+    async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()>;
+
+    /// Sets the file size to `new_size`, updating mtime.
+    ///
+    /// This implements POSIX truncate/ftruncate semantics:
+    /// - If `new_size < current_size`, the file is shrunk (logically).
+    /// - If `new_size > current_size`, the file is extended with zeros.
+    ///
+    /// Historical slices beyond `new_size` MAY be retained (lazy GC), but
+    /// read operations MUST respect the new size (clamp to [0, new_size)).
+    ///
+    /// Returns [`MetaError::NotFound`] if `inode` does not exist.
+    async fn truncate(&self, inode: u64, new_size: u64) -> Result<()>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -228,6 +265,11 @@ struct MemStoreInner {
 /// remote.txt at index [3] to match).
 pub const REMOTE_TXT_INODE: u64 = 3;
 
+/// Inode number for `/writable.dat`, matching the kernel module's
+/// `tree_descr[4]` entry. This file supports both read and write
+/// operations via the IPC write path (Phase 3 step 4).
+pub const WRITABLE_DAT_INODE: u64 = 4;
+
 /// Deterministic UUID for the single Slice [`MemStore::new`] seeds for
 /// `remote.txt`, covering the file's entire 512-byte extent. The
 /// corresponding block (keyed as `<this UUID>/0` in the ObjectStore -
@@ -241,20 +283,20 @@ pub const REMOTE_TXT_INODE: u64 = 3;
 /// always reads the same predictable content.
 pub const REMOTE_TXT_SEED_SLICE_ID: uuid::Uuid = uuid::Uuid::nil();
 
-
 impl MemStore {
-    /// Builds a new `MemStore`, pre-seeded with exactly two entries:
+    /// Builds a new `MemStore`, pre-seeded with exactly three entries:
     ///
     /// - Inode [`ROOT_INODE`] (1): the root directory `/`.
-    /// - Inode [`REMOTE_TXT_INODE`] (2): a regular file named
+    /// - Inode [`REMOTE_TXT_INODE`] (3): a regular file named
     ///   `remote.txt`, linked as a child of the root directory.
+    /// - Inode [`WRITABLE_DAT_INODE`] (4): a regular file named
+    ///   `writable.dat`, linked as a child of the root directory.
     ///
-    /// This mirrors (at the metadata layer) the static `remote.txt`
-    /// entry the kernel side's `tree_descr` table already exposes
-    /// (see `kestrelfs/inode.c`) - the two are not yet wired
-    /// together (this Phase 3 step is metadata-model-only, per the
-    /// task), but sharing the same name/inode-2 convention keeps the
-    /// eventual integration step's mapping obvious.
+    /// This matches the kernel side's `tree_descr` table (see
+    /// `kestrelfs/inode.c`), which places remote.txt at index [3] and
+    /// writable.dat at index [4]. As of Phase 3 step 4, LOOKUP/GETATTR/
+    /// READ_CHUNK/WRITE_CHUNK requests flow from kernel → daemon →
+    /// MetaStore/ObjectStore, enabling full read/write functionality.
     pub fn new() -> Self {
         let now = current_unix_time();
 
@@ -268,12 +310,17 @@ impl MemStore {
         const REMOTE_TXT_SIZE: u64 = 512;
         let remote_txt = Inode::new_file(REMOTE_TXT_INODE, REMOTE_TXT_SIZE, now);
 
+        // writable.dat starts empty (size 0) and grows via write operations
+        let writable_dat = Inode::new_file(WRITABLE_DAT_INODE, 0, now);
+
         let mut inodes = HashMap::new();
         inodes.insert(ROOT_INODE, root);
         inodes.insert(REMOTE_TXT_INODE, remote_txt);
+        inodes.insert(WRITABLE_DAT_INODE, writable_dat);
 
         let mut root_entries = DirEntries::new();
         root_entries.insert("remote.txt".to_string(), REMOTE_TXT_INODE);
+        root_entries.insert("writable.dat".to_string(), WRITABLE_DAT_INODE);
 
         let mut dir_entries = HashMap::new();
         dir_entries.insert(ROOT_INODE, root_entries);
@@ -301,7 +348,7 @@ impl MemStore {
                 dir_entries,
                 slices,
             }),
-            next_inode_id: AtomicU64::new(REMOTE_TXT_INODE + 1),
+            next_inode_id: AtomicU64::new(WRITABLE_DAT_INODE + 1),
         }
     }
 
@@ -319,6 +366,33 @@ impl MemStore {
     fn allocate_inode_id(&self) -> u64 {
         self.next_inode_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Test-only helper: directly inserts an inode, bypassing normal
+    /// create() logic. Used by unit tests that need to set up specific
+    /// inode states without going through the full MetaStore API.
+    #[cfg(test)]
+    pub(crate) async fn insert_inode_for_test(&self, inode_id: u64, inode: Inode) {
+        self.inner.write().await.inodes.insert(inode_id, inode);
+    }
+
+    /// Test-only helper: directly inserts slices for a given inode,
+    /// bypassing append_slice(). Used by read_from_slices tests that
+    /// need to construct specific overlap scenarios.
+    #[cfg(test)]
+    pub(crate) async fn insert_slices_for_test(
+        &self,
+        inode_id: u64,
+        chunk_index: u32,
+        slices: Vec<Slice>,
+    ) {
+        self.inner
+            .write()
+            .await
+            .slices
+            .entry(inode_id)
+            .or_insert_with(HashMap::new)
+            .insert(chunk_index, slices);
+    }
 }
 
 impl Default for MemStore {
@@ -334,7 +408,7 @@ impl Default for MemStore {
 /// `UNIX_EPOCH` on a badly misconfigured clock; centralizing the
 /// `unwrap_or_default()` fallback here means that edge case is
 /// handled once, not duplicated at every construction site).
-fn current_unix_time() -> u64 {
+pub fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -377,6 +451,98 @@ impl MetaStore for MemStore {
             .and_then(|chunks| chunks.get(&chunk_idx))
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {
+        // Validate name
+        if name.is_empty() || name.contains('/') {
+            return Err(MetaError::InvalidName(format!("invalid name: {}", name)));
+        }
+        if name.len() > 255 {
+            return Err(MetaError::InvalidName(format!(
+                "name too long: {}",
+                name.len()
+            )));
+        }
+
+        let mut inner = self.inner.write().await;
+
+        // Check parent exists and is a directory
+        let parent_inode = inner.inodes.get(&parent).ok_or(MetaError::NotFound)?;
+        if !parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Check if name already exists
+        if let Some(entries) = inner.dir_entries.get(&parent) {
+            if entries.contains_key(name) {
+                return Err(MetaError::AlreadyExists);
+            }
+        }
+
+        // Allocate new inode
+        let new_inode_id = self.allocate_inode_id();
+        let now = current_unix_time();
+        let mut new_inode = Inode::new_file(new_inode_id, 0, now);
+        new_inode.mode = mode;
+
+        // Insert inode and directory entry
+        inner.inodes.insert(new_inode_id, new_inode);
+        inner
+            .dir_entries
+            .entry(parent)
+            .or_insert_with(HashMap::new)
+            .insert(name.to_string(), new_inode_id);
+
+        Ok(new_inode_id)
+    }
+
+    async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()> {
+        let mut inner = self.inner.write().await;
+
+        // Check inode exists
+        let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
+
+        // Update inode size if this slice extends it
+        let slice_end = slice.chunk_index as u64 * crate::fs_model::CHUNK_SIZE
+            + slice.chunk_offset as u64
+            + slice.length as u64;
+        if slice_end > inode_meta.size {
+            inode_meta.size = slice_end;
+        }
+
+        // Update mtime
+        inode_meta.mtime = current_unix_time();
+
+        // Append slice to the chunk's slice list
+        inner
+            .slices
+            .entry(inode)
+            .or_insert_with(HashMap::new)
+            .entry(slice.chunk_index)
+            .or_insert_with(Vec::new)
+            .push(slice);
+
+        Ok(())
+    }
+
+    async fn truncate(&self, inode: u64, new_size: u64) -> Result<()> {
+        let mut inner = self.inner.write().await;
+
+        // Check inode exists
+        let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
+
+        // Update size unconditionally (can shrink or grow)
+        inode_meta.size = new_size;
+
+        // Update mtime
+        inode_meta.mtime = current_unix_time();
+
+        // Note: We do NOT delete slices beyond new_size here (lazy GC).
+        // The read path (read_from_slices in main.rs) MUST respect the
+        // inode's size limit and clamp reads to [0, size).
+
+        Ok(())
     }
 }
 
@@ -424,7 +590,10 @@ mod tests {
     #[tokio::test]
     async fn lookup_unknown_name_is_not_found() {
         let store = MemStore::new();
-        let err = store.lookup(ROOT_INODE, "does_not_exist.txt").await.unwrap_err();
+        let err = store
+            .lookup(ROOT_INODE, "does_not_exist.txt")
+            .await
+            .unwrap_err();
         assert!(matches!(err, MetaError::NotFound));
     }
 
@@ -438,10 +607,13 @@ mod tests {
     #[tokio::test]
     async fn lookup_under_regular_file_is_not_a_directory() {
         let store = MemStore::new();
-        // remote.txt (inode 2) is a regular file, not a directory -
+        // remote.txt (inode 3) is a regular file, not a directory -
         // looking anything up "inside" it must be rejected distinctly
         // from a plain NotFound.
-        let err = store.lookup(REMOTE_TXT_INODE, "anything").await.unwrap_err();
+        let err = store
+            .lookup(REMOTE_TXT_INODE, "anything")
+            .await
+            .unwrap_err();
         assert!(matches!(err, MetaError::NotADirectory));
     }
 
@@ -498,5 +670,190 @@ mod tests {
             let inode = handle.await.expect("task must not panic");
             assert_eq!(inode.inode_id, ROOT_INODE);
         }
+    }
+
+    #[tokio::test]
+    async fn create_new_file_succeeds() {
+        let store = MemStore::new();
+        let new_inode = store
+            .create(ROOT_INODE, "test.txt", S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        // Verify inode exists
+        let inode = store
+            .getattr(new_inode)
+            .await
+            .expect("new inode must exist");
+        assert_eq!(inode.inode_id, new_inode);
+        assert_eq!(inode.size, 0);
+
+        // Verify lookup works
+        let looked_up = store
+            .lookup(ROOT_INODE, "test.txt")
+            .await
+            .expect("lookup must succeed");
+        assert_eq!(looked_up, new_inode);
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_name_returns_already_exists() {
+        let store = MemStore::new();
+        store
+            .create(ROOT_INODE, "dup.txt", S_IFREG | 0o644)
+            .await
+            .expect("first create must succeed");
+        let err = store
+            .create(ROOT_INODE, "dup.txt", S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn create_under_nonexistent_parent_returns_not_found() {
+        let store = MemStore::new();
+        let err = store
+            .create(999, "test.txt", S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn create_under_regular_file_returns_not_a_directory() {
+        let store = MemStore::new();
+        let err = store
+            .create(REMOTE_TXT_INODE, "test.txt", S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::NotADirectory));
+    }
+
+    #[tokio::test]
+    async fn create_with_invalid_name_returns_error() {
+        let store = MemStore::new();
+
+        // Empty name
+        let err = store
+            .create(ROOT_INODE, "", S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        // Name with slash
+        let err = store
+            .create(ROOT_INODE, "foo/bar", S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        // Name too long
+        let long_name = "a".repeat(256);
+        let err = store
+            .create(ROOT_INODE, &long_name, S_IFREG | 0o644)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn append_slice_updates_size_and_mtime() {
+        use crate::fs_model::Slice;
+
+        let store = MemStore::new();
+        let inode_id = store
+            .create(ROOT_INODE, "test.txt", S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let before = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(before.size, 0);
+
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 100,
+            written_at: current_unix_time(),
+        };
+
+        store
+            .append_slice(inode_id, slice)
+            .await
+            .expect("append_slice must succeed");
+
+        let after = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(after.size, 100);
+        assert!(after.mtime >= before.mtime);
+
+        // Verify slice is readable
+        let slices = store
+            .read_slices(inode_id, 0)
+            .await
+            .expect("read_slices must succeed");
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].length, 100);
+    }
+
+    #[tokio::test]
+    async fn append_slice_cow_preserves_old_slices() {
+        use crate::fs_model::Slice;
+
+        let store = MemStore::new();
+        let inode_id = store
+            .create(ROOT_INODE, "test.txt", S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let slice1 = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::from_u128(1),
+            chunk_offset: 0,
+            length: 50,
+            written_at: 1000,
+        };
+
+        let slice2 = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::from_u128(2),
+            chunk_offset: 25,
+            length: 50,
+            written_at: 2000,
+        };
+
+        store
+            .append_slice(inode_id, slice1)
+            .await
+            .expect("first append must succeed");
+        store
+            .append_slice(inode_id, slice2)
+            .await
+            .expect("second append must succeed");
+
+        let slices = store
+            .read_slices(inode_id, 0)
+            .await
+            .expect("read_slices must succeed");
+        assert_eq!(slices.len(), 2, "both slices must be preserved (COW)");
+        assert_eq!(slices[0].slice_id, uuid::Uuid::from_u128(1));
+        assert_eq!(slices[1].slice_id, uuid::Uuid::from_u128(2));
+    }
+
+    #[tokio::test]
+    async fn append_slice_to_nonexistent_inode_returns_not_found() {
+        use crate::fs_model::Slice;
+
+        let store = MemStore::new();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 100,
+            written_at: current_unix_time(),
+        };
+
+        let err = store.append_slice(999, slice).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
     }
 }

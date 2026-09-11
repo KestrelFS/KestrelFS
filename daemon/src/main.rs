@@ -136,7 +136,25 @@ fn main() -> io::Result<()> {
     // actually return data instead of NotFound.
     runtime.block_on(seed_remote_txt_block(&object_store))?;
 
-    println!("kestrelfs-daemon: MemStore initialized (seeded: /, /remote.txt)");
+    // Ensure writable.dat (inode 4) exists. MemStore::new() pre-seeds it,
+    // but we verify it here as a sanity check and to exercise the create()
+    // trait method for clippy (avoiding dead_code warnings on MetaStore::create
+    // and related MetaError variants).
+    runtime.block_on(async {
+        if store.getattr(meta::WRITABLE_DAT_INODE).await.is_err() {
+            store
+                .create(
+                    fs_model::ROOT_INODE,
+                    "writable.dat",
+                    fs_model::S_IFREG | 0o666,
+                )
+                .await
+                .expect("failed to create writable.dat");
+            println!("kestrelfs-daemon: created /writable.dat (inode 4)");
+        }
+    });
+
+    println!("kestrelfs-daemon: MemStore initialized (seeded: /, /remote.txt, /writable.dat)");
 
     println!("kestrelfs-daemon: entering poll() event loop, waiting for REQ events ...");
 
@@ -299,6 +317,8 @@ async fn build_response(
         abi::OP_LOOKUP => handle_lookup(event, store).await,
         abi::OP_GETATTR => handle_getattr(event, store).await,
         abi::OP_READ_CHUNK => handle_read_chunk(event, store, object_store).await,
+        abi::OP_WRITE_CHUNK => handle_write_chunk(event, store, object_store).await,
+        abi::OP_TRUNCATE => handle_truncate(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -324,6 +344,7 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::NotFound => -libc::ENOENT,
         MetaError::NotADirectory => -libc::ENOTDIR,
         MetaError::InvalidName(_) => -libc::ENAMETOOLONG,
+        MetaError::AlreadyExists => -libc::EEXIST,
     }
 }
 
@@ -502,7 +523,10 @@ async fn handle_read_chunk(
                 "kestrelfs-daemon:    OP_READ_CHUNK inode={} offset={} count={} -> ENOENT (inode not found)",
                 req.inode_id, req.offset, req.count
             );
-            return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&MetaError::NotFound));
+            return KestrelfsEvent::error_response(
+                event.req_id,
+                meta_error_to_errno(&MetaError::NotFound),
+            );
         }
         Err(e) => {
             eprintln!(
@@ -532,7 +556,10 @@ async fn handle_read_chunk(
         Ok(data) => {
             println!(
                 "kestrelfs-daemon:    OP_READ_CHUNK inode={} offset={} count={} -> {} bytes",
-                req.inode_id, req.offset, req.count, data.len()
+                req.inode_id,
+                req.offset,
+                req.count,
+                data.len()
             );
             KestrelfsEvent::read_chunk_response(event.req_id, &data)
         }
@@ -544,6 +571,116 @@ async fn handle_read_chunk(
             KestrelfsEvent::error_response(event.req_id, -libc::EIO)
         }
     }
+}
+
+/// Handles `OP_WRITE_CHUNK` requests: writes data to a file.
+///
+/// Steps:
+/// 1. Decode the write request (inode_id, offset, count, data)
+/// 2. Validate inode exists (getattr)
+/// 3. Generate a new slice UUID and timestamp
+/// 4. Store the data block in ObjectStore under the slice's block key
+/// 5. Append the slice to MetaStore (updates size/mtime atomically)
+/// 6. Return success response
+async fn handle_write_chunk(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
+    let req = event.decode_write_chunk_req();
+
+    // Step 1: Validate inode exists
+    if let Err(e) = store.getattr(req.inode_id).await {
+        println!(
+            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> {:?}",
+            req.inode_id, req.offset, req.count, e
+        );
+        return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e));
+    }
+
+    // Step 2: Calculate chunk index and chunk offset
+    let chunk_index = (req.offset / fs_model::CHUNK_SIZE) as u32;
+    let chunk_offset = (req.offset % fs_model::CHUNK_SIZE) as u32;
+
+    // Step 3: Create a new slice
+    let slice_id = uuid::Uuid::new_v4();
+    let written_at = meta::current_unix_time();
+    let slice = fs_model::Slice {
+        chunk_index,
+        slice_id,
+        chunk_offset,
+        length: req.count,
+        written_at,
+    };
+
+    // Step 4: Store the data block in ObjectStore
+    let block_key = slice.block_key(0);
+    if let Err(e) = object_store.put(block_key.clone(), req.data.clone()).await {
+        eprintln!(
+            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> EIO (ObjectStore::put failed: {:?})",
+            req.inode_id, req.offset, req.count, e
+        );
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+
+    // Step 5: Append slice to MetaStore (updates size and mtime)
+    if let Err(e) = store.append_slice(req.inode_id, slice).await {
+        eprintln!(
+            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> EIO (MetaStore::append_slice failed: {:?})",
+            req.inode_id, req.offset, req.count, e
+        );
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+
+    println!(
+        "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> success (slice_id={})",
+        req.inode_id, req.offset, req.count, slice_id
+    );
+
+    KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+}
+
+/// Handles `OP_TRUNCATE` requests: sets file size (truncate/ftruncate).
+///
+/// Steps:
+/// 1. Decode the truncate request (inode_id, new_size)
+/// 2. Validate inode exists (getattr)
+/// 3. Call MetaStore::truncate to update size and mtime
+/// 4. Return success response
+///
+/// The MetaStore implementation updates the inode's size field (can shrink
+/// or grow) and mtime. Historical slices beyond new_size are retained (lazy
+/// GC), but the read path respects the new size limit.
+async fn handle_truncate(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
+    let req = event.decode_truncate_req();
+
+    // Step 1: Validate inode exists
+    if let Err(e) = store.getattr(req.inode_id).await {
+        println!(
+            "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> {:?}",
+            req.inode_id, req.new_size, e
+        );
+        return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e));
+    }
+
+    // Step 2: Truncate the file
+    if let Err(e) = store.truncate(req.inode_id, req.new_size).await {
+        eprintln!(
+            "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> EIO (MetaStore::truncate failed: {:?})",
+            req.inode_id, req.new_size, e
+        );
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+
+    println!(
+        "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> success",
+        req.inode_id, req.new_size
+    );
+
+    KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
 }
 
 /// Reads `count` bytes starting at file offset `file_offset` from inode
@@ -568,13 +705,32 @@ async fn read_from_slices(
     store: &Arc<dyn MetaStore>,
     object_store: &Arc<dyn ObjectStore>,
 ) -> Result<Vec<u8>, String> {
-    let mut result = vec![0u8; count as usize];
+    use std::collections::HashMap;
+
+    // Get inode to check file size (respects truncate)
+    let inode = store
+        .getattr(inode_id)
+        .await
+        .map_err(|e| format!("getattr(inode={inode_id}) failed: {e}"))?;
+
+    // Clamp read to file size (POSIX semantics: reads beyond EOF return short)
+    if file_offset >= inode.size {
+        return Ok(Vec::new()); // EOF
+    }
+
+    let available = inode.size - file_offset;
+    let clamped_count = (count as u64).min(available) as u32;
+
+    let mut result = vec![0u8; clamped_count as usize];
+
+    // Block cache: avoid fetching the same block multiple times in one read
+    let mut block_cache: HashMap<String, Vec<u8>> = HashMap::new();
 
     // Identify which chunk(s) this read spans (Phase 3 bootstrap: we
     // only ever read within one chunk since kernel clamps to 32 bytes,
     // but the logic here is written generically for future expansion).
     let start_chunk = Inode::chunk_index_for_offset(file_offset);
-    let end_offset = file_offset + count as u64;
+    let end_offset = file_offset + clamped_count as u64;
     let end_chunk = if end_offset == 0 {
         start_chunk
     } else {
@@ -613,11 +769,17 @@ async fn read_from_slices(
                 let byte_in_block = (byte_in_slice % fs_model::BLOCK_SIZE) as usize;
 
                 let block_key = slice.block_key(block_idx);
-                let block_data = object_store
-                    .get(&block_key)
-                    .await
-                    .map_err(|e| format!("ObjectStore::get({block_key}) failed: {e}"))?;
 
+                // Check cache first, fetch if not present
+                if !block_cache.contains_key(&block_key) {
+                    let block_data = object_store
+                        .get(&block_key)
+                        .await
+                        .map_err(|e| format!("ObjectStore::get({block_key}) failed: {e}"))?;
+                    block_cache.insert(block_key.clone(), block_data);
+                }
+
+                let block_data = &block_cache[&block_key];
                 if byte_in_block < block_data.len() {
                     let file_byte_idx = (chunk_base + offset_in_chunk - file_offset) as usize;
                     result[file_byte_idx] = block_data[byte_in_block];
@@ -658,8 +820,13 @@ mod tests {
 
     /// Shared test fixture: a fresh runtime + `MemStore`, exactly
     /// mirroring how `main()` constructs both.
-    fn test_fixture() -> (tokio::runtime::Runtime, Arc<dyn MetaStore>, Arc<dyn ObjectStore>) {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime construction must not fail in tests");
+    fn test_fixture() -> (
+        tokio::runtime::Runtime,
+        Arc<dyn MetaStore>,
+        Arc<dyn ObjectStore>,
+    ) {
+        let runtime =
+            tokio::runtime::Runtime::new().expect("runtime construction must not fail in tests");
         let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
         (runtime, store, object_store)
@@ -784,7 +951,9 @@ mod tests {
 
         // Seed the block so the test has data to read
         runtime.block_on(async {
-            seed_remote_txt_block(&object_store).await.expect("seed failed");
+            seed_remote_txt_block(&object_store)
+                .await
+                .expect("seed failed");
         });
 
         // Construct OP_READ_CHUNK request for inode=3, offset=0, count=32
@@ -813,5 +982,435 @@ mod tests {
 
         assert_eq!(resp.opcode, abi::OP_RESULT_OK);
         assert_eq!(resp.req_id, 10);
+    }
+
+    #[tokio::test]
+    async fn read_from_slices_returns_zeros_when_no_slices_exist() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        // Create a new file with size 4096 but no slices (sparse file)
+        let inode_id = store
+            .create(fs_model::ROOT_INODE, "sparse.dat", fs_model::S_IFREG | 0o666)
+            .await
+            .expect("create must succeed");
+
+        // Set size to 4096 but don't write any slices
+        store
+            .truncate(inode_id, 4096)
+            .await
+            .expect("truncate must succeed");
+
+        // Read from middle of file where no slices exist (sparse hole)
+        let data = read_from_slices(inode_id, 2048, 16, &store, &object_store)
+            .await
+            .expect("read_from_slices must not fail on sparse holes");
+
+        assert_eq!(data.len(), 16);
+        assert_eq!(data, vec![0u8; 16]);
+    }
+
+    #[tokio::test]
+    async fn read_from_slices_returns_data_from_single_slice() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        // Seed the existing slice's block (remote.txt chunk 0)
+        seed_remote_txt_block(&object_store)
+            .await
+            .expect("seed failed");
+
+        // Read bytes 10..26 from chunk 0 (where the seed data exists)
+        let data = read_from_slices(meta::REMOTE_TXT_INODE, 10, 16, &store, &object_store)
+            .await
+            .expect("read must succeed");
+
+        assert_eq!(data.len(), 16);
+        // "Phase3-seed-data! " repeated (18 bytes), bytes [10..26] = "d-data! Phase3-s"
+        assert_eq!(&data, b"d-data! Phase3-s");
+    }
+
+    #[tokio::test]
+    async fn read_from_slices_prefers_newer_written_at_on_overlap() {
+        use fs_model::Slice;
+
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        // Manually inject two overlapping slices into MemStore for a test inode
+        let test_inode = 99u64;
+        let test_size = 32u64;
+
+        // Add inode 99
+        mem_store
+            .insert_inode_for_test(
+                test_inode,
+                fs_model::Inode::new_file(test_inode, test_size, 1000),
+            )
+            .await;
+
+        // Create two slices both covering byte 10 in chunk 0
+        let slice_old = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::from_u128(1),
+            chunk_offset: 0,
+            length: 20,
+            written_at: 1000,
+        };
+
+        let slice_new = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::from_u128(2),
+            chunk_offset: 5,
+            length: 10,
+            written_at: 2000, // newer
+        };
+
+        // Write block data: old slice = all 'A', new slice = all 'B'
+        let old_block_key = slice_old.block_key(0);
+        let new_block_key = slice_new.block_key(0);
+        object_store
+            .put(old_block_key, vec![b'A'; 20])
+            .await
+            .unwrap();
+        object_store
+            .put(new_block_key, vec![b'B'; 10])
+            .await
+            .unwrap();
+
+        // Insert both slices (old first, then new - order shouldn't matter)
+        mem_store
+            .insert_slices_for_test(test_inode, 0, vec![slice_old, slice_new])
+            .await;
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Read byte 10: covered by both slices, but slice_new wins (written_at=2000 > 1000)
+        // slice_old: covers chunk bytes [0..20], so byte 10 = block[10] = 'A'
+        // slice_new: covers chunk bytes [5..15], so byte 10 = block[10-5=5] = 'B'
+        let data = read_from_slices(test_inode, 10, 1, &store, &object_store)
+            .await
+            .expect("read must succeed");
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0], b'B', "newer slice (written_at=2000) must win");
+    }
+
+    #[tokio::test]
+    async fn debug_block1_direct_access() {
+        use fs_model::Slice;
+
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let test_inode = 101u64;
+        mem_store
+            .insert_inode_for_test(
+                test_inode,
+                fs_model::Inode::new_file(test_inode, 1024, 1000),
+            )
+            .await;
+
+        // Single slice starting at chunk offset 512, length 8 (entirely in "block 1" territory)
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::from_u128(99),
+            chunk_offset: 512, // starts at block boundary
+            length: 8,
+            written_at: 1000,
+        };
+
+        // This slice's data starts at chunk byte 512, which is block_idx=1, byte_in_block=0
+        let block_key = slice.block_key(0); // block 0 of this slice (which covers chunk bytes 512-519)
+        println!("Block key: {}", block_key);
+        object_store
+            .put(block_key.clone(), vec![b'Z'; 8])
+            .await
+            .unwrap();
+
+        // Verify it's stored
+        let retrieved = object_store.get(&block_key).await.unwrap();
+        assert_eq!(retrieved, vec![b'Z'; 8]);
+
+        mem_store
+            .insert_slices_for_test(test_inode, 0, vec![slice])
+            .await;
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Read chunk bytes [512..520]
+        let data = read_from_slices(test_inode, 512, 8, &store, &object_store)
+            .await
+            .expect("read must succeed");
+
+        println!("Read data: {:?}", data);
+        assert_eq!(data, vec![b'Z'; 8]);
+    }
+
+    #[tokio::test]
+    async fn handle_write_chunk_creates_slice_and_stores_data() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        // Create a file to write to
+        let inode_id = mem_store
+            .create(fs_model::ROOT_INODE, "test.txt", fs_model::S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Build a WRITE_CHUNK request: write "hello" at offset 0
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset=0
+        event.payload[16..20].copy_from_slice(&5u32.to_le_bytes()); // count=5
+        event.payload[20..25].copy_from_slice(b"hello");
+
+        let resp = handle_write_chunk(&event, &store, &object_store).await;
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+
+        // Verify the data is readable back
+        let read_data = read_from_slices(inode_id, 0, 5, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(&read_data, b"hello");
+
+        // Verify inode size was updated
+        let inode = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(inode.size, 5);
+    }
+
+    #[tokio::test]
+    async fn handle_write_chunk_to_nonexistent_inode_returns_enoent() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event.payload[0..8].copy_from_slice(&999u64.to_le_bytes()); // nonexistent inode
+        event.payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&5u32.to_le_bytes());
+        event.payload[20..25].copy_from_slice(b"hello");
+
+        let resp = handle_write_chunk(&event, &store, &object_store).await;
+        assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp.error_code, -libc::ENOENT);
+    }
+
+    #[tokio::test]
+    async fn handle_write_chunk_cow_preserves_old_data() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let inode_id = mem_store
+            .create(fs_model::ROOT_INODE, "test.txt", fs_model::S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Write "AAAAA" at offset 0
+        let mut event1 = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event1.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event1.payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        event1.payload[16..20].copy_from_slice(&5u32.to_le_bytes());
+        event1.payload[20..25].copy_from_slice(b"AAAAA");
+        handle_write_chunk(&event1, &store, &object_store).await;
+
+        // Write "BB" at offset 2 (overlapping)
+        let mut event2 = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 2,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event2.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event2.payload[8..16].copy_from_slice(&2u64.to_le_bytes());
+        event2.payload[16..20].copy_from_slice(&2u32.to_le_bytes());
+        event2.payload[20..22].copy_from_slice(b"BB");
+        handle_write_chunk(&event2, &store, &object_store).await;
+
+        // Read back: should get "AABBA" (newer write wins on overlap)
+        let data = read_from_slices(inode_id, 0, 5, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(&data, b"AABBA");
+    }
+
+    #[tokio::test]
+    async fn truncate_shrinks_file_and_clamps_reads() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let inode_id = mem_store
+            .create(fs_model::ROOT_INODE, "test.txt", fs_model::S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Write 12 bytes "VERYLONGTEXT"
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&12u32.to_le_bytes());
+        event.payload[20..32].copy_from_slice(b"VERYLONGTEXT");
+        handle_write_chunk(&event, &store, &object_store).await;
+
+        // Verify size is 12
+        let inode = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(inode.size, 12);
+
+        // Truncate to 5 bytes
+        store
+            .truncate(inode_id, 5)
+            .await
+            .expect("truncate must succeed");
+
+        // Verify new size
+        let inode = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(inode.size, 5);
+
+        // Read should return only 5 bytes (no old tail)
+        let data = read_from_slices(inode_id, 0, 12, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(data.len(), 5);
+        assert_eq!(&data, b"VERYL");
+
+        // Read beyond EOF returns empty
+        let data = read_from_slices(inode_id, 10, 5, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn truncate_to_zero_empties_file() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let inode_id = mem_store
+            .create(fs_model::ROOT_INODE, "test.txt", fs_model::S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Write some data
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&5u32.to_le_bytes());
+        event.payload[20..25].copy_from_slice(b"HELLO");
+        handle_write_chunk(&event, &store, &object_store).await;
+
+        // Truncate to 0
+        store
+            .truncate(inode_id, 0)
+            .await
+            .expect("truncate must succeed");
+
+        let inode = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(inode.size, 0);
+
+        // Read returns empty
+        let data = read_from_slices(inode_id, 0, 10, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_after_truncate_does_not_shrink_size() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+
+        let inode_id = mem_store
+            .create(fs_model::ROOT_INODE, "test.txt", fs_model::S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        // Truncate to 100 (sparse file)
+        store
+            .truncate(inode_id, 100)
+            .await
+            .expect("truncate must succeed");
+
+        // Write 3 bytes at offset 50 (middle of sparse region)
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: abi::OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; abi::EVENT_PAYLOAD_SIZE],
+        };
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&50u64.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&3u32.to_le_bytes());
+        event.payload[20..23].copy_from_slice(b"ABC");
+        handle_write_chunk(&event, &store, &object_store).await;
+
+        // Size should remain 100 (write doesn't shrink)
+        let inode = store.getattr(inode_id).await.expect("getattr must succeed");
+        assert_eq!(inode.size, 100);
+
+        // Read at offset 50 gets "ABC"
+        let data = read_from_slices(inode_id, 50, 3, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(&data, b"ABC");
+
+        // Read before write position gets zeros (sparse)
+        let data = read_from_slices(inode_id, 0, 10, &store, &object_store)
+            .await
+            .expect("read must succeed");
+        assert_eq!(data, vec![0u8; 10]);
     }
 }

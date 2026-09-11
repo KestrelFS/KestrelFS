@@ -54,6 +54,20 @@ extern const struct file_operations kestrelfs_file_ops;
 extern const struct file_operations kestrelfs_remote_file_ops;
 
 /*
+ * kestrelfs_writable_file_ops - file operations for writable.dat (inode 4).
+ *
+ * Supports both read and write operations via IPC to the daemon.
+ */
+extern const struct file_operations kestrelfs_writable_file_ops;
+
+/*
+ * kestrelfs_writable_inode_ops - inode operations for writable.dat (inode 4).
+ *
+ * Implements setattr to handle truncate/ftruncate via OP_TRUNCATE IPC.
+ */
+extern const struct inode_operations kestrelfs_writable_inode_ops;
+
+/*
  * chardev.c: Phase 2 IPC bridge infrastructure (/dev/kestrel_ctl).
  *
  * kestrelfs_chardev_init()/_exit() are called once from super.c's

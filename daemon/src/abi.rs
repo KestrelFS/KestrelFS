@@ -49,7 +49,7 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 4;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -77,6 +77,10 @@ pub const OP_READ_CHUNK: u32 = 2;
 /// Request: fetch inode attributes. Mirrors `KESTRELFS_OP_GETATTR`.
 #[allow(dead_code)]
 pub const OP_GETATTR: u32 = 3;
+/// Request: write data to file. Mirrors `KESTRELFS_OP_WRITE_CHUNK`.
+pub const OP_WRITE_CHUNK: u32 = 4;
+/// Request: set file size (truncate/ftruncate). Mirrors `KESTRELFS_OP_TRUNCATE`.
+pub const OP_TRUNCATE: u32 = 5;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -157,6 +161,45 @@ impl KestrelfsEvent {
             inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
             offset: u64::from_le_bytes(self.payload[8..16].try_into().unwrap()),
             count: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
+        }
+    }
+
+    /// Decodes the payload as a `KESTRELFS_OP_WRITE_CHUNK` request (ABI v3).
+    ///
+    /// Layout:
+    /// - inode_id: u64 at offset 0
+    /// - offset: u64 at offset 8
+    /// - count: u32 at offset 16 (max 12 bytes)
+    /// - data: bytes at offset 20
+    ///
+    /// Caller must have already checked `opcode == OP_WRITE_CHUNK`.
+    pub fn decode_write_chunk_req(&self) -> WriteChunkReq {
+        let inode_id = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
+        let count = u32::from_le_bytes(self.payload[16..20].try_into().unwrap());
+        let count = count.min(12);
+        let data = self.payload[20..20 + count as usize].to_vec();
+
+        WriteChunkReq {
+            inode_id,
+            offset,
+            count,
+            data,
+        }
+    }
+
+    /// Decodes a `KESTRELFS_OP_TRUNCATE` request from the payload.
+    ///
+    /// Payload layout (little-endian):
+    ///   [0..8)   inode_id (u64)
+    ///   [8..16)  new_size (u64)
+    pub fn decode_truncate_req(&self) -> TruncateReq {
+        let inode_id = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let new_size = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
+
+        TruncateReq {
+            inode_id,
+            new_size,
         }
     }
 
@@ -378,6 +421,27 @@ pub struct ReadChunkReq {
     pub count: u32,
 }
 
+/// Decoded `KESTRELFS_OP_WRITE_CHUNK` request payload.
+///
+/// Layout (ABI v3):
+/// - `inode_id` at offset 0 (u64)
+/// - `offset` at offset 8 (u64)
+/// - `count` at offset 16 (u32, max 12)
+/// - `data` at offset 20 (up to 12 bytes)
+pub struct WriteChunkReq {
+    pub inode_id: u64,
+    pub offset: u64,
+    pub count: u32,
+    pub data: Vec<u8>,
+}
+
+/// Decoded KESTRELFS_OP_TRUNCATE request.
+#[derive(Debug, Clone)]
+pub struct TruncateReq {
+    pub inode_id: u64,
+    pub new_size: u64,
+}
+
 // ---------------------------------------------------------------------
 // struct kestrelfs_ring_ctrl
 // ---------------------------------------------------------------------
@@ -481,8 +545,7 @@ pub fn compile_time_layout_asserts() {
     );
 
     assert_eq!(
-        SHM_REGION_SIZE,
-        131_264,
+        SHM_REGION_SIZE, 131_264,
         "kestrelfs_shared_region size drifted from the value verified \
          against the running kernel module during Phase 2 development \
          (see README/design notes); if this legitimately changed, the \
@@ -554,7 +617,9 @@ mod tests {
     fn decode_lookup_req_accepts_max_length_name() {
         let name = vec![b'a'; LOOKUP_NAME_MAX];
         let event = raw_lookup_req(1, &name);
-        let decoded = event.decode_lookup_req().expect("max-length name must be accepted");
+        let decoded = event
+            .decode_lookup_req()
+            .expect("max-length name must be accepted");
         assert_eq!(decoded.name.len(), LOOKUP_NAME_MAX);
     }
 
@@ -567,7 +632,10 @@ mod tests {
         let mut event = KestrelfsEvent::zeroed(OP_LOOKUP, 1);
         event.payload[8] = (LOOKUP_NAME_MAX + 1) as u8;
         let err = event.decode_lookup_req().unwrap_err();
-        assert_eq!(err, LookupDecodeError::NameTooLong((LOOKUP_NAME_MAX + 1) as u8));
+        assert_eq!(
+            err,
+            LookupDecodeError::NameTooLong((LOOKUP_NAME_MAX + 1) as u8)
+        );
     }
 
     #[test]
@@ -581,7 +649,9 @@ mod tests {
     #[test]
     fn decode_lookup_req_empty_name() {
         let event = raw_lookup_req(1, b"");
-        let decoded = event.decode_lookup_req().expect("empty name is a valid (if unusual) payload");
+        let decoded = event
+            .decode_lookup_req()
+            .expect("empty name is a valid (if unusual) payload");
         assert_eq!(decoded.name, "");
     }
 
@@ -593,12 +663,30 @@ mod tests {
 
         assert_eq!(event.opcode, OP_RESULT_OK);
         assert_eq!(event.req_id, 7);
-        assert_eq!(u64::from_le_bytes(event.payload[0..8].try_into().unwrap()), 2);
-        assert_eq!(u64::from_le_bytes(event.payload[8..16].try_into().unwrap()), 512);
-        assert_eq!(u32::from_le_bytes(event.payload[16..20].try_into().unwrap()), 0o100644);
-        assert_eq!(u32::from_le_bytes(event.payload[20..24].try_into().unwrap()), 1000);
-        assert_eq!(u32::from_le_bytes(event.payload[24..28].try_into().unwrap()), 1000);
-        assert_eq!(u32::from_le_bytes(event.payload[28..32].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_le_bytes(event.payload[0..8].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(event.payload[8..16].try_into().unwrap()),
+            512
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[16..20].try_into().unwrap()),
+            0o100644
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[20..24].try_into().unwrap()),
+            1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[24..28].try_into().unwrap()),
+            1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[28..32].try_into().unwrap()),
+            1
+        );
     }
 
     // --- KESTRELFS_OP_GETATTR request decode ------------------------
@@ -619,11 +707,26 @@ mod tests {
 
         assert_eq!(event.opcode, OP_RESULT_OK);
         assert_eq!(event.req_id, 9);
-        assert_eq!(u64::from_le_bytes(event.payload[0..8].try_into().unwrap()), 512);
-        assert_eq!(u32::from_le_bytes(event.payload[8..12].try_into().unwrap()), 0o100644);
-        assert_eq!(u32::from_le_bytes(event.payload[12..16].try_into().unwrap()), 1000);
-        assert_eq!(u32::from_le_bytes(event.payload[16..20].try_into().unwrap()), 1000);
-        assert_eq!(u32::from_le_bytes(event.payload[20..24].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_le_bytes(event.payload[0..8].try_into().unwrap()),
+            512
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[8..12].try_into().unwrap()),
+            0o100644
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[12..16].try_into().unwrap()),
+            1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[16..20].try_into().unwrap()),
+            1000
+        );
+        assert_eq!(
+            u32::from_le_bytes(event.payload[20..24].try_into().unwrap()),
+            1
+        );
         assert_eq!(
             u64::from_le_bytes(event.payload[24..32].try_into().unwrap()),
             1_700_000_000
@@ -670,5 +773,78 @@ mod tests {
     #[test]
     fn getattr_response_fields_sum_to_full_payload() {
         const { assert!(8 + 4 + 4 + 4 + 4 + 8 == EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn decode_write_chunk_req_extracts_all_fields() {
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 123,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; EVENT_PAYLOAD_SIZE],
+        };
+
+        // inode_id = 42 at offset 0
+        event.payload[0..8].copy_from_slice(&42u64.to_le_bytes());
+        // offset = 1000 at offset 8
+        event.payload[8..16].copy_from_slice(&1000u64.to_le_bytes());
+        // count = 5 at offset 16
+        event.payload[16..20].copy_from_slice(&5u32.to_le_bytes());
+        // data = "hello" at offset 20
+        event.payload[20..25].copy_from_slice(b"hello");
+
+        let req = event.decode_write_chunk_req();
+        assert_eq!(req.inode_id, 42);
+        assert_eq!(req.offset, 1000);
+        assert_eq!(req.count, 5);
+        assert_eq!(req.data, b"hello");
+    }
+
+    #[test]
+    fn decode_write_chunk_req_clamps_count_to_max_12() {
+        let mut event = KestrelfsEvent {
+            seq: 0,
+            opcode: OP_WRITE_CHUNK,
+            flags: 0,
+            req_id: 1,
+            error_code: 0,
+            _reserved0: 0,
+            payload: [0u8; EVENT_PAYLOAD_SIZE],
+        };
+
+        // count = 999 (invalid, should be clamped to 12)
+        event.payload[16..20].copy_from_slice(&999u32.to_le_bytes());
+        event.payload[20..32].copy_from_slice(b"123456789012");
+
+        let req = event.decode_write_chunk_req();
+        assert_eq!(req.count, 12);
+        assert_eq!(req.data.len(), 12);
+        assert_eq!(&req.data, b"123456789012");
+    }
+
+    #[test]
+    fn write_chunk_request_fits_payload_budget() {
+        // inode_id(8) + offset(8) + count(4) + data(12) = 32
+        const { assert!(8 + 8 + 4 + 12 == EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn decode_truncate_req_works() {
+        let mut event = KestrelfsEvent::zeroed(OP_TRUNCATE, 123);
+        event.payload[0..8].copy_from_slice(&42u64.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&1024u64.to_le_bytes());
+
+        let req = event.decode_truncate_req();
+        assert_eq!(req.inode_id, 42);
+        assert_eq!(req.new_size, 1024);
+    }
+
+    #[test]
+    fn truncate_request_fits_payload_budget() {
+        // inode_id(8) + new_size(8) = 16, well within 32 bytes
+        const { assert!(8 + 8 <= EVENT_PAYLOAD_SIZE) };
     }
 }

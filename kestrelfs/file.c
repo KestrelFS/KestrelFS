@@ -32,6 +32,7 @@
 #include <linux/minmax.h>
 #include <linux/errno.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 
 #include "kestrelfs.h"
 
@@ -243,4 +244,265 @@ const struct file_operations kestrelfs_remote_file_ops = {
 	.owner	= THIS_MODULE,
 	.read	= kestrelfs_remote_read,
 	.llseek	= kestrelfs_remote_llseek,
+};
+
+/*
+ * kestrelfs_writable_read() - fops->read for writable.dat (inode 4).
+ *
+ * Similar to kestrelfs_remote_read, but uses i_size_read() instead of
+ * KESTRELFS_REMOTE_FILE_SIZE. This allows writable.dat to have a dynamic
+ * size that can be changed via write/truncate operations.
+ *
+ * Steps:
+ *   0. Read current file size from inode->i_size (respects truncate)
+ *   1. If *ppos >= i_size, return 0 (EOF)
+ *   2. Clamp count to min(requested, 32, remaining_bytes_to_eof)
+ *   3. Send READ_CHUNK IPC request to daemon
+ *   4. Wait for response and copy data to userspace
+ *   5. Advance *ppos and return bytes read
+ *
+ * Return: bytes read on success, 0 at EOF, negative errno on error.
+ */
+static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	struct inode *inode = file->f_inode;
+	struct kestrelfs_event resp;
+	u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE];
+	u64 req_id, file_size;
+	u32 clamped_count;
+	int ret;
+
+	/* Get current file size (respects truncate) */
+	file_size = i_size_read(inode);
+
+	/* EOF check */
+	if (*ppos >= file_size)
+		return 0;
+
+	if (count == 0)
+		return 0;
+
+	/* Clamp to (requested, max_chunk_size, bytes_remaining_to_eof) */
+	clamped_count = (u32)min3((u64)count, (u64)KESTRELFS_READ_CHUNK_MAX_LEN,
+				   file_size - *ppos);
+
+	/* Build READ_CHUNK request */
+	memset(payload, 0, sizeof(payload));
+	put_unaligned_le64((u64)inode->i_ino, &payload[0]);
+	put_unaligned_le64((u64)*ppos, &payload[8]);
+	put_unaligned_le32(clamped_count, &payload[16]);
+
+	ret = kestrelfs_req_push(KESTRELFS_OP_READ_CHUNK, 0, payload, &req_id);
+	if (ret)
+		return ret;
+
+	/* Wait for response */
+	for (;;) {
+		ret = kestrelfs_check_resp(req_id, &resp);
+		if (ret == 0)
+			break;
+
+		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS));
+		if (ret == -ERESTARTSYS)
+			return -EINTR;
+	}
+
+	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+		return resp.error_code < 0 ? resp.error_code : -EIO;
+
+	/* Copy data to userspace */
+	if (copy_to_user(buf, resp.payload, clamped_count))
+		return -EFAULT;
+
+	*ppos += clamped_count;
+	return clamped_count;
+}
+
+/*
+ * kestrelfs_writable_llseek() - fops->llseek for writable.dat.
+ *
+ * Uses generic_file_llseek which dynamically reads i_size, allowing
+ * SEEK_END to reflect the current file size after write/truncate operations.
+ */
+static loff_t kestrelfs_writable_llseek(struct file *file, loff_t offset,
+					 int whence)
+{
+	return generic_file_llseek(file, offset, whence);
+}
+
+/*
+ * kestrelfs_writable_write() - handle write(2) on writable.dat.
+ *
+ * Sends a WRITE_CHUNK IPC request to the daemon with:
+ * - inode_id (u64) = file's inode number
+ * - offset (u64) = *ppos (adjusted for O_APPEND if needed)
+ * - count (u32) = min(len, 12) (limited by IPC payload size)
+ * - data (up to 12 bytes)
+ *
+ * O_APPEND handling: Unlike write_iter-based paths, when a filesystem
+ * implements f_op->write directly, the VFS vfs_write() does NOT call
+ * generic_write_checks() to automatically translate O_APPEND into
+ * "seek to i_size before writing". We must manually check f_flags and
+ * update *ppos to i_size when O_APPEND is set, otherwise "echo foo >> file"
+ * would incorrectly write at offset 0 instead of appending.
+ *
+ * Returns number of bytes written on success, negative errno on error.
+ */
+static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *buf,
+					 size_t len, loff_t *ppos)
+{
+	struct kestrelfs_event resp;
+	u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE];
+	unsigned long deadline;
+	u64 req_id;
+	size_t write_len;
+	int ret;
+
+	if (len == 0)
+		return 0;
+
+	/* Handle O_APPEND: VFS does not automatically seek to EOF for us
+	 * when using f_op->write (only for write_iter). */
+	if (filp->f_flags & O_APPEND)
+		*ppos = i_size_read(filp->f_inode);
+
+	/* Clamp to max 12 bytes per IPC call */
+	write_len = min_t(size_t, len, 12);
+
+	/* Build payload: inode_id@0, offset@8, count@16, data@20 */
+	memset(payload, 0, sizeof(payload));
+	put_unaligned_le64((u64)filp->f_inode->i_ino, &payload[0]);
+	put_unaligned_le64((u64)*ppos, &payload[8]);
+	put_unaligned_le32(write_len, &payload[16]);
+
+	/* Copy user data to payload */
+	if (copy_from_user(&payload[20], buf, write_len))
+		return -EFAULT;
+
+	ret = kestrelfs_req_push(KESTRELFS_OP_WRITE_CHUNK, 0, payload, &req_id);
+	if (ret)
+		return ret;
+
+	deadline = jiffies + msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS);
+
+	for (;;) {
+		ret = kestrelfs_check_resp(req_id, &resp);
+		if (ret == 0)
+			break;
+
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+
+		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS));
+		if (ret == -ERESTARTSYS)
+			return -EINTR;
+	}
+
+	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+		return resp.error_code < 0 ? resp.error_code : -EIO;
+
+	/* Daemon succeeded: update file position */
+	*ppos += write_len;
+
+	/* Update i_size if write extended the file.
+	 * This ensures stat() reflects the new size after write. */
+	if (*ppos > i_size_read(filp->f_inode)) {
+		i_size_write(filp->f_inode, *ppos);
+		mark_inode_dirty(filp->f_inode);
+	}
+
+	return write_len;
+}
+
+const struct file_operations kestrelfs_writable_file_ops = {
+	.owner	= THIS_MODULE,
+	.read	= kestrelfs_writable_read,
+	.write	= kestrelfs_writable_write,
+	.llseek	= kestrelfs_writable_llseek,
+};
+
+/**
+ * kestrelfs_writable_setattr() - handle setattr for writable.dat (truncate support).
+ * @idmap: idmap for user namespace (unused, VFS plumbing)
+ * @dentry: dentry of writable.dat
+ * @attr: attributes to set
+ *
+ * This function is called by the VFS when userspace invokes:
+ *   - open(..., O_TRUNC) - VFS calls setattr(ATTR_SIZE, 0) after open
+ *   - ftruncate(fd, size) - explicit size change
+ *   - truncate(path, size) - explicit size change
+ *
+ * We only handle ATTR_SIZE changes. For other attributes, we use the
+ * simple_setattr() helper.
+ *
+ * Steps:
+ *   1. If ATTR_SIZE is set, send KESTRELFS_OP_TRUNCATE IPC to daemon
+ *   2. If daemon succeeds, call truncate_setsize() to update kernel i_size
+ *   3. Call setattr_copy() to apply other attribute changes
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
+				       struct dentry *dentry,
+				       struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	int ret;
+
+	/* Handle ATTR_SIZE (truncate/ftruncate) via IPC */
+	if (attr->ia_valid & ATTR_SIZE) {
+		u64 inode_id = inode->i_ino;
+		u64 new_size = attr->ia_size;
+		u64 req_id;
+		u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE] = {0};
+		struct kestrelfs_event resp;
+
+		/* Build KESTRELFS_OP_TRUNCATE request payload:
+		 * inode_id@0 (u64), new_size@8 (u64) */
+		put_unaligned_le64(inode_id, &payload[0]);
+		put_unaligned_le64(new_size, &payload[8]);
+
+		ret = kestrelfs_req_push(KESTRELFS_OP_TRUNCATE, 0, payload, &req_id);
+		if (ret) {
+			pr_err("kestrelfs: failed to push TRUNCATE request: %d\n", ret);
+			return ret;
+		}
+
+		/* Wait for response (2 second timeout) */
+		for (;;) {
+			ret = kestrelfs_check_resp(req_id, &resp);
+			if (ret == 0)
+				break;
+
+			ret = kestrelfs_wait_for_resp(msecs_to_jiffies(2000));
+			if (ret == -ERESTARTSYS)
+				return -EINTR;
+			if (ret == -ETIME) {
+				pr_err("kestrelfs: TRUNCATE inode=%llu new_size=%llu timeout\n",
+				       inode_id, new_size);
+				return -ETIMEDOUT;
+			}
+		}
+
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
+			pr_err("kestrelfs: TRUNCATE inode=%llu new_size=%llu failed: %d\n",
+			       inode_id, new_size, resp.error_code);
+			return resp.error_code;
+		}
+
+		/* Daemon succeeded, update kernel i_size.
+		 * truncate_setsize() handles page cache invalidation. */
+		truncate_setsize(inode, new_size);
+	}
+
+	/* Apply other attribute changes (mtime, mode, etc.) */
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
+
+	return 0;
+}
+
+const struct inode_operations kestrelfs_writable_inode_ops = {
+	.setattr = kestrelfs_writable_setattr,
 };

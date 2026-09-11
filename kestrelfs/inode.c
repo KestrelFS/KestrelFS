@@ -97,6 +97,35 @@ static void kestrelfs_fixup_remote_size(struct super_block *sb)
 	dput(dentry);
 }
 
+/**
+ * kestrelfs_setup_writable_inode_ops() - install custom inode_operations for writable.dat.
+ * @sb: superblock
+ *
+ * After simple_fill_super() creates writable.dat with default simple_dir inode ops,
+ * we replace i_op with kestrelfs_writable_inode_ops to support setattr (truncate).
+ */
+static void kestrelfs_setup_writable_inode_ops(struct super_block *sb)
+{
+	struct dentry *dentry;
+
+	dentry = lookup_one_len_unlocked("writable.dat", sb->s_root,
+					  strlen("writable.dat"));
+	if (IS_ERR(dentry)) {
+		pr_warn("kestrelfs: could not look up writable.dat to set inode_operations: %ld\n",
+			PTR_ERR(dentry));
+		return;
+	}
+
+	if (!dentry->d_inode) {
+		pr_warn("kestrelfs: writable.dat dentry has no inode, skipping inode_operations setup\n");
+		dput(dentry);
+		return;
+	}
+
+	dentry->d_inode->i_op = &kestrelfs_writable_inode_ops;
+	dput(dentry);
+}
+
 /*
  * kestrelfs_fill_super() - populate a freshly allocated superblock.
  * @sb:		superblock to fill in.
@@ -124,6 +153,7 @@ static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 	static struct tree_descr kestrelfs_files[] = {
 		[2] = { "hello.txt", &kestrelfs_file_ops, S_IRUGO },
 		[3] = { "remote.txt", &kestrelfs_remote_file_ops, S_IRUGO },
+		[4] = { "writable.dat", &kestrelfs_writable_file_ops, S_IRUGO | S_IWUGO },
 		{ "" },
 	};
 	int ret;
@@ -141,8 +171,9 @@ static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &kestrelfs_super_ops;
 
 	kestrelfs_fixup_remote_size(sb);
+	kestrelfs_setup_writable_inode_ops(sb);
 
-	pr_info("kestrelfs: superblock populated (root + hello.txt + remote.txt)\n");
+	pr_info("kestrelfs: superblock populated (root + hello.txt + remote.txt + writable.dat)\n");
 	return 0;
 }
 

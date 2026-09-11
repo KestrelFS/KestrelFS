@@ -356,6 +356,39 @@ bump: it only adds interpretation rules for previously-reserved payload
 bytes of two opcodes that had no producer/consumer code on either side yet,
 without changing any existing struct's size, alignment, or field offsets.
 
+### Known Limitations
+
+**Write path (Phase 3 step 4)**: The current implementation does **not** yet
+handle file truncation or `O_TRUNC` semantics. When shell redirection
+(`> file`) overwrites a file with shorter content, the file size remains at
+its previous (larger) value, and subsequent reads may return stale tail bytes
+from earlier writes.
+
+**Root cause**: The kernel module does not detect or communicate `O_TRUNC` to
+the daemon, and the daemon's `append_slice()` method only ever grows file
+size (`max(old_size, new_end)`), never shrinks it. The COW (copy-on-write)
+slice model preserves all historical writes; reads correctly select the newest
+slice for each byte range, but the reported file size stays at the maximum
+offset ever written.
+
+**Example failure**:
+```bash
+echo "LONGCONTENT" > /mnt/kestrelfs/writable.dat  # size=11
+echo "SHORT" > /mnt/kestrelfs/writable.dat        # size still 11
+cat /mnt/kestrelfs/writable.dat                   # reads "SHORTONTENT" (stale tail)
+```
+
+**Workaround** (until `truncate` support is added in a future step):
+```bash
+truncate -s 0 /mnt/kestrelfs/writable.dat  # manually shrink to 0 first
+echo "newdata" > /mnt/kestrelfs/writable.dat
+```
+
+Or ensure every overwrite is at least as long as the previous file size.
+
+A future step will add `KESTRELFS_OP_TRUNCATE` (IPC opcode 5) and kernel-side
+`O_TRUNC` detection to properly implement POSIX file truncation semantics.
+
 ### Coding standards
 
 - Kernel C code strictly follows the Linux kernel coding style and is built

@@ -118,8 +118,59 @@
 #define KESTRELFS_OP_LOOKUP		1	/* req: resolve path -> inode metadata */
 #define KESTRELFS_OP_READ_CHUNK		2	/* req: fetch chunk data (cache miss) */
 #define KESTRELFS_OP_GETATTR		3	/* req: fetch inode attributes */
+#define KESTRELFS_OP_WRITE_CHUNK	4	/* req: write data to file */
+#define KESTRELFS_OP_TRUNCATE		5	/* req: set file size (truncate/ftruncate) */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
+
+/*
+ * Payload layout for KESTRELFS_OP_WRITE_CHUNK requests
+ * -----------------------------------------------------
+ *
+ * struct kestrelfs_write_chunk_req (packed manually into
+ * kestrelfs_event.payload, NOT a separate C struct - both sides must
+ * encode/decode at exact byte offsets):
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id - target file inode
+ *   offset  8, 8 bytes, little-endian u64: offset - file byte offset
+ *   offset 16, 4 bytes, little-endian u32: count - number of bytes to write
+ *   offset 20, up to 12 bytes: data - actual bytes to write
+ *
+ * Maximum write size per call is 12 bytes (32-byte payload - 20 bytes header).
+ * Introduced in KESTRELFS_ABI_VERSION 3.
+ *
+ * Response: RESULT_OK on success (daemon has durably stored the write),
+ * RESULT_ERROR with negative errno on failure.
+ *
+ * The daemon updates file size via max(old_size, offset+count). For shrinking
+ * the file or handling O_TRUNC, use KESTRELFS_OP_TRUNCATE (see below).
+ */
+
+/*
+ * Payload layout for KESTRELFS_OP_TRUNCATE requests
+ * --------------------------------------------------
+ *
+ * struct kestrelfs_truncate_req (packed manually into
+ * kestrelfs_event.payload, NOT a separate C struct - both sides must
+ * encode/decode at exact byte offsets):
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id - target file inode
+ *   offset  8, 8 bytes, little-endian u64: new_size - new file size in bytes
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 4.
+ *
+ * This operation is triggered by VFS setattr(ATTR_SIZE) calls, which handle:
+ *   - open(..., O_TRUNC) - truncate to 0 on open
+ *   - ftruncate(fd, size) - explicit truncate via syscall
+ *   - truncate(path, size) - explicit truncate via syscall
+ *
+ * The daemon MUST update the inode's size and mtime. Historical slices beyond
+ * new_size MAY be retained for lazy GC, but read operations MUST respect the
+ * new size limit (clamp reads to [0, new_size) and return EOF appropriately).
+ *
+ * Response: RESULT_OK on success, RESULT_ERROR with negative errno on failure.
+ * On failure, the kernel will NOT update i_size.
+ */
 
 /*
  * Payload layout for KESTRELFS_OP_READ_CHUNK requests
@@ -380,8 +431,14 @@ struct kestrelfs_ring_ctrl {
  *       kestrelfs_files[] in inode.c) to 3, making it no longer safe
  *       for the Rust daemon to assume every READ_CHUNK request targets
  *       one single, implicit file.
+ *
+ *   3 - Phase 3 step 4: Added KESTRELFS_OP_WRITE_CHUNK (opcode 4) for
+ *       write operations. Payload layout: inode_id (u64 @0), offset
+ *       (u64 @8), count (u32 @16, max 12), data (@20). This enables
+ *       the daemon to accept writes from the kernel and persist them
+ *       via MetaStore + ObjectStore, completing the read/write path.
  */
-#define KESTRELFS_ABI_VERSION		2
+#define KESTRELFS_ABI_VERSION		4
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.

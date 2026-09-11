@@ -199,7 +199,10 @@ mod tests {
         let store1 = MemObjectStore::new();
         let store2 = store1.clone();
 
-        store1.put("shared_key".to_string(), b"data".to_vec()).await.unwrap();
+        store1
+            .put("shared_key".to_string(), b"data".to_vec())
+            .await
+            .unwrap();
         let retrieved = store2.get("shared_key").await.unwrap();
 
         assert_eq!(retrieved, b"data");
@@ -210,11 +213,7 @@ mod tests {
         let store = MemObjectStore::new();
         store.put("k".to_string(), b"v".to_vec()).await.unwrap();
 
-        let (r1, r2, r3) = tokio::join!(
-            store.get("k"),
-            store.get("k"),
-            store.get("k")
-        );
+        let (r1, r2, r3) = tokio::join!(store.get("k"), store.get("k"), store.get("k"));
 
         assert_eq!(r1.unwrap(), b"v");
         assert_eq!(r2.unwrap(), b"v");
