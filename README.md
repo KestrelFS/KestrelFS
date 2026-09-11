@@ -1,4 +1,20 @@
-# KestrelFS
+<p align="center">
+  <a href="https://github.com/KestrelFS/KestrelFS">
+    <img src=".github/assets/kestrelfs-logo.svg" alt="KestrelFS Logo" width="650">
+  </a>
+</p>
+
+<p align="center">
+  <strong>超高性能、内核级加速的云原生分布式文件系统</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/KestrelFS/KestrelFS/actions"><img src="https://img.shields.io/badge/Kernel-Linux%206.x-blue.svg" alt="Kernel"></a>
+  <a href="https://github.com/KestrelFS/KestrelFS"><img src="https://img.shields.io/badge/Language-C%20%2F%20Rust-orange.svg" alt="Language"></a>
+  <a href="https://github.com/KestrelFS/KestrelFS/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg" alt="License"></a>
+</p>
+
+---
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
