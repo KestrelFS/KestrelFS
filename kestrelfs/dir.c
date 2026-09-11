@@ -233,19 +233,22 @@ const struct inode_operations kestrelfs_dir_inode_operations = {
  * Sends KESTRELFS_OP_READDIR to daemon repeatedly with increasing offset
  * until entry_count == 0. Emits entries via dir_emit().
  *
- * LIMITATION: READDIR response can only fit 2 entries per call due to
- * payload size constraints (32 bytes). Entry names are limited:
- * - entry[0]: max 10 chars + NUL (11 bytes)
- * - entry[1]: max 4 chars (truncated, no NUL guarantee)
- * Long names will be truncated and may cause issues with userspace tools.
+ * PAYLOAD LIMITATION: To avoid name truncation, daemon now returns only
+ * 1 entry per response (changed from 2). Layout:
+ *   - entry_count (u8@0)
+ *   - entry[0]: inode (u64@1) + name (up to 23 bytes@9)
+ * This allows full names like "remote.txt" and "writable.dat" without
+ * truncation (previously "remo" and "writ").
+ *
+ * ORDERING NOTE: MemStore uses HashMap, so entries appear in arbitrary order.
+ * For stable listings, daemon should sort by name or inode (not yet implemented).
  */
 static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	
 	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
-	u32 offset = (u32)ctx->pos;
+	u32 offset;
 	int ret;
 
 	pr_info("kestrelfs: readdir ino=%lu pos=%lld\n", inode->i_ino, ctx->pos);
@@ -269,8 +272,9 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 	/* Loop: send READDIR requests until entry_count == 0 */
 	while (1) {
 		u8 entry_count;
-		u64 ino1, ino2;
-		char name1[12], name2[5];
+		u64 ino;
+		char name[24];  /* 23 bytes + NUL */
+		int name_len;
 		int i;
 
 		/* Build READDIR request: dir_ino(u64@0) + offset(u32@8) */
@@ -285,7 +289,7 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 			return ret;
 		}
 
-		/* Parse response: entry_count(u8@0) + entries */
+		/* Parse response: entry_count(u8@0) + entry */
 		entry_count = resp.payload[0];
 
 		pr_info("kestrelfs: readdir offset=%u -> entry_count=%u\n",
@@ -296,52 +300,30 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 			break;
 		}
 
-		/* Entry 0: ino(u64@1) + name(11 bytes@9, NUL-terminated) */
+		/* Entry: ino(u64@1) + name(up to 23 bytes@9) */
 		if (entry_count >= 1) {
-			memcpy(&ino1, &resp.payload[1], sizeof(u64));
-			memcpy(name1, &resp.payload[9], 11);
-			name1[11] = 0; /* ensure NUL termination */
+			memcpy(&ino, &resp.payload[1], sizeof(u64));
+			memcpy(name, &resp.payload[9], 23);
+			name[23] = 0; /* ensure NUL termination */
 
-			/* Find actual NUL in name1 */
-			for (i = 0; i < 11; i++) {
-				if (name1[i] == 0)
+			/* Find actual name length (look for NUL or end of buffer) */
+			name_len = 0;
+			for (i = 0; i < 23; i++) {
+				if (name[i] == 0)
 					break;
+				name_len++;
 			}
 
-			if (i > 0) {
-				if (!dir_emit(ctx, name1, i, ino1, DT_UNKNOWN)) {
+			if (name_len > 0) {
+				if (!dir_emit(ctx, name, name_len, ino, DT_UNKNOWN)) {
 					return 0; /* Buffer full */
 				}
 				ctx->pos++;
 			}
 		}
 
-		/* Entry 1: ino(u64@20) + name(4 bytes@28, possibly truncated) */
-		if (entry_count >= 2) {
-			memcpy(&ino2, &resp.payload[20], sizeof(u64));
-			memcpy(name2, &resp.payload[28], 4);
-			name2[4] = 0; /* ensure NUL termination */
-
-			/* Find actual NUL or use all 4 bytes */
-			for (i = 0; i < 4; i++) {
-				if (name2[i] == 0)
-					break;
-			}
-
-			if (i > 0) {
-				if (!dir_emit(ctx, name2, i, ino2, DT_UNKNOWN)) {
-					return 0; /* Buffer full */
-				}
-				ctx->pos++;
-			}
-		}
-
-		/* Advance offset for next batch */
+		/* Advance offset for next batch (1 entry at a time) */
 		offset += entry_count;
-
-		/* Safety: if we got fewer than 2 entries, we're at the end */
-		if (entry_count < 2)
-			break;
 	}
 
 	return 0;

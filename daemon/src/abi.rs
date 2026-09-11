@@ -398,27 +398,26 @@ impl KestrelfsEvent {
         let mut event = KestrelfsEvent::zeroed(OP_RESULT_OK, req_id);
         let p = &mut event.payload;
 
-        let entry_count = entries.len().min(2) as u8;
+        // Limit to 1 entry per response to avoid name truncation.
+        // With 32-byte payload, returning 2 entries leaves only 4 bytes
+        // for the second name (entry[1]@28), causing "remote.txt" -> "remo".
+        // Solution: return max 1 entry with full name space (~20 bytes).
+        let entry_count = entries.len().min(1) as u8;
         p[0] = entry_count;
 
         if entry_count >= 1 {
             let (inode, name) = entries[0];
             p[1..9].copy_from_slice(&inode.to_le_bytes());
             let name_bytes = name.as_bytes();
-            let copy_len = name_bytes.len().min(10);
+            // With only 1 entry, we can use more space for the name.
+            // Layout: entry_count(1) + inode(8) + name(up to 23 bytes)
+            // Total: 1 + 8 + 23 = 32 (fits in payload)
+            let copy_len = name_bytes.len().min(23);
             p[9..9 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
-            // NUL terminator (implicit if name fits, or truncation marker)
-            if copy_len < 11 {
+            // NUL terminator if space allows
+            if copy_len < 23 {
                 p[9 + copy_len] = 0;
             }
-        }
-
-        if entry_count >= 2 {
-            let (inode, name) = entries[1];
-            p[20..28].copy_from_slice(&inode.to_le_bytes());
-            let name_bytes = name.as_bytes();
-            let copy_len = name_bytes.len().min(4);
-            p[28..28 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
         }
 
         event

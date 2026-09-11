@@ -406,10 +406,14 @@ static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *bu
 	*ppos += write_len;
 
 	/* Update i_size if write extended the file.
-	 * This ensures stat() reflects the new size after write. */
+	 * This ensures stat() reflects the new size after write.
+	 * 
+	 * DO NOT mark_inode_dirty(): daemon is the authoritative metadata store.
+	 * Marking dirty would cause umount to call .write_inode (which we don't
+	 * implement), leading to "busy inodes after umount" warnings or hangs.
+	 */
 	if (*ppos > i_size_read(filp->f_inode)) {
 		i_size_write(filp->f_inode, *ppos);
-		mark_inode_dirty(filp->f_inode);
 	}
 
 	return write_len;
@@ -496,9 +500,13 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 		truncate_setsize(inode, new_size);
 	}
 
-	/* Apply other attribute changes (mtime, mode, etc.) */
+	/* Apply other attribute changes (mtime, mode, etc.)
+	 * 
+	 * DO NOT mark_inode_dirty(): daemon is the authoritative metadata store.
+	 * Marking dirty would cause umount to call .write_inode (which we don't
+	 * implement), leading to "busy inodes after umount" warnings or hangs.
+	 */
 	setattr_copy(idmap, inode, attr);
-	mark_inode_dirty(inode);
 
 	return 0;
 }
