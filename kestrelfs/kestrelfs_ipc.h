@@ -122,6 +122,8 @@
 #define KESTRELFS_OP_TRUNCATE		5	/* req: set file size (truncate/ftruncate) */
 #define KESTRELFS_OP_CREATE		6	/* req: create new file/directory */
 #define KESTRELFS_OP_READDIR		7	/* req: list directory entries */
+#define KESTRELFS_OP_MKDIR		8	/* req: create new directory */
+#define KESTRELFS_OP_UNLINK		9	/* req: remove file or directory */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -371,6 +373,49 @@
  * Introduced in KESTRELFS_ABI_VERSION 5.
  */
 
+/*
+ * Payload layout for KESTRELFS_OP_MKDIR requests
+ * -----------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: parent_inode_id.
+ *   offset  8, 4 bytes, little-endian u32: mode (permission bits, e.g. 0755).
+ *   offset 12, up to 20 bytes: name (NUL-terminated string).
+ *
+ * RESPONSE (Rust -> kernel), KESTRELFS_OP_RESULT_OK payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: new_dir_inode_id.
+ *   offset  8..32: reserved.
+ *
+ * On failure: parent not found -> -ENOENT, not a directory -> -ENOTDIR,
+ * directory exists -> -EEXIST.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 6.
+ */
+
+/*
+ * Payload layout for KESTRELFS_OP_UNLINK requests
+ * ------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: parent_inode_id.
+ *   offset  8, up to 24 bytes: name (NUL-terminated string).
+ *
+ * RESPONSE: KESTRELFS_OP_RESULT_OK (no payload needed).
+ *
+ * This operation removes a file or directory entry from the parent directory.
+ * For directories, the daemon MUST return -ENOTEMPTY if the directory is not
+ * empty. The kernel distinguishes unlink (removes files) and rmdir (removes
+ * directories), but both use this opcode - the daemon checks the inode type.
+ *
+ * On failure: parent not found -> -ENOENT, entry not found -> -ENOENT,
+ * directory not empty -> -ENOTEMPTY, parent not a directory -> -ENOTDIR.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 6.
+ */
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -499,7 +544,7 @@ struct kestrelfs_ring_ctrl {
  *       the daemon to accept writes from the kernel and persist them
  *       via MetaStore + ObjectStore, completing the read/write path.
  */
-#define KESTRELFS_ABI_VERSION		5
+#define KESTRELFS_ABI_VERSION		6
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.

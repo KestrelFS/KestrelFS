@@ -140,7 +140,7 @@ impl MetaStore for FileMetaStore {
         let inode_id = self.mem.create(parent, name, mode).await?;
         self.sync_to_disk()
             .await
-            .map_err(|_| MetaError::NotFound)?;
+            .map_err(|_| MetaError::Io)?;
         Ok(inode_id)
     }
 
@@ -148,7 +148,7 @@ impl MetaStore for FileMetaStore {
         self.mem.append_slice(inode, slice).await?;
         self.sync_to_disk()
             .await
-            .map_err(|_| MetaError::NotFound)?;
+            .map_err(|_| MetaError::Io)?;
         Ok(())
     }
 
@@ -156,12 +156,28 @@ impl MetaStore for FileMetaStore {
         self.mem.truncate(inode, new_size).await?;
         self.sync_to_disk()
             .await
-            .map_err(|_| MetaError::NotFound)?;
+            .map_err(|_| MetaError::Io)?;
         Ok(())
     }
 
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
         self.mem.readdir(inode).await
+    }
+
+    async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {
+        let inode_id = self.mem.mkdir(parent, name, mode).await?;
+        self.sync_to_disk()
+            .await
+            .map_err(|_| MetaError::Io)?;
+        Ok(inode_id)
+    }
+
+    async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        self.mem.unlink(parent, name).await?;
+        self.sync_to_disk()
+            .await
+            .map_err(|_| MetaError::Io)?;
+        Ok(())
     }
 }
 

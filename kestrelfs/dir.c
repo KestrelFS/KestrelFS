@@ -228,9 +228,133 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/*
+ * kestrelfs_inode_mkdir - VFS ->mkdir() for directories.
+ *
+ * Sends KESTRELFS_OP_MKDIR to daemon, waits for response, creates VFS inode.
+ */
+static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				 struct dentry *dentry, umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	u64 parent_ino = dir->i_ino;
+	u64 new_ino;
+	struct inode *inode;
+	const char *name = dentry->d_name.name;
+	size_t name_len = dentry->d_name.len;
+	int ret;
+
+	pr_info("kestrelfs: mkdir parent=%llu name=\"%s\" mode=0%o\n",
+		parent_ino, name, mode);
+
+	/* Validate name length (20 bytes max for payload) */
+	if (name_len >= 20) {
+		pr_warn("kestrelfs: mkdir name too long: %zu bytes\n", name_len);
+		return -ENAMETOOLONG;
+	}
+
+	/* Build request: parent(u64@0) + mode(u32@8) + name(NUL-terminated@12) */
+	req.opcode = KESTRELFS_OP_MKDIR;
+	req.req_id = 0;
+	memcpy(&req.payload[0], &parent_ino, sizeof(u64));
+	memcpy(&req.payload[8], &mode, sizeof(u32));
+	memcpy(&req.payload[12], name, name_len);
+	req.payload[12 + name_len] = '\0';
+
+	/* Send IPC request */
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret) {
+		pr_info("kestrelfs: mkdir failed: %d\n", ret);
+		return ret;
+	}
+
+	/* Parse response: new_ino(u64@0) */
+	memcpy(&new_ino, &resp.payload[0], sizeof(u64));
+
+	pr_info("kestrelfs: mkdir created dir ino=%llu\n", new_ino);
+
+	/* Create VFS inode for the new directory */
+	inode = kestrelfs_get_inode(sb, new_ino, S_IFDIR | mode, 0);
+	if (IS_ERR(inode)) {
+		pr_err("kestrelfs: failed to create inode: %ld\n",
+		       PTR_ERR(inode));
+		return PTR_ERR(inode);
+	}
+
+	/* Instantiate dentry */
+	d_instantiate(dentry, inode);
+
+	return 0;
+}
+
+/*
+ * kestrelfs_inode_unlink - VFS ->unlink() for files.
+ *
+ * Sends KESTRELFS_OP_UNLINK to daemon, waits for response.
+ */
+static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	u64 parent_ino = dir->i_ino;
+	const char *name = dentry->d_name.name;
+	size_t name_len = dentry->d_name.len;
+	int ret;
+
+	pr_info("kestrelfs: unlink parent=%llu name=\"%s\"\n",
+		parent_ino, name);
+
+	/* Validate name length (24 bytes max for payload) */
+	if (name_len >= 24) {
+		pr_warn("kestrelfs: unlink name too long: %zu bytes\n", name_len);
+		return -ENAMETOOLONG;
+	}
+
+	/* Build request: parent(u64@0) + name(NUL-terminated@8) */
+	req.opcode = KESTRELFS_OP_UNLINK;
+	req.req_id = 0;
+	memcpy(&req.payload[0], &parent_ino, sizeof(u64));
+	memcpy(&req.payload[8], name, name_len);
+	req.payload[8 + name_len] = '\0';
+
+	/* Send IPC request */
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret) {
+		pr_info("kestrelfs: unlink failed: %d\n", ret);
+		return ret;
+	}
+
+	pr_info("kestrelfs: unlink removed \"%s\" from parent=%llu\n",
+		name, parent_ino);
+
+	/* Mark dentry as deleted (VFS will handle inode cleanup) */
+	d_delete(dentry);
+
+	return 0;
+}
+
+/*
+ * kestrelfs_inode_rmdir - VFS ->rmdir() for directories.
+ *
+ * Uses the same KESTRELFS_OP_UNLINK opcode; daemon checks if directory is empty.
+ */
+static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	pr_info("kestrelfs: rmdir parent=%llu name=\"%s\"\n",
+		dir->i_ino, dentry->d_name.name);
+
+	/* Reuse unlink logic (daemon will check if directory is empty) */
+	return kestrelfs_inode_unlink(dir, dentry);
+}
+
 const struct inode_operations kestrelfs_dir_inode_operations = {
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
+	.mkdir		= kestrelfs_inode_mkdir,
+	.unlink		= kestrelfs_inode_unlink,
+	.rmdir		= kestrelfs_inode_rmdir,
 };
 
 /*

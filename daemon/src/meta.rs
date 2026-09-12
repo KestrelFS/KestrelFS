@@ -82,6 +82,12 @@ pub enum MetaError {
     /// child with the requested name.
     #[error("file already exists")]
     AlreadyExists,
+    /// `unlink()` was called on a non-empty directory.
+    #[error("directory not empty")]
+    NotEmpty,
+    /// I/O error during persistence operations (FileMetaStore).
+    #[error("I/O error")]
+    Io,
 }
 
 /// Convenience alias, matching the `Result<T>` naming used throughout
@@ -206,6 +212,29 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotFound`] if `inode` does not exist.
     /// - [`MetaError::NotADirectory`] if `inode` is not a directory.
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>>;
+
+    /// Creates a new directory under `parent` with the given `name` and `mode`.
+    /// Returns the newly allocated inode id.
+    ///
+    /// # Errors
+    ///
+    /// - [`MetaError::NotFound`] if `parent` does not exist.
+    /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
+    /// - [`MetaError::AlreadyExists`] if a child named `name` already exists.
+    /// - [`MetaError::InvalidName`] if `name` is empty, contains '/', or > 255 bytes.
+    async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64>;
+
+    /// Removes a file or empty directory from `parent` directory.
+    ///
+    /// For regular files: removes the dirent and marks the inode as deleted.
+    /// For directories: only succeeds if the directory is empty (no children).
+    ///
+    /// # Errors
+    ///
+    /// - [`MetaError::NotFound`] if `parent` does not exist or `name` not found.
+    /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
+    /// - [`MetaError::InvalidName`] if attempting to unlink "." or "..".
+    async fn unlink(&self, parent: u64, name: &str) -> Result<()>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -585,6 +614,107 @@ impl MetaStore for MemStore {
 
         Ok(entries)
     }
+
+    async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {
+        // Validate name
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid name: {}", name)));
+        }
+        if name.len() > 255 {
+            return Err(MetaError::InvalidName(format!(
+                "name too long: {}",
+                name.len()
+            )));
+        }
+
+        let mut inner = self.inner.write().await;
+
+        // Check parent exists and is a directory
+        let parent_inode = inner.inodes.get(&parent).ok_or(MetaError::NotFound)?;
+        if !parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Check if name already exists
+        if let Some(entries) = inner.dir_entries.get(&parent) {
+            if entries.contains_key(name) {
+                return Err(MetaError::AlreadyExists);
+            }
+        }
+
+        // Allocate new inode
+        let new_inode_id = self.allocate_inode_id();
+        let now = current_unix_time();
+        let new_inode = Inode::new_dir(new_inode_id, now);
+        // Note: new_dir() already sets mode to S_IFDIR | 0o755.
+        // The passed `mode` parameter could be used to customize permissions.
+        let _ = mode; // Suppress unused variable warning for now
+
+        // Insert inode and directory entry
+        inner.inodes.insert(new_inode_id, new_inode);
+        inner
+            .dir_entries
+            .entry(parent)
+            .or_insert_with(HashMap::new)
+            .insert(name.to_string(), new_inode_id);
+
+        // Initialize empty dir_entries for the new directory
+        inner.dir_entries.insert(new_inode_id, HashMap::new());
+
+        Ok(new_inode_id)
+    }
+
+    async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        // Validate name
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid name: {}", name)));
+        }
+
+        let mut inner = self.inner.write().await;
+
+        // Check parent exists and is a directory
+        let parent_inode = inner.inodes.get(&parent).ok_or(MetaError::NotFound)?;
+        if !parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Find the child in parent's directory entries
+        let child_inode_id = inner
+            .dir_entries
+            .get(&parent)
+            .and_then(|entries| entries.get(name).copied())
+            .ok_or(MetaError::NotFound)?;
+
+        // Get child inode to check if it's a directory
+        let child_inode = inner
+            .inodes
+            .get(&child_inode_id)
+            .ok_or(MetaError::NotFound)?;
+
+        // If it's a directory, check if it's empty
+        if child_inode.is_dir() {
+            if let Some(child_entries) = inner.dir_entries.get(&child_inode_id) {
+                if !child_entries.is_empty() {
+                    return Err(MetaError::NotEmpty);
+                }
+            }
+            // Remove empty directory's dir_entries entry
+            inner.dir_entries.remove(&child_inode_id);
+        }
+
+        // Remove from parent's directory entries
+        if let Some(entries) = inner.dir_entries.get_mut(&parent) {
+            entries.remove(name);
+        }
+
+        // Remove the inode itself
+        inner.inodes.remove(&child_inode_id);
+
+        // Remove any slices associated with this inode (for files)
+        inner.slices.remove(&child_inode_id);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -895,6 +1025,186 @@ mod tests {
         };
 
         let err = store.append_slice(999, slice).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_directory() {
+        use crate::fs_model::S_IFDIR;
+
+        let store = MemStore::new();
+        let dir_ino = store
+            .mkdir(ROOT_INODE, "testdir", S_IFDIR | 0o755)
+            .await
+            .expect("mkdir must succeed");
+
+        // Verify it's a directory
+        let inode = store.getattr(dir_ino).await.expect("getattr must succeed");
+        assert!(inode.is_dir());
+        assert_eq!(inode.size, 0);
+
+        // Verify it's in parent's directory entries
+        let child_ino = store
+            .lookup(ROOT_INODE, "testdir")
+            .await
+            .expect("lookup must succeed");
+        assert_eq!(child_ino, dir_ino);
+
+        // Verify directory is empty
+        let entries = store.readdir(dir_ino).await.expect("readdir must succeed");
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_duplicate_name() {
+        use crate::fs_model::S_IFDIR;
+
+        let store = MemStore::new();
+        store
+            .mkdir(ROOT_INODE, "testdir", S_IFDIR | 0o755)
+            .await
+            .expect("first mkdir must succeed");
+
+        let err = store
+            .mkdir(ROOT_INODE, "testdir", S_IFDIR | 0o755)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_invalid_names() {
+        use crate::fs_model::S_IFDIR;
+
+        let store = MemStore::new();
+
+        // Empty name
+        let err = store
+            .mkdir(ROOT_INODE, "", S_IFDIR | 0o755)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        // Dot
+        let err = store
+            .mkdir(ROOT_INODE, ".", S_IFDIR | 0o755)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        // Dotdot
+        let err = store
+            .mkdir(ROOT_INODE, "..", S_IFDIR | 0o755)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        // Slash
+        let err = store
+            .mkdir(ROOT_INODE, "foo/bar", S_IFDIR | 0o755)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn unlink_removes_file() {
+        let store = MemStore::new();
+        let file_ino = store
+            .create(ROOT_INODE, "test.txt", S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        // Verify file exists
+        store.getattr(file_ino).await.expect("file must exist");
+        store
+            .lookup(ROOT_INODE, "test.txt")
+            .await
+            .expect("lookup must succeed");
+
+        // Unlink the file
+        store
+            .unlink(ROOT_INODE, "test.txt")
+            .await
+            .expect("unlink must succeed");
+
+        // Verify file is gone
+        let err = store.getattr(file_ino).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+
+        let err = store.lookup(ROOT_INODE, "test.txt").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn unlink_removes_empty_directory() {
+        use crate::fs_model::S_IFDIR;
+
+        let store = MemStore::new();
+        let dir_ino = store
+            .mkdir(ROOT_INODE, "emptydir", S_IFDIR | 0o755)
+            .await
+            .expect("mkdir must succeed");
+
+        // Unlink (rmdir) the empty directory
+        store
+            .unlink(ROOT_INODE, "emptydir")
+            .await
+            .expect("unlink empty dir must succeed");
+
+        // Verify directory is gone
+        let err = store.getattr(dir_ino).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn unlink_rejects_non_empty_directory() {
+        use crate::fs_model::S_IFDIR;
+
+        let store = MemStore::new();
+        let dir_ino = store
+            .mkdir(ROOT_INODE, "nonempty", S_IFDIR | 0o755)
+            .await
+            .expect("mkdir must succeed");
+
+        // Create a file inside the directory
+        store
+            .create(dir_ino, "file.txt", S_IFREG | 0o644)
+            .await
+            .expect("create must succeed");
+
+        // Try to unlink the non-empty directory
+        let err = store
+            .unlink(ROOT_INODE, "nonempty")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::NotEmpty));
+
+        // Verify directory still exists
+        store.getattr(dir_ino).await.expect("dir must still exist");
+    }
+
+    #[tokio::test]
+    async fn unlink_rejects_invalid_names() {
+        let store = MemStore::new();
+
+        let err = store.unlink(ROOT_INODE, ".").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        let err = store.unlink(ROOT_INODE, "..").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+
+        let err = store.unlink(ROOT_INODE, "").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn unlink_nonexistent_file_returns_not_found() {
+        let store = MemStore::new();
+        let err = store
+            .unlink(ROOT_INODE, "does_not_exist")
+            .await
+            .unwrap_err();
         assert!(matches!(err, MetaError::NotFound));
     }
 }

@@ -381,6 +381,8 @@ async fn build_response(
         abi::OP_TRUNCATE => handle_truncate(event, store).await,
         abi::OP_CREATE => handle_create(event, store).await,
         abi::OP_READDIR => handle_readdir(event, store).await,
+        abi::OP_MKDIR => handle_mkdir(event, store).await,
+        abi::OP_UNLINK => handle_unlink(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -508,6 +510,110 @@ async fn handle_readdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> K
     }
 }
 
+async fn handle_mkdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+    let mut parent_inode_bytes = [0u8; 8];
+    let mut mode_bytes = [0u8; 4];
+    let mut name_bytes = [0u8; 20];
+
+    // Decode request: parent_inode(u64@0) + mode(u32@8) + name(NUL-terminated@12)
+    parent_inode_bytes.copy_from_slice(&event.payload[0..8]);
+    mode_bytes.copy_from_slice(&event.payload[8..12]);
+    name_bytes.copy_from_slice(&event.payload[12..32]);
+
+    let parent_inode = u64::from_le_bytes(parent_inode_bytes);
+    let mode = u32::from_le_bytes(mode_bytes);
+
+    // Extract NUL-terminated name
+    let name = match std::ffi::CStr::from_bytes_until_nul(&name_bytes) {
+        Ok(cstr) => match cstr.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("kestrelfs-daemon:    OP_MKDIR invalid UTF-8 name");
+                return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+            }
+        },
+        Err(_) => {
+            eprintln!("kestrelfs-daemon:    OP_MKDIR name not NUL-terminated");
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    println!(
+        "kestrelfs-daemon:    OP_MKDIR parent={} name=\"{}\" mode=0o{:o}",
+        parent_inode, name, mode
+    );
+
+    // Call MetaStore::mkdir
+    match store.mkdir(parent_inode, name, mode).await {
+        Ok(new_inode_id) => {
+            println!(
+                "kestrelfs-daemon:    OP_MKDIR created dir inode={}",
+                new_inode_id
+            );
+            // Response: new_inode_id(u64@0)
+            let mut resp = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            resp.payload[0..8].copy_from_slice(&new_inode_id.to_le_bytes());
+            resp
+        }
+        Err(e) => {
+            println!(
+                "kestrelfs-daemon:    OP_MKDIR parent={} name=\"{}\" -> {:?}",
+                parent_inode, name, e
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+        }
+    }
+}
+
+async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+    let mut parent_inode_bytes = [0u8; 8];
+    let mut name_bytes = [0u8; 24];
+
+    // Decode request: parent_inode(u64@0) + name(NUL-terminated@8)
+    parent_inode_bytes.copy_from_slice(&event.payload[0..8]);
+    name_bytes.copy_from_slice(&event.payload[8..32]);
+
+    let parent_inode = u64::from_le_bytes(parent_inode_bytes);
+
+    // Extract NUL-terminated name
+    let name = match std::ffi::CStr::from_bytes_until_nul(&name_bytes) {
+        Ok(cstr) => match cstr.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("kestrelfs-daemon:    OP_UNLINK invalid UTF-8 name");
+                return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+            }
+        },
+        Err(_) => {
+            eprintln!("kestrelfs-daemon:    OP_UNLINK name not NUL-terminated");
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    println!(
+        "kestrelfs-daemon:    OP_UNLINK parent={} name=\"{}\"",
+        parent_inode, name
+    );
+
+    // Call MetaStore::unlink
+    match store.unlink(parent_inode, name).await {
+        Ok(()) => {
+            println!(
+                "kestrelfs-daemon:    OP_UNLINK removed \"{}\" from parent={}",
+                name, parent_inode
+            );
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+        Err(e) => {
+            println!(
+                "kestrelfs-daemon:    OP_UNLINK parent={} name=\"{}\" -> {:?}",
+                parent_inode, name, e
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+        }
+    }
+}
+
 /// Converts a [`MetaError`] into the negative errno-style value the
 /// event header's `error_code` field carries on a
 /// `KESTRELFS_OP_RESULT_ERROR` response (see `kestrelfs_ipc.h`'s doc
@@ -523,6 +629,8 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::NotADirectory => -libc::ENOTDIR,
         MetaError::InvalidName(_) => -libc::ENAMETOOLONG,
         MetaError::AlreadyExists => -libc::EEXIST,
+        MetaError::NotEmpty => -libc::ENOTEMPTY,
+        MetaError::Io => -libc::EIO,
     }
 }
 
@@ -1590,5 +1698,177 @@ mod tests {
             .await
             .expect("read must succeed");
         assert_eq!(data, vec![0u8; 10]);
+    }
+
+    /// Builds a raw `OP_MKDIR` request event.
+    fn raw_mkdir_req(req_id: u64, parent_inode: u64, mode: u32, name: &str) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_MKDIR, req_id);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&mode.to_le_bytes());
+        let name_bytes = name.as_bytes();
+        event.payload[12..12 + name_bytes.len()].copy_from_slice(name_bytes);
+        event.payload[12 + name_bytes.len()] = 0; // NUL terminator
+        event
+    }
+
+    /// Builds a raw `OP_UNLINK` request event.
+    fn raw_unlink_req(req_id: u64, parent_inode: u64, name: &str) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_UNLINK, req_id);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        let name_bytes = name.as_bytes();
+        event.payload[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
+        event.payload[8 + name_bytes.len()] = 0; // NUL terminator
+        event
+    }
+
+    #[test]
+    fn mkdir_creates_new_directory() {
+        let (runtime, store, object_store) = test_fixture();
+        let req = raw_mkdir_req(100, fs_model::ROOT_INODE, 0o755, "testdir");
+
+        let resp = runtime.block_on(build_response(&req, &store, &object_store));
+
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(resp.req_id, 100);
+        assert_eq!(resp.error_code, 0);
+
+        let new_dir_inode = u64::from_le_bytes(resp.payload[0..8].try_into().unwrap());
+        assert!(new_dir_inode > 0);
+
+        // Verify directory exists via lookup
+        let lookup_req = raw_lookup_req(101, fs_model::ROOT_INODE, "testdir");
+        let lookup_resp = runtime.block_on(build_response(&lookup_req, &store, &object_store));
+        assert_eq!(lookup_resp.opcode, abi::OP_RESULT_OK);
+        let found_inode = u64::from_le_bytes(lookup_resp.payload[0..8].try_into().unwrap());
+        assert_eq!(found_inode, new_dir_inode);
+    }
+
+    #[test]
+    fn mkdir_duplicate_name_returns_eexist() {
+        let (runtime, store, object_store) = test_fixture();
+        
+        // Create first directory
+        let req1 = raw_mkdir_req(102, fs_model::ROOT_INODE, 0o755, "duplicate");
+        let resp1 = runtime.block_on(build_response(&req1, &store, &object_store));
+        assert_eq!(resp1.opcode, abi::OP_RESULT_OK);
+
+        // Try to create again with same name
+        let req2 = raw_mkdir_req(103, fs_model::ROOT_INODE, 0o755, "duplicate");
+        let resp2 = runtime.block_on(build_response(&req2, &store, &object_store));
+        assert_eq!(resp2.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp2.error_code, -libc::EEXIST);
+    }
+
+    #[test]
+    fn unlink_removes_file() {
+        let (runtime, store, object_store) = test_fixture();
+        
+        // Create a file first
+        let create_req = raw_create_req(104, fs_model::ROOT_INODE, 0o644, "tempfile");
+        let create_resp = runtime.block_on(build_response(&create_req, &store, &object_store));
+        assert_eq!(create_resp.opcode, abi::OP_RESULT_OK);
+
+        // Unlink the file
+        let unlink_req = raw_unlink_req(105, fs_model::ROOT_INODE, "tempfile");
+        let unlink_resp = runtime.block_on(build_response(&unlink_req, &store, &object_store));
+        assert_eq!(unlink_resp.opcode, abi::OP_RESULT_OK);
+
+        // Verify file no longer exists
+        let lookup_req = raw_lookup_req(106, fs_model::ROOT_INODE, "tempfile");
+        let lookup_resp = runtime.block_on(build_response(&lookup_req, &store, &object_store));
+        assert_eq!(lookup_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(lookup_resp.error_code, -libc::ENOENT);
+    }
+
+    #[test]
+    fn unlink_empty_directory_succeeds() {
+        let (runtime, store, object_store) = test_fixture();
+        
+        // Create an empty directory
+        let mkdir_req = raw_mkdir_req(107, fs_model::ROOT_INODE, 0o755, "emptydir");
+        let mkdir_resp = runtime.block_on(build_response(&mkdir_req, &store, &object_store));
+        assert_eq!(mkdir_resp.opcode, abi::OP_RESULT_OK);
+
+        // Unlink (rmdir) the empty directory
+        let unlink_req = raw_unlink_req(108, fs_model::ROOT_INODE, "emptydir");
+        let unlink_resp = runtime.block_on(build_response(&unlink_req, &store, &object_store));
+        assert_eq!(unlink_resp.opcode, abi::OP_RESULT_OK);
+
+        // Verify directory no longer exists
+        let lookup_req = raw_lookup_req(109, fs_model::ROOT_INODE, "emptydir");
+        let lookup_resp = runtime.block_on(build_response(&lookup_req, &store, &object_store));
+        assert_eq!(lookup_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(lookup_resp.error_code, -libc::ENOENT);
+    }
+
+    #[test]
+    fn unlink_nonempty_directory_returns_enotempty() {
+        let (runtime, store, object_store) = test_fixture();
+        
+        // Create a directory
+        let mkdir_req = raw_mkdir_req(110, fs_model::ROOT_INODE, 0o755, "nonempty");
+        let mkdir_resp = runtime.block_on(build_response(&mkdir_req, &store, &object_store));
+        assert_eq!(mkdir_resp.opcode, abi::OP_RESULT_OK);
+        let dir_inode = u64::from_le_bytes(mkdir_resp.payload[0..8].try_into().unwrap());
+
+        // Create a file inside the directory
+        let create_req = raw_create_req(111, dir_inode, 0o644, "child.txt");
+        let create_resp = runtime.block_on(build_response(&create_req, &store, &object_store));
+        assert_eq!(create_resp.opcode, abi::OP_RESULT_OK);
+
+        // Try to unlink the non-empty directory
+        let unlink_req = raw_unlink_req(112, fs_model::ROOT_INODE, "nonempty");
+        let unlink_resp = runtime.block_on(build_response(&unlink_req, &store, &object_store));
+        assert_eq!(unlink_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(unlink_resp.error_code, -libc::ENOTEMPTY);
+    }
+
+    #[test]
+    fn mkdir_create_unlink_workflow_with_persistence() {
+        let (runtime, store, object_store) = test_fixture();
+
+        // 1. Create directory
+        let mkdir_req = raw_mkdir_req(200, fs_model::ROOT_INODE, 0o755, "persist_dir");
+        let mkdir_resp = runtime.block_on(build_response(&mkdir_req, &store, &object_store));
+        assert_eq!(mkdir_resp.opcode, abi::OP_RESULT_OK);
+        let dir_inode = u64::from_le_bytes(mkdir_resp.payload[0..8].try_into().unwrap());
+
+        // 2. Create file inside directory
+        let create_req = raw_create_req(201, dir_inode, 0o644, "persist_file.txt");
+        let create_resp = runtime.block_on(build_response(&create_req, &store, &object_store));
+        assert_eq!(create_resp.opcode, abi::OP_RESULT_OK);
+
+        // 3. Unlink the file
+        let unlink_req = raw_unlink_req(202, dir_inode, "persist_file.txt");
+        let unlink_resp = runtime.block_on(build_response(&unlink_req, &store, &object_store));
+        assert_eq!(unlink_resp.opcode, abi::OP_RESULT_OK);
+
+        // 4. Verify file is gone
+        let lookup_file = raw_lookup_req(203, dir_inode, "persist_file.txt");
+        let lookup_file_resp = runtime.block_on(build_response(&lookup_file, &store, &object_store));
+        assert_eq!(lookup_file_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(lookup_file_resp.error_code, -libc::ENOENT);
+
+        // 5. Unlink the empty directory
+        let unlink_dir_req = raw_unlink_req(204, fs_model::ROOT_INODE, "persist_dir");
+        let unlink_dir_resp = runtime.block_on(build_response(&unlink_dir_req, &store, &object_store));
+        assert_eq!(unlink_dir_resp.opcode, abi::OP_RESULT_OK);
+
+        // 6. Verify directory is gone
+        let lookup_dir = raw_lookup_req(205, fs_model::ROOT_INODE, "persist_dir");
+        let lookup_dir_resp = runtime.block_on(build_response(&lookup_dir, &store, &object_store));
+        assert_eq!(lookup_dir_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(lookup_dir_resp.error_code, -libc::ENOENT);
+    }
+
+    /// Helper to build raw CREATE request (already exists in tests, but adding for clarity)
+    fn raw_create_req(req_id: u64, parent_inode: u64, mode: u32, name: &str) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_CREATE, req_id);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&mode.to_le_bytes());
+        let name_bytes = name.as_bytes();
+        event.payload[12..12 + name_bytes.len()].copy_from_slice(name_bytes);
+        event.payload[12 + name_bytes.len()] = 0;
+        event
     }
 }

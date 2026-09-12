@@ -49,7 +49,7 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -85,6 +85,10 @@ pub const OP_TRUNCATE: u32 = 5;
 pub const OP_CREATE: u32 = 6;
 /// Request: list directory entries. Mirrors `KESTRELFS_OP_READDIR`.
 pub const OP_READDIR: u32 = 7;
+/// Request: create new directory. Mirrors `KESTRELFS_OP_MKDIR`.
+pub const OP_MKDIR: u32 = 8;
+/// Request: remove file or directory. Mirrors `KESTRELFS_OP_UNLINK`.
+pub const OP_UNLINK: u32 = 9;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors

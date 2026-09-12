@@ -189,6 +189,18 @@ impl Inode {
         }
     }
 
+    pub fn new_dir(inode_id: u64, mtime: u64) -> Self {
+        Inode {
+            inode_id,
+            size: 0,
+            mode: S_IFDIR | 0o755,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            mtime,
+        }
+    }
+
     /// Returns `true` if this inode represents a directory.
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFDIR == S_IFDIR
