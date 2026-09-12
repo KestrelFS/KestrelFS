@@ -22,3 +22,6 @@ kestrelfs/chardev_test
 target/
 Cargo.lock
 daemon/.kestrelfs-objects/
+
+# VM test binaries
+vm-test/kestrelfs-daemon
