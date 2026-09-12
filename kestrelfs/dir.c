@@ -246,8 +246,8 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	size_t name_len = dentry->d_name.len;
 	int ret;
 
-	pr_info("kestrelfs: mkdir parent=%llu name=\"%s\" mode=0%o\n",
-		parent_ino, name, mode);
+	pr_info("kestrelfs: mkdir parent=%lu name=\"%s\" mode=0%o\n",
+		dir->i_ino, name, mode);
 
 	/* Validate name length (20 bytes max for payload) */
 	if (name_len >= 20) {
@@ -306,8 +306,8 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 	size_t name_len = dentry->d_name.len;
 	int ret;
 
-	pr_info("kestrelfs: unlink parent=%llu name=\"%s\"\n",
-		parent_ino, name);
+	pr_info("kestrelfs: unlink parent=%lu name=\"%s\"\n",
+		dir->i_ino, name);
 
 	/* Validate name length (24 bytes max for payload) */
 	if (name_len >= 24) {
@@ -350,7 +350,7 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
  */
 static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
 {
-	pr_info("kestrelfs: rmdir parent=%llu name=\"%s\"\n",
+	pr_info("kestrelfs: rmdir parent=%lu name=\"%s\"\n",
 		dir->i_ino, dentry->d_name.name);
 
 	/* Reuse unlink logic (daemon will check if directory is empty) */
