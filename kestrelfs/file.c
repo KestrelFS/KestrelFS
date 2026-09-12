@@ -37,6 +37,47 @@
 #include "kestrelfs.h"
 
 /*
+ * kestrelfs_ipc_sync_call() - unified IPC helper with total deadline.
+ * @req: request event to send
+ * @resp: response event to receive
+ *
+ * Sends IPC request and waits up to 2 seconds total, checking daemon liveness.
+ * Returns 0 on success, negative errno on failure.
+ */
+static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
+				   struct kestrelfs_event *resp)
+{
+	u64 req_id;
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+	int ret;
+
+	/* Check daemon is alive before sending */
+	if (!kestrelfs_is_daemon_alive())
+		return -ENOTCONN;
+
+	ret = kestrelfs_req_push(req->opcode, req->flags, req->payload, &req_id);
+	if (ret)
+		return ret;
+
+	/* Wait with total deadline (not per-iteration timeout) */
+	while (time_before(jiffies, deadline)) {
+		ret = kestrelfs_check_resp(req_id, resp);
+		if (ret == 0)
+			return 0; /* Success */
+
+		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(100));
+		if (ret == -ERESTARTSYS)
+			return -EINTR;
+
+		/* Check daemon liveness on each iteration */
+		if (!kestrelfs_is_daemon_alive())
+			return -ENOTCONN;
+	}
+
+	return -ETIMEDOUT;
+}
+
+/*
  * kestrelfs_file_read() - serve reads against hello.txt.
  * @file:	open file instance (unused beyond sanity, content is static).
  * @buf:	userspace destination buffer.
@@ -443,7 +484,8 @@ const struct file_operations kestrelfs_writable_file_ops = {
  * Steps:
  *   1. If ATTR_SIZE is set, send KESTRELFS_OP_TRUNCATE IPC to daemon
  *   2. If daemon succeeds, call truncate_setsize() to update kernel i_size
- *   3. Call setattr_copy() to apply other attribute changes
+ *   3. Ensure no residual dirty pages (truncate_inode_pages)
+ *   4. Call setattr_copy() to apply other attribute changes
  *
  * Return: 0 on success, negative errno on failure.
  */
@@ -458,53 +500,37 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 	if (attr->ia_valid & ATTR_SIZE) {
 		u64 inode_id = inode->i_ino;
 		u64 new_size = attr->ia_size;
-		u64 req_id;
-		u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE] = {0};
-		struct kestrelfs_event resp;
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
 
 		/* Build KESTRELFS_OP_TRUNCATE request payload:
 		 * inode_id@0 (u64), new_size@8 (u64) */
-		put_unaligned_le64(inode_id, &payload[0]);
-		put_unaligned_le64(new_size, &payload[8]);
+		req.opcode = KESTRELFS_OP_TRUNCATE;
+		req.flags = 0;
+		memcpy(&req.payload[0], &inode_id, sizeof(u64));
+		memcpy(&req.payload[8], &new_size, sizeof(u64));
 
-		ret = kestrelfs_req_push(KESTRELFS_OP_TRUNCATE, 0, payload, &req_id);
+		/* Use unified sync call with total deadline (2 seconds) */
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		if (ret) {
-			pr_err("kestrelfs: failed to push TRUNCATE request: %d\n", ret);
-			return ret;
-		}
-
-		/* Wait for response (2 second timeout) */
-		for (;;) {
-			ret = kestrelfs_check_resp(req_id, &resp);
-			if (ret == 0)
-				break;
-
-			ret = kestrelfs_wait_for_resp(msecs_to_jiffies(2000));
-			if (ret == -ERESTARTSYS)
-				return -EINTR;
-			if (ret == -ETIME) {
-				pr_err("kestrelfs: TRUNCATE inode=%llu new_size=%llu timeout\n",
-				       inode_id, new_size);
-				return -ETIMEDOUT;
-			}
-		}
-
-		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
 			pr_err("kestrelfs: TRUNCATE inode=%llu new_size=%llu failed: %d\n",
-			       inode_id, new_size, resp.error_code);
-			return resp.error_code;
+			       inode_id, new_size, ret);
+			return ret;
 		}
 
 		/* Daemon succeeded, update kernel i_size.
 		 * truncate_setsize() handles page cache invalidation. */
 		truncate_setsize(inode, new_size);
+
+		/* Ensure no residual dirty pages remain */
+		truncate_inode_pages(&inode->i_data, new_size);
 	}
 
 	/* Apply other attribute changes (mtime, mode, etc.)
 	 * 
 	 * DO NOT mark_inode_dirty(): daemon is the authoritative metadata store.
-	 * Marking dirty would cause umount to call .write_inode (which we don't
-	 * implement), leading to "busy inodes after umount" warnings or hangs.
+	 * VFS may still mark dirty internally via notify_change(), but we handle
+	 * that with write_inode() returning 0.
 	 */
 	setattr_copy(idmap, inode, attr);
 

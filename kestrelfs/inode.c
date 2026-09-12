@@ -60,10 +60,43 @@ static void kestrelfs_evict_inode(struct inode *inode)
 	clear_inode(inode);
 }
 
+/*
+ * kestrelfs_write_inode() - handle VFS writeback request.
+ * @inode: inode to write
+ * @wbc: writeback control (ignored)
+ *
+ * VFS may call this during umount or sync even if we don't call mark_inode_dirty().
+ * notify_change() can mark inodes dirty internally.
+ * 
+ * Since daemon is the authoritative metadata store and we already send IPC during
+ * write/setattr, we don't need to do anything here. Just return success.
+ *
+ * MUST NOT send IPC here - daemon may be shutting down during umount.
+ */
+static int kestrelfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	return 0;
+}
+
+/*
+ * kestrelfs_sync_fs() - handle sync(2) / syncfs(2).
+ * @sb: superblock
+ * @wait: whether to wait for completion (ignored)
+ *
+ * Since all writes are synchronous IPC calls that complete before returning,
+ * there's nothing to flush. Just return success.
+ */
+static int kestrelfs_sync_fs(struct super_block *sb, int wait)
+{
+	return 0;
+}
+
 const struct super_operations kestrelfs_super_ops = {
 	.statfs		= kestrelfs_statfs,
-	.drop_inode	= generic_drop_inode,  /* Use default policy, not delete_inode */
+	.drop_inode	= generic_drop_inode,
 	.evict_inode	= kestrelfs_evict_inode,
+	.write_inode	= kestrelfs_write_inode,
+	.sync_fs	= kestrelfs_sync_fs,
 };
 
 /*
@@ -107,7 +140,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		inode->i_fop = &kestrelfs_dir_file_operations;
 		set_nlink(inode, 2);
 	} else if (S_ISREG(mode)) {
-		/* Regular file */
+		/* Regular file - no custom a_ops (avoid dirty_folio without writeback) */
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
 		set_nlink(inode, 1);
@@ -180,9 +213,9 @@ static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 /*
  * kestrelfs_mount() - fs_type->mount() callback.
  *
- * mount_nodev() is appropriate here because KestrelFS Phase 1 has no
- * backing block device: the entire tree lives in page cache-backed
- * inodes allocated by simple_fill_super().
+ * mount_nodev() is appropriate here because KestrelFS has no backing block
+ * device: it's a pseudo-filesystem where metadata lives in daemon memory
+ * and the kernel only maintains inode caches.
  */
 static struct dentry *kestrelfs_mount(struct file_system_type *fs_type,
 				       int flags, const char *dev_name,
@@ -191,10 +224,19 @@ static struct dentry *kestrelfs_mount(struct file_system_type *fs_type,
 	return mount_nodev(fs_type, flags, data, kestrelfs_fill_super);
 }
 
+/*
+ * Use kill_anon_super() instead of kill_litter_super() because:
+ * 1. We use mount_nodev() (no block device)
+ * 2. We manually create root inode (no simple_fill_super tree_descr list)
+ * 3. kill_anon_super() is the standard choice for pseudo-filesystems
+ *    (procfs, sysfs, tmpfs, ramfs) - cleaner teardown path
+ * 4. kill_litter_super() is for libfs-based filesystems using simple_fill_super,
+ *    which we no longer use (Phase 3 removed it for dynamic LOOKUP)
+ */
 struct file_system_type kestrelfs_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= KESTRELFS_NAME,
 	.mount		= kestrelfs_mount,
-	.kill_sb	= kill_litter_super,
+	.kill_sb	= kill_anon_super,
 	.fs_flags	= FS_USERNS_MOUNT,
 };

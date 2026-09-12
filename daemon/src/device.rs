@@ -176,7 +176,7 @@ impl KestrelDevice {
         // case `KESTRELFS_IOC_GET_ABI_VERSION`) writes exactly
         // `sizeof(__u32)` bytes via `copy_to_user()`, matching what we
         // provide here.
-        let ret = unsafe { libc::ioctl(fd, ioctl::GET_ABI_VERSION, &mut version as *mut u32) };
+        let ret = unsafe { libc::ioctl(fd, ioctl::GET_ABI_VERSION as _, &mut version as *mut u32) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -190,7 +190,7 @@ impl KestrelDevice {
         // SAFETY: see `ioctl_get_abi_version` above; identical
         // reasoning, with an 8-byte `*mut u64` output argument
         // matching the kernel's `__u64` `copy_to_user()`.
-        let ret = unsafe { libc::ioctl(fd, ioctl::GET_REGION_SIZE, &mut size as *mut u64) };
+        let ret = unsafe { libc::ioctl(fd, ioctl::GET_REGION_SIZE as _, &mut size as *mut u64) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -208,7 +208,7 @@ impl KestrelDevice {
         // request with no argument, matching the kernel's
         // `KESTRELFS_IOC_NOTIFY_RESP` case in `kestrelfs_ioctl()`,
         // which reads no user pointer.
-        let ret = unsafe { libc::ioctl(self.fd, ioctl::NOTIFY_RESP) };
+        let ret = unsafe { libc::ioctl(self.fd, ioctl::NOTIFY_RESP as _) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }

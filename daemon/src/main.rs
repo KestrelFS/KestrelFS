@@ -462,17 +462,20 @@ async fn handle_readdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> K
     // Call MetaStore::readdir
     match store.readdir(req.dir_inode).await {
         Ok(entries) => {
-            // NOTE: HashMap iteration order is non-deterministic. For stable
-            // directory listings, we should sort entries by name or inode.
-            // Currently returning in arbitrary order.
+            // Sort entries by inode for stable ordering (HashMap is non-deterministic)
+            let mut sorted_entries: Vec<(u64, &str)> = entries
+                .iter()
+                .map(|(inode, name)| (*inode, name.as_str()))
+                .collect();
+            sorted_entries.sort_by_key(|(inode, _)| *inode);
             
             // Skip to requested offset and take only 1 entry (to avoid name truncation)
             let offset = req.offset as usize;
-            let chunk: Vec<(u64, &str)> = entries
+            let chunk: Vec<(u64, &str)> = sorted_entries
                 .iter()
                 .skip(offset)
-                .take(1)  // Changed from 2 to 1 to allow longer names
-                .map(|(inode, name)| (*inode, name.as_str()))
+                .take(1)
+                .copied()
                 .collect();
 
             println!(

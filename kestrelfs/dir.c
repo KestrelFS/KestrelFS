@@ -148,6 +148,9 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 		return ERR_CAST(inode);
 	}
 
+	/* Insert into inode hash (like shmem, avoid unhashed state) */
+	insert_inode_hash(inode);
+
 	/* Attach to dentry */
 	return d_splice_alias(inode, dentry);
 }
@@ -216,6 +219,9 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 		return PTR_ERR(inode);
 	}
 
+	/* Insert into inode hash (like shmem, avoid unhashed state) */
+	insert_inode_hash(inode);
+
 	/* Instantiate dentry */
 	d_instantiate(dentry, inode);
 
@@ -253,21 +259,12 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 
 	pr_info("kestrelfs: readdir ino=%lu pos=%lld\n", inode->i_ino, ctx->pos);
 
-	/* Emit . and .. */
-	if (ctx->pos == 0) {
-		if (!dir_emit_dot(file, ctx))
-			return 0;
-	}
-	if (ctx->pos == 1) {
-		if (!dir_emit_dotdot(file, ctx))
-			return 0;
-	}
+	/* Emit . and .. (dir_emit_dots handles ctx->pos advancement) */
+	if (!dir_emit_dots(file, ctx))
+		return 0;
 
-	/* Adjust offset for daemon (skip . and ..) */
-	if (ctx->pos >= 2)
-		offset = (u32)(ctx->pos - 2);
-	else
-		offset = 0;
+	/* Calculate offset for daemon (skip . and ..) */
+	offset = (ctx->pos >= 2) ? (u32)(ctx->pos - 2) : 0;
 
 	/* Loop: send READDIR requests until entry_count == 0 */
 	while (1) {
@@ -301,29 +298,30 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 		}
 
 		/* Entry: ino(u64@1) + name(up to 23 bytes@9) */
-		if (entry_count >= 1) {
-			memcpy(&ino, &resp.payload[1], sizeof(u64));
-			memcpy(name, &resp.payload[9], 23);
-			name[23] = 0; /* ensure NUL termination */
+		memcpy(&ino, &resp.payload[1], sizeof(u64));
+		memcpy(name, &resp.payload[9], 23);
+		name[23] = 0; /* ensure NUL termination */
 
-			/* Find actual name length (look for NUL or end of buffer) */
-			name_len = 0;
-			for (i = 0; i < 23; i++) {
-				if (name[i] == 0)
-					break;
-				name_len++;
-			}
-
-			if (name_len > 0) {
-				if (!dir_emit(ctx, name, name_len, ino, DT_UNKNOWN)) {
-					return 0; /* Buffer full */
-				}
-				ctx->pos++;
-			}
+		/* Find actual name length (look for NUL or end of buffer) */
+		name_len = 0;
+		for (i = 0; i < 23; i++) {
+			if (name[i] == 0)
+				break;
+			name_len++;
 		}
 
-		/* Advance offset for next batch (1 entry at a time) */
-		offset += entry_count;
+		/* Protocol error: entry_count > 0 but name is empty */
+		if (name_len == 0) {
+			pr_err("kestrelfs: protocol error - entry_count=%u but name is empty\n",
+			       entry_count);
+			return -EIO;
+		}
+
+		if (!dir_emit(ctx, name, name_len, ino, DT_UNKNOWN)) {
+			return 0; /* Buffer full */
+		}
+		ctx->pos++;
+		offset++;
 	}
 
 	return 0;
