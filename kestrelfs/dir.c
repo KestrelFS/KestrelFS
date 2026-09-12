@@ -259,7 +259,10 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	req.opcode = KESTRELFS_OP_MKDIR;
 	req.req_id = 0;
 	memcpy(&req.payload[0], &parent_ino, sizeof(u64));
-	memcpy(&req.payload[8], &mode, sizeof(u32));
+	{
+		u32 mode32 = (u32)mode;
+		memcpy(&req.payload[8], &mode32, sizeof(u32));
+	}
 	memcpy(&req.payload[12], name, name_len);
 	req.payload[12 + name_len] = '\0';
 
