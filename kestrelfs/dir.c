@@ -332,8 +332,13 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 	pr_info("kestrelfs: unlink removed \"%s\" from parent=%llu\n",
 		name, parent_ino);
 
-	/* Mark dentry as deleted (VFS will handle inode cleanup) */
-	d_delete(dentry);
+	/* Update inode metadata (VFS will handle dentry invalidation) */
+	if (d_really_is_positive(dentry)) {
+		struct inode *inode = d_inode(dentry);
+		drop_nlink(inode);
+		inode_set_ctime_current(inode);
+		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	}
 
 	return 0;
 }
