@@ -51,6 +51,7 @@ mod device;
 mod fs_model;
 mod ioctl;
 mod meta;
+mod meta_persist;
 mod object_store;
 mod ring;
 
@@ -72,17 +73,18 @@ use std::sync::Arc;
 #[command(name = "kestrelfs-daemon")]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Directory for storing block data (objects).
+    /// Directory for storing block data (objects) and metadata.
     ///
     /// If the directory doesn't exist, it will be created. Block data is stored
-    /// as individual files organized by slice UUID. Defaults to "./.kestrelfs-objects"
+    /// as individual files organized by slice UUID. Metadata is stored in
+    /// `meta.json` in the same directory. Defaults to "./.kestrelfs-data"
     /// in the current working directory.
-    #[arg(long, default_value = "./.kestrelfs-objects")]
+    #[arg(long, default_value = "./.kestrelfs-data")]
     data_dir: PathBuf,
 
-    /// Use in-memory object store instead of local filesystem (for testing).
+    /// Use in-memory storage for both metadata and objects (for testing).
     ///
-    /// When enabled, block data is stored in RAM and lost on daemon restart.
+    /// When enabled, all data is stored in RAM and lost on daemon restart.
     /// This is useful for tests but not recommended for production use.
     #[arg(long)]
     memory: bool,
@@ -161,23 +163,31 @@ fn main() -> io::Result<()> {
     // construction again.
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Initialize ObjectStore based on CLI flags
-    let object_store: Arc<dyn ObjectStore> = if args.memory {
-        println!("kestrelfs-daemon: using in-memory object store (data will not persist)");
-        Arc::new(object_store::MemObjectStore::new())
+    // Initialize ObjectStore and MetaStore based on CLI flags
+    let (object_store, store): (Arc<dyn ObjectStore>, Arc<dyn MetaStore>) = if args.memory {
+        println!("kestrelfs-daemon: using in-memory storage (data will not persist)");
+        (
+            Arc::new(object_store::MemObjectStore::new()),
+            Arc::new(meta::MemStore::new()),
+        )
     } else {
         println!(
-            "kestrelfs-daemon: using local filesystem object store at {}",
+            "kestrelfs-daemon: using local filesystem storage at {}",
             args.data_dir.display()
         );
-        Arc::new(
+        let obj_store = Arc::new(
             runtime
                 .block_on(object_store::LocalFsObjectStore::new(&args.data_dir))
                 .map_err(|e| io::Error::other(e.to_string()))?,
-        )
+        );
+        let meta_path = args.data_dir.join("meta.json");
+        let meta_store = Arc::new(
+            runtime
+                .block_on(meta_persist::FileMetaStore::new(meta_path))
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        );
+        (obj_store, meta_store)
     };
-
-    let store: Arc<dyn MetaStore> = Arc::new(meta::MemStore::new());
 
     // Seed the block data for remote.txt's single Slice (see
     // meta::REMOTE_TXT_SEED_SLICE_ID). MemStore already created the

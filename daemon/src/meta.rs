@@ -239,7 +239,7 @@ type DirEntries = HashMap<String, u64>;
 /// whatever `MetaStore` implementation eventually replaces `MemStore`
 /// - callers of the trait are unaffected either way.
 pub struct MemStore {
-    inner: RwLock<MemStoreInner>,
+    pub(crate) inner: RwLock<MemStoreInner>,
     /// Source of fresh inode ids for any future `create`-like
     /// operation. Not yet used by any trait method (`MemStore` today
     /// only ever seeds its two hardcoded entries at construction
@@ -249,17 +249,17 @@ pub struct MemStore {
     /// retrofit one. A plain `AtomicU64` (not behind the `RwLock`)
     /// since id allocation is independent of the inode/dirent tables'
     /// own consistency.
-    next_inode_id: AtomicU64,
+    pub(crate) next_inode_id: AtomicU64,
 }
 
 /// The actual mutable state behind `MemStore`'s `RwLock`, split out
 /// as its own struct purely so `MemStore`'s single `RwLock<..>` field
 /// declaration stays readable rather than becoming a `RwLock<(HashMap<..>, HashMap<..>)>`
 /// tuple.
-struct MemStoreInner {
-    inodes: HashMap<u64, Inode>,
+pub(crate) struct MemStoreInner {
+    pub(crate) inodes: HashMap<u64, Inode>,
     /// `parent_inode_id -> (child_name -> child_inode_id)`.
-    dir_entries: HashMap<u64, DirEntries>,
+    pub(crate) dir_entries: HashMap<u64, DirEntries>,
     /// `inode_id -> (chunk_index -> slices)`. Grouping slices by
     /// chunk index up front (rather than storing one flat
     /// `Vec<Slice>` per inode and filtering by `chunk_index` on every
@@ -267,7 +267,7 @@ struct MemStoreInner {
     /// `HashMap` lookup with no scanning - the same access pattern a
     /// real KV store (Redis key `slices:{inode}:{chunk_idx}`) would
     /// naturally have too.
-    slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
+    pub(crate) slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
 }
 
 /// Fixed inode id for the bootstrap `remote.txt` entry seeded by
@@ -495,8 +495,11 @@ impl MetaStore for MemStore {
         // Allocate new inode
         let new_inode_id = self.allocate_inode_id();
         let now = current_unix_time();
-        let mut new_inode = Inode::new_file(new_inode_id, 0, now);
-        new_inode.mode = mode;
+        let new_inode = Inode::new_file(new_inode_id, 0, now);
+        // Note: new_file() already sets mode to S_IFREG | 0o644.
+        // The passed `mode` parameter from the kernel includes file type bits (S_IFREG | perm).
+        // For now we use new_file()'s default. Future: parse mode to support directories.
+        let _ = mode; // Suppress unused variable warning
 
         // Insert inode and directory entry
         inner.inodes.insert(new_inode_id, new_inode);
