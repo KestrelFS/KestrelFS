@@ -235,6 +235,30 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
     /// - [`MetaError::InvalidName`] if attempting to unlink "." or "..".
     async fn unlink(&self, parent: u64, name: &str) -> Result<()>;
+
+    /// Renames/moves a file or directory from `(old_parent, old_name)` to `(new_parent, new_name)`.
+    ///
+    /// Supports:
+    /// - Same directory rename: `old_parent == new_parent`, `old_name != new_name`
+    /// - Cross-directory move: `old_parent != new_parent`
+    /// - Atomic replacement: if `new_name` exists as a regular file, it is replaced (POSIX semantics)
+    ///
+    /// # Errors
+    ///
+    /// - [`MetaError::NotFound`] if source does not exist or parent directories missing
+    /// - [`MetaError::NotADirectory`] if either parent is not a directory
+    /// - [`MetaError::AlreadyExists`] if target exists and is a non-empty directory
+    /// - [`MetaError::InvalidName`] if attempting to rename "." or ".."
+    /// - [`MetaError::NotEmpty`] if target is a non-empty directory
+    ///
+    /// Implementation must prevent renaming a directory into its own subtree.
+    async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<()>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -712,6 +736,133 @@ impl MetaStore for MemStore {
 
         // Remove any slices associated with this inode (for files)
         inner.slices.remove(&child_inode_id);
+
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<()> {
+        // Validate names
+        if old_name.is_empty() || old_name == "." || old_name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid old_name: {}", old_name)));
+        }
+        if new_name.is_empty() || new_name == "." || new_name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid new_name: {}", new_name)));
+        }
+
+        let mut inner = self.inner.write().await;
+
+        // Check old_parent exists and is a directory
+        let old_parent_inode = inner.inodes.get(&old_parent).ok_or(MetaError::NotFound)?;
+        if !old_parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Check new_parent exists and is a directory
+        let new_parent_inode = inner.inodes.get(&new_parent).ok_or(MetaError::NotFound)?;
+        if !new_parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+
+        // Find source inode
+        let source_inode_id = inner
+            .dir_entries
+            .get(&old_parent)
+            .and_then(|entries| entries.get(old_name).copied())
+            .ok_or(MetaError::NotFound)?;
+
+        let source_inode = inner
+            .inodes
+            .get(&source_inode_id)
+            .ok_or(MetaError::NotFound)?;
+
+        // Check if we're renaming a directory into its own subtree
+        if source_inode.is_dir() {
+            // Walk up from new_parent to check if it's a descendant of source
+            let mut check_parent = new_parent;
+            loop {
+                if check_parent == source_inode_id {
+                    // Attempting to move directory into its own subtree
+                    return Err(MetaError::InvalidName(
+                        "cannot move directory into its own subtree".to_string(),
+                    ));
+                }
+                if check_parent == ROOT_INODE {
+                    break;
+                }
+                // Find parent by scanning dir_entries (inefficient but simple)
+                let mut found_parent = None;
+                for (&dir_ino, entries) in inner.dir_entries.iter() {
+                    if entries.values().any(|&child| child == check_parent) {
+                        found_parent = Some(dir_ino);
+                        break;
+                    }
+                }
+                match found_parent {
+                    Some(p) => check_parent = p,
+                    None => break, // Orphaned or root
+                }
+            }
+        }
+
+        // Check if target exists
+        let target_exists = inner
+            .dir_entries
+            .get(&new_parent)
+            .and_then(|entries| entries.get(new_name).copied());
+
+        if let Some(target_inode_id) = target_exists {
+            let target_inode = inner.inodes.get(&target_inode_id).ok_or(MetaError::NotFound)?;
+
+            // POSIX semantics: can replace regular file, but not non-empty directory
+            if target_inode.is_dir() {
+                // Check if target directory is empty
+                if let Some(target_entries) = inner.dir_entries.get(&target_inode_id) {
+                    if !target_entries.is_empty() {
+                        return Err(MetaError::NotEmpty);
+                    }
+                }
+                // Remove empty target directory
+                inner.dir_entries.remove(&target_inode_id);
+                inner.inodes.remove(&target_inode_id);
+            } else {
+                // Replace regular file: remove old target
+                inner.inodes.remove(&target_inode_id);
+                inner.slices.remove(&target_inode_id);
+            }
+        }
+
+        // Remove from old location
+        if let Some(entries) = inner.dir_entries.get_mut(&old_parent) {
+            entries.remove(old_name);
+        }
+
+        // Add to new location
+        inner
+            .dir_entries
+            .entry(new_parent)
+            .or_insert_with(HashMap::new)
+            .insert(new_name.to_string(), source_inode_id);
+
+        // Update mtime of both parent directories
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some(old_parent_inode) = inner.inodes.get_mut(&old_parent) {
+            old_parent_inode.mtime = now;
+        }
+        if old_parent != new_parent {
+            if let Some(new_parent_inode) = inner.inodes.get_mut(&new_parent) {
+                new_parent_inode.mtime = now;
+            }
+        }
 
         Ok(())
     }
@@ -1207,4 +1358,107 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MetaError::NotFound));
     }
+
+    #[tokio::test]
+    async fn rename_same_directory_renames_file() {
+        let store = MemStore::new();
+        let file_ino = store.create(ROOT_INODE, "oldname.txt", S_IFREG | 0o644).await.unwrap();
+        
+        // Rename in same directory
+        store.rename(ROOT_INODE, "oldname.txt", ROOT_INODE, "newname.txt").await.unwrap();
+        
+        // Old name should not exist
+        let err = store.lookup(ROOT_INODE, "oldname.txt").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+        
+        // New name should resolve to same inode
+        let found_ino = store.lookup(ROOT_INODE, "newname.txt").await.unwrap();
+        assert_eq!(found_ino, file_ino);
+    }
+
+    #[tokio::test]
+    async fn rename_cross_directory_moves_file() {
+        let store = MemStore::new();
+        let dir1_ino = store.mkdir(ROOT_INODE, "dir1", 0o755).await.unwrap();
+        let dir2_ino = store.mkdir(ROOT_INODE, "dir2", 0o755).await.unwrap();
+        let file_ino = store.create(dir1_ino, "file.txt", S_IFREG | 0o644).await.unwrap();
+        
+        // Move from dir1 to dir2
+        store.rename(dir1_ino, "file.txt", dir2_ino, "moved.txt").await.unwrap();
+        
+        // Should not exist in old location
+        let err = store.lookup(dir1_ino, "file.txt").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+        
+        // Should exist in new location
+        let found_ino = store.lookup(dir2_ino, "moved.txt").await.unwrap();
+        assert_eq!(found_ino, file_ino);
+    }
+
+    #[tokio::test]
+    async fn rename_replaces_existing_file() {
+        let store = MemStore::new();
+        let file1_ino = store.create(ROOT_INODE, "file1.txt", S_IFREG | 0o644).await.unwrap();
+        let file2_ino = store.create(ROOT_INODE, "file2.txt", S_IFREG | 0o644).await.unwrap();
+        
+        // Rename file1 to file2 (should replace file2)
+        store.rename(ROOT_INODE, "file1.txt", ROOT_INODE, "file2.txt").await.unwrap();
+        
+        // file1.txt should not exist
+        let err = store.lookup(ROOT_INODE, "file1.txt").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+        
+        // file2.txt should now point to file1's inode
+        let found_ino = store.lookup(ROOT_INODE, "file2.txt").await.unwrap();
+        assert_eq!(found_ino, file1_ino);
+        
+        // Old file2 inode should be gone
+        let err = store.getattr(file2_ino).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_nonempty_directory_target() {
+        let store = MemStore::new();
+        let _file_ino = store.create(ROOT_INODE, "file.txt", S_IFREG | 0o644).await.unwrap();
+        let dir_ino = store.mkdir(ROOT_INODE, "dir", 0o755).await.unwrap();
+        store.create(dir_ino, "child.txt", S_IFREG | 0o644).await.unwrap();
+        
+        // Try to rename file over non-empty directory
+        let err = store.rename(ROOT_INODE, "file.txt", ROOT_INODE, "dir").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotEmpty));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_directory_into_own_subtree() {
+        let store = MemStore::new();
+        let dir1_ino = store.mkdir(ROOT_INODE, "dir1", 0o755).await.unwrap();
+        let dir2_ino = store.mkdir(dir1_ino, "dir2", 0o755).await.unwrap();
+        
+        // Try to move dir1 into dir1/dir2 (would create a loop)
+        let err = store.rename(ROOT_INODE, "dir1", dir2_ino, "moved").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_invalid_names() {
+        let store = MemStore::new();
+        store.create(ROOT_INODE, "file.txt", S_IFREG | 0o644).await.unwrap();
+        
+        // Try to rename with invalid old_name
+        let err = store.rename(ROOT_INODE, "..", ROOT_INODE, "newname").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+        
+        // Try to rename with invalid new_name
+        let err = store.rename(ROOT_INODE, "file.txt", ROOT_INODE, ".").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn rename_nonexistent_source_returns_not_found() {
+        let store = MemStore::new();
+        let err = store.rename(ROOT_INODE, "nonexistent", ROOT_INODE, "newname").await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound));
+    }
 }
+

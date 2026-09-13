@@ -357,12 +357,93 @@ static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
 	return kestrelfs_inode_unlink(dir, dentry);
 }
 
+/*
+ * kestrelfs_inode_rename - VFS ->rename() for files and directories.
+ *
+ * Sends KESTRELFS_OP_RENAME to daemon. Supports same-directory rename and
+ * cross-directory moves with POSIX semantics (atomic replacement).
+ *
+ * Name length limitation: both old and new names must be <= 7 bytes due to
+ * payload constraints (32 bytes total: 8+8+1+1+7+7).
+ */
+static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
+				  struct inode *old_dir, struct dentry *old_dentry,
+				  struct inode *new_dir, struct dentry *new_dentry,
+				  unsigned int flags)
+{
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	u64 old_parent_ino = old_dir->i_ino;
+	u64 new_parent_ino = new_dir->i_ino;
+	const char *old_name = old_dentry->d_name.name;
+	const char *new_name = new_dentry->d_name.name;
+	size_t old_name_len = old_dentry->d_name.len;
+	size_t new_name_len = new_dentry->d_name.len;
+	int ret;
+
+	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
+		old_dir->i_ino, old_name, new_dir->i_ino, new_name, flags);
+
+	/* VFS may pass flags like RENAME_NOREPLACE, RENAME_EXCHANGE, etc.
+	 * For now, we only support basic rename (flags=0).
+	 */
+	if (flags != 0) {
+		pr_warn("kestrelfs: rename flags 0x%x not supported\n", flags);
+		return -EINVAL;
+	}
+
+	/* Validate name lengths (7 bytes max each) */
+	if (old_name_len > KESTRELFS_RENAME_NAME_MAX) {
+		pr_warn("kestrelfs: rename old_name too long: %zu bytes\n", old_name_len);
+		return -ENAMETOOLONG;
+	}
+	if (new_name_len > KESTRELFS_RENAME_NAME_MAX) {
+		pr_warn("kestrelfs: rename new_name too long: %zu bytes\n", new_name_len);
+		return -ENAMETOOLONG;
+	}
+
+	/* Build request:
+	 * old_parent(u64@0) + new_parent(u64@8) + old_name_len(u8@16) + new_name_len(u8@17)
+	 * + old_name(7@18) + new_name(7@25)
+	 */
+	req.opcode = KESTRELFS_OP_RENAME;
+	req.req_id = 0;
+	memcpy(&req.payload[0], &old_parent_ino, sizeof(u64));
+	memcpy(&req.payload[8], &new_parent_ino, sizeof(u64));
+	req.payload[16] = (u8)old_name_len;
+	req.payload[17] = (u8)new_name_len;
+	memcpy(&req.payload[18], old_name, old_name_len);
+	memcpy(&req.payload[25], new_name, new_name_len);
+
+	/* Send IPC request */
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret) {
+		pr_info("kestrelfs: rename failed: %d\n", ret);
+		return ret;
+	}
+
+	pr_info("kestrelfs: rename success\n");
+
+	/* Update VFS metadata */
+	if (d_really_is_positive(old_dentry)) {
+		struct inode *inode = d_inode(old_dentry);
+		inode_set_ctime_current(inode);
+	}
+	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	if (old_dir != new_dir) {
+		inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+	}
+
+	return 0;
+}
+
 const struct inode_operations kestrelfs_dir_inode_operations = {
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
 	.mkdir		= kestrelfs_inode_mkdir,
 	.unlink		= kestrelfs_inode_unlink,
 	.rmdir		= kestrelfs_inode_rmdir,
+	.rename		= kestrelfs_inode_rename,
 };
 
 /*

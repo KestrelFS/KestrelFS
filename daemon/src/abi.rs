@@ -49,7 +49,7 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -89,6 +89,8 @@ pub const OP_READDIR: u32 = 7;
 pub const OP_MKDIR: u32 = 8;
 /// Request: remove file or directory. Mirrors `KESTRELFS_OP_UNLINK`.
 pub const OP_UNLINK: u32 = 9;
+/// Request: rename/move file or directory. Mirrors `KESTRELFS_OP_RENAME`.
+pub const OP_RENAME: u32 = 10;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -253,6 +255,45 @@ impl KestrelfsEvent {
         let offset = u32::from_le_bytes(self.payload[8..12].try_into().unwrap());
 
         ReaddirReq { dir_inode, offset }
+    }
+
+    /// Decodes a `KESTRELFS_OP_RENAME` request payload.
+    ///
+    /// Wire layout (32 bytes total):
+    ///   old_parent(8) + new_parent(8) + old_name_len(1) + new_name_len(1)
+    ///   + old_name(7) + new_name(7)
+    ///
+    /// Returns `Err` if either name length exceeds [`RENAME_NAME_MAX`] or
+    /// if either name is invalid UTF-8.
+    pub fn decode_rename_req(&self) -> Result<RenameReq, RenameDecodeError> {
+        let old_parent = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let new_parent = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
+        let old_name_len = self.payload[16];
+        let new_name_len = self.payload[17];
+
+        if old_name_len as usize > RENAME_NAME_MAX {
+            return Err(RenameDecodeError::OldNameTooLong(old_name_len));
+        }
+        if new_name_len as usize > RENAME_NAME_MAX {
+            return Err(RenameDecodeError::NewNameTooLong(new_name_len));
+        }
+
+        let old_name_bytes = &self.payload[18..18 + old_name_len as usize];
+        let new_name_bytes = &self.payload[25..25 + new_name_len as usize];
+
+        let old_name = std::str::from_utf8(old_name_bytes)
+            .map_err(|_| RenameDecodeError::OldNameInvalidUtf8)?
+            .to_string();
+        let new_name = std::str::from_utf8(new_name_bytes)
+            .map_err(|_| RenameDecodeError::NewNameInvalidUtf8)?
+            .to_string();
+
+        Ok(RenameReq {
+            old_parent,
+            new_parent,
+            old_name,
+            new_name,
+        })
     }
 
     /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
@@ -436,6 +477,12 @@ impl KestrelfsEvent {
 /// [`EVENT_PAYLOAD_SIZE`]).
 pub const LOOKUP_NAME_MAX: usize = 23;
 
+/// Mirrors `KESTRELFS_RENAME_NAME_MAX` in `kestrelfs_ipc.h`: the
+/// maximum number of bytes each name in a `KESTRELFS_OP_RENAME` request
+/// may carry. Wire layout: old_parent(8) + new_parent(8) + old_name_len(1)
+/// + new_name_len(1) + old_name(7) + new_name(7) = 32 bytes.
+pub const RENAME_NAME_MAX: usize = 7;
+
 /// Decoded form of a `KESTRELFS_OP_LOOKUP` request payload. See
 /// [`KestrelfsEvent::decode_lookup_req`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,6 +593,32 @@ pub struct CreateReq {
 pub struct ReaddirReq {
     pub dir_inode: u64,
     pub offset: u32,
+}
+
+/// Decoded `KESTRELFS_OP_RENAME` request payload.
+#[derive(Debug, Clone)]
+pub struct RenameReq {
+    pub old_parent: u64,
+    pub new_parent: u64,
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// Errors [`KestrelfsEvent::decode_rename_req`] can report.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenameDecodeError {
+    /// Old name length exceeds [`RENAME_NAME_MAX`].
+    #[error("old_name_len {0} exceeds RENAME_NAME_MAX ({RENAME_NAME_MAX})")]
+    OldNameTooLong(u8),
+    /// New name length exceeds [`RENAME_NAME_MAX`].
+    #[error("new_name_len {0} exceeds RENAME_NAME_MAX ({RENAME_NAME_MAX})")]
+    NewNameTooLong(u8),
+    /// Invalid UTF-8 in old_name.
+    #[error("invalid UTF-8 in old_name")]
+    OldNameInvalidUtf8,
+    /// Invalid UTF-8 in new_name.
+    #[error("invalid UTF-8 in new_name")]
+    NewNameInvalidUtf8,
 }
 
 // ---------------------------------------------------------------------

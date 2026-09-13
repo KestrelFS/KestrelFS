@@ -383,6 +383,7 @@ async fn build_response(
         abi::OP_READDIR => handle_readdir(event, store).await,
         abi::OP_MKDIR => handle_mkdir(event, store).await,
         abi::OP_UNLINK => handle_unlink(event, store).await,
+        abi::OP_RENAME => handle_rename(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -608,6 +609,43 @@ async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
             println!(
                 "kestrelfs-daemon:    OP_UNLINK parent={} name=\"{}\" -> {:?}",
                 parent_inode, name, e
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+        }
+    }
+}
+
+async fn handle_rename(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+    // Decode request using abi.rs helper
+    let req = match event.decode_rename_req() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("kestrelfs-daemon:    OP_RENAME decode error: {:?}", e);
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    println!(
+        "kestrelfs-daemon:    OP_RENAME old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\"",
+        req.old_parent, req.old_name, req.new_parent, req.new_name
+    );
+
+    // Call MetaStore::rename
+    match store
+        .rename(req.old_parent, &req.old_name, req.new_parent, &req.new_name)
+        .await
+    {
+        Ok(()) => {
+            println!(
+                "kestrelfs-daemon:    OP_RENAME success: \"{}\" -> \"{}\"",
+                req.old_name, req.new_name
+            );
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+        Err(e) => {
+            println!(
+                "kestrelfs-daemon:    OP_RENAME error: {:?}",
+                e
             );
             KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
         }
@@ -1871,4 +1909,152 @@ mod tests {
         event.payload[12 + name_bytes.len()] = 0;
         event
     }
+
+    /// Helper to build raw RENAME request
+    fn raw_rename_req(
+        req_id: u64,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_RENAME, req_id);
+        let old_name_bytes = old_name.as_bytes();
+        let new_name_bytes = new_name.as_bytes();
+        
+        event.payload[0..8].copy_from_slice(&old_parent.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&new_parent.to_le_bytes());
+        event.payload[16] = old_name_bytes.len() as u8;
+        event.payload[17] = new_name_bytes.len() as u8;
+        event.payload[18..18 + old_name_bytes.len()].copy_from_slice(old_name_bytes);
+        event.payload[25..25 + new_name_bytes.len()].copy_from_slice(new_name_bytes);
+        event
+    }
+
+    #[test]
+    fn rename_same_directory() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = Arc::new(meta::MemStore::new()) as Arc<dyn MetaStore>;
+        let object_store = Arc::new(object_store::MemObjectStore::new()) as Arc<dyn ObjectStore>;
+
+        // 1. Create a file
+        let create_req = raw_create_req(300, fs_model::ROOT_INODE, fs_model::S_IFREG | 0o644, "old.txt");
+        let create_resp = runtime.block_on(build_response(&create_req, &store, &object_store));
+        assert_eq!(create_resp.opcode, abi::OP_RESULT_OK);
+        let file_ino = u64::from_le_bytes(create_resp.payload[0..8].try_into().unwrap());
+
+        // 2. Rename in same directory
+        let rename_req = raw_rename_req(301, fs_model::ROOT_INODE, "old.txt", fs_model::ROOT_INODE, "new.txt");
+        let rename_resp = runtime.block_on(build_response(&rename_req, &store, &object_store));
+        assert_eq!(rename_resp.opcode, abi::OP_RESULT_OK);
+
+        // 3. Old name should not exist
+        let lookup_old = raw_lookup_req(302, fs_model::ROOT_INODE, "old.txt");
+        let lookup_old_resp = runtime.block_on(build_response(&lookup_old, &store, &object_store));
+        assert_eq!(lookup_old_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(lookup_old_resp.error_code, -libc::ENOENT);
+
+        // 4. New name should exist with same inode
+        let lookup_new = raw_lookup_req(303, fs_model::ROOT_INODE, "new.txt");
+        let lookup_new_resp = runtime.block_on(build_response(&lookup_new, &store, &object_store));
+        assert_eq!(lookup_new_resp.opcode, abi::OP_RESULT_OK);
+        let found_ino = u64::from_le_bytes(lookup_new_resp.payload[0..8].try_into().unwrap());
+        assert_eq!(found_ino, file_ino);
+    }
+
+    #[test]
+    fn rename_cross_directory() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = Arc::new(meta::MemStore::new()) as Arc<dyn MetaStore>;
+        let object_store = Arc::new(object_store::MemObjectStore::new()) as Arc<dyn ObjectStore>;
+
+        // 1. Create two directories
+        let mkdir1_req = raw_mkdir_req(400, fs_model::ROOT_INODE, 0o755, "dir1");
+        let mkdir1_resp = runtime.block_on(build_response(&mkdir1_req, &store, &object_store));
+        assert_eq!(mkdir1_resp.opcode, abi::OP_RESULT_OK);
+        let dir1_ino = u64::from_le_bytes(mkdir1_resp.payload[0..8].try_into().unwrap());
+
+        let mkdir2_req = raw_mkdir_req(401, fs_model::ROOT_INODE, 0o755, "dir2");
+        let mkdir2_resp = runtime.block_on(build_response(&mkdir2_req, &store, &object_store));
+        assert_eq!(mkdir2_resp.opcode, abi::OP_RESULT_OK);
+        let dir2_ino = u64::from_le_bytes(mkdir2_resp.payload[0..8].try_into().unwrap());
+
+        // 2. Create file in dir1
+        let create_req = raw_create_req(402, dir1_ino, fs_model::S_IFREG | 0o644, "file");
+        let create_resp = runtime.block_on(build_response(&create_req, &store, &object_store));
+        assert_eq!(create_resp.opcode, abi::OP_RESULT_OK);
+        let file_ino = u64::from_le_bytes(create_resp.payload[0..8].try_into().unwrap());
+
+        // 3. Move from dir1 to dir2
+        let rename_req = raw_rename_req(403, dir1_ino, "file", dir2_ino, "moved");
+        let rename_resp = runtime.block_on(build_response(&rename_req, &store, &object_store));
+        assert_eq!(rename_resp.opcode, abi::OP_RESULT_OK);
+
+        // 4. Should not exist in dir1
+        let lookup_old = raw_lookup_req(404, dir1_ino, "file");
+        let lookup_old_resp = runtime.block_on(build_response(&lookup_old, &store, &object_store));
+        assert_eq!(lookup_old_resp.opcode, abi::OP_RESULT_ERROR);
+
+        // 5. Should exist in dir2
+        let lookup_new = raw_lookup_req(405, dir2_ino, "moved");
+        let lookup_new_resp = runtime.block_on(build_response(&lookup_new, &store, &object_store));
+        assert_eq!(lookup_new_resp.opcode, abi::OP_RESULT_OK);
+        let found_ino = u64::from_le_bytes(lookup_new_resp.payload[0..8].try_into().unwrap());
+        assert_eq!(found_ino, file_ino);
+    }
+
+    #[test]
+    fn rename_replaces_existing_file() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = Arc::new(meta::MemStore::new()) as Arc<dyn MetaStore>;
+        let object_store = Arc::new(object_store::MemObjectStore::new()) as Arc<dyn ObjectStore>;
+
+        // 1. Create two files
+        let create1_req = raw_create_req(500, fs_model::ROOT_INODE, fs_model::S_IFREG | 0o644, "file1");
+        let create1_resp = runtime.block_on(build_response(&create1_req, &store, &object_store));
+        assert_eq!(create1_resp.opcode, abi::OP_RESULT_OK);
+        let file1_ino = u64::from_le_bytes(create1_resp.payload[0..8].try_into().unwrap());
+
+        let create2_req = raw_create_req(501, fs_model::ROOT_INODE, fs_model::S_IFREG | 0o644, "file2");
+        let create2_resp = runtime.block_on(build_response(&create2_req, &store, &object_store));
+        assert_eq!(create2_resp.opcode, abi::OP_RESULT_OK);
+
+        // 2. Rename file1 over file2 (atomic replacement)
+        let rename_req = raw_rename_req(502, fs_model::ROOT_INODE, "file1", fs_model::ROOT_INODE, "file2");
+        let rename_resp = runtime.block_on(build_response(&rename_req, &store, &object_store));
+        assert_eq!(rename_resp.opcode, abi::OP_RESULT_OK);
+
+        // 3. file2 should now point to file1's inode
+        let lookup_req = raw_lookup_req(503, fs_model::ROOT_INODE, "file2");
+        let lookup_resp = runtime.block_on(build_response(&lookup_req, &store, &object_store));
+        assert_eq!(lookup_resp.opcode, abi::OP_RESULT_OK);
+        let found_ino = u64::from_le_bytes(lookup_resp.payload[0..8].try_into().unwrap());
+        assert_eq!(found_ino, file1_ino);
+    }
+
+    #[test]
+    fn rename_rejects_nonempty_directory() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = Arc::new(meta::MemStore::new()) as Arc<dyn MetaStore>;
+        let object_store = Arc::new(object_store::MemObjectStore::new()) as Arc<dyn ObjectStore>;
+
+        // 1. Create directory with a file inside
+        let mkdir_req = raw_mkdir_req(600, fs_model::ROOT_INODE, 0o755, "dir");
+        let mkdir_resp = runtime.block_on(build_response(&mkdir_req, &store, &object_store));
+        let dir_ino = u64::from_le_bytes(mkdir_resp.payload[0..8].try_into().unwrap());
+
+        let create_req = raw_create_req(601, dir_ino, fs_model::S_IFREG | 0o644, "child");
+        runtime.block_on(build_response(&create_req, &store, &object_store));
+
+        // 2. Create another file
+        let create_file_req = raw_create_req(602, fs_model::ROOT_INODE, fs_model::S_IFREG | 0o644, "file");
+        runtime.block_on(build_response(&create_file_req, &store, &object_store));
+
+        // 3. Try to rename file over non-empty directory
+        let rename_req = raw_rename_req(603, fs_model::ROOT_INODE, "file", fs_model::ROOT_INODE, "dir");
+        let rename_resp = runtime.block_on(build_response(&rename_req, &store, &object_store));
+        assert_eq!(rename_resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(rename_resp.error_code, -libc::ENOTEMPTY);
+    }
 }
+

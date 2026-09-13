@@ -124,6 +124,7 @@
 #define KESTRELFS_OP_READDIR		7	/* req: list directory entries */
 #define KESTRELFS_OP_MKDIR		8	/* req: create new directory */
 #define KESTRELFS_OP_UNLINK		9	/* req: remove file or directory */
+#define KESTRELFS_OP_RENAME		10	/* req: rename/move file or directory */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -416,6 +417,45 @@
  * Introduced in KESTRELFS_ABI_VERSION 6.
  */
 
+/*
+ * Payload layout for KESTRELFS_OP_RENAME requests
+ * ------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust):
+ *
+ *   offset  0, 8 bytes, little-endian u64: old_parent_inode_id.
+ *   offset  8, 8 bytes, little-endian u64: new_parent_inode_id.
+ *   offset 16, 1 byte, u8: old_name_len (MUST be <= KESTRELFS_RENAME_NAME_MAX).
+ *   offset 17, 1 byte, u8: new_name_len (MUST be <= KESTRELFS_RENAME_NAME_MAX).
+ *   offset 18, 7 bytes: old_name (NOT NUL-terminated, length in old_name_len).
+ *   offset 25, 7 bytes: new_name (NOT NUL-terminated, length in new_name_len).
+ *   ------------------------------------------------------------
+ *   total: exactly 32 bytes.
+ *
+ * RESPONSE: KESTRELFS_OP_RESULT_OK (no payload needed).
+ *
+ * This operation atomically renames/moves a file or directory from
+ * (old_parent, old_name) to (new_parent, new_name).
+ *
+ * Supports:
+ * - Same directory rename (old_parent == new_parent)
+ * - Cross-directory move (old_parent != new_parent)
+ * - Atomic replacement: if new_name exists as a regular file, it is atomically
+ *   replaced (POSIX semantics)
+ *
+ * The daemon MUST:
+ * - Return -ENOTEMPTY if target exists and is a non-empty directory
+ * - Prevent renaming a directory into its own subtree (return -EINVAL)
+ * - Update mtime of both parent directories
+ *
+ * On failure: source not found -> -ENOENT, parent not directory -> -ENOTDIR,
+ * target is non-empty directory -> -ENOTEMPTY, directory loop -> -EINVAL,
+ * invalid name -> -ENAMETOOLONG.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 7.
+ */
+#define KESTRELFS_RENAME_NAME_MAX	7
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -543,8 +583,18 @@ struct kestrelfs_ring_ctrl {
  *       (u64 @8), count (u32 @16, max 12), data (@20). This enables
  *       the daemon to accept writes from the kernel and persist them
  *       via MetaStore + ObjectStore, completing the read/write path.
+ *
+ *   4 - Phase 3 step 5: Added KESTRELFS_OP_TRUNCATE (opcode 5).
+ *
+ *   5 - Phase 3 step 7: Added KESTRELFS_OP_CREATE and KESTRELFS_OP_READDIR.
+ *
+ *   6 - Phase 3 step 9: Added KESTRELFS_OP_MKDIR and KESTRELFS_OP_UNLINK.
+ *
+ *   7 - Phase 3 step 10: Added KESTRELFS_OP_RENAME (opcode 10). Supports
+ *       atomic rename/move with POSIX semantics. Names limited to 7 bytes
+ *       each to fit within 32-byte payload.
  */
-#define KESTRELFS_ABI_VERSION		6
+#define KESTRELFS_ABI_VERSION		7
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.

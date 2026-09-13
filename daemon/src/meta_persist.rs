@@ -179,6 +179,20 @@ impl MetaStore for FileMetaStore {
             .map_err(|_| MetaError::Io)?;
         Ok(())
     }
+
+    async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<()> {
+        self.mem.rename(old_parent, old_name, new_parent, new_name).await?;
+        self.sync_to_disk()
+            .await
+            .map_err(|_| MetaError::Io)?;
+        Ok(())
+    }
 }
 
 impl MemStore {
