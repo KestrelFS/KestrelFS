@@ -502,9 +502,6 @@ sudo rmmod kestrelfs
 |---|---|---|
 | 1 | **等待 Cursor 的 Step 17 提示词** | 默认候选：S3ObjectStore 原型 |
 | 2 | S3 ObjectStore | 补齐 Redis metadata 对应的共享对象数据面 |
-| 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe |
-
-| 2 | S3 ObjectStore | 补齐 Redis metadata 对应的共享对象数据面 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
 > **⚠️ 明确**：在 Cursor 新提示词下达前，Codex **不要**自行开始 Redis/S3/Phase 4 等任何方向。只做 Cursor 提示词范围内的事。
