@@ -1,7 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4 Step 20（持久化索引 + 同步 BIO fill/hit + 失效）已由 Cursor 验收并纳入本提交（ABI 仍为 v11，cache format v1）。
-> **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
+> **最后更新**：Phase 4 Step 21（cache namespace identity）实现完成，等待 Cursor 验收；尚未 commit（IPC ABI 仍为 v11，cache format bump 到 v2）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
 ---
@@ -15,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 4 Step 20 已验收（同步 BIO hit）；DMA/eviction/多节点失效尚未开始 |
+| 当前阶段 | Phase 4 Step 21 待 Cursor 验收（v2 superblock 绑定 namespace SHA-256 identity） |
 
 ---
 
@@ -53,7 +52,7 @@
                     │                                  │
                     │  VFS (super/inode/dir/file ops)  │
                     │  /dev/kestrel_ctl char device     │
-                    │  本地 NVMe 缓存 (Step 20 同步 hit) │
+                    │ 本地 NVMe 缓存 (Step 21 namespace) │
                     └──────────────────────────────────┘
 ```
 
@@ -61,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；Step 20 在 Step 19 的专用块设备/v1 格式上持久化并恢复 4 KiB block index，READ_DATA miss 后同步 fill，完整范围命中时用同步 BIO 直接返回，并在 rewrite/truncate/unlink/rename-overwrite 前保守失效整个 inode。尚无 DMA、eviction、checksum 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；Step 21 将格式 bump 到 v2，在 superblock 持久化 32-byte namespace SHA-256 identity。指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 20 的 4 KiB 持久化索引、READ_DATA fill、同步 BIO hit 和四类失效保持不变。尚无 DMA、eviction、checksum 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -77,7 +76,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │   ├── file.c                   # file_operations (read/write/setattr) + IPC sync call helper
 │   ├── chardev.c                # /dev/kestrel_ctl: mmap/poll/ioctl
 │   ├── ipc_ring.c               # ring buffer push/pop primitives
-│   ├── cache.c                  # Phase 4 块设备 claim、v1 格式、持久化索引、同步 fill/hit/失效
+│   ├── cache.c                  # Phase 4 v2 namespace-bound 持久化 cache + 同步 fill/hit/失效
 │   ├── kestrelfs.h              # 内部跨文件声明
 │   └── kestrelfs_ipc.h          # ★ ABI 合约（C/Rust 共享，opcode/payload/struct 定义）
 │
@@ -102,7 +101,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── STEP9_MANUAL_TEST.md         # Step 9 mkdir/unlink 手工测试指南
 ├── test-persistence.sh          # 持久化集成测试脚本（需 sudo）
 ├── test-step19-cache-vng.sh     # Step 19 loop 格式化/复用/fail-closed/mount 回归
-├── test-step20-cache-vng.sh     # Step 20 loop fill/reload/hit/四类失效自动回归
+├── test-step20-cache-vng.sh     # Step 20/21 loop fill/reload/hit/失效/namespace 回归
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -138,6 +137,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 18** | **内核拥有的 NVMe 缓存骨架：块设备参数 + 恒 miss read hook** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 19** | **独占 claim 块设备 + v1 cache superblock + 内存/盘上索引骨架** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 20** | **持久化索引恢复 + READ_DATA fill + 同步 BIO hit + mutation 失效** | **11（未变）** | **✅ 已验收** |
+| **Phase 4 Step 21** | **cache namespace identity：v2 superblock + 64-hex 模块参数 + mismatch fail-closed** | **11（未变）** | **🚧 待 Cursor 验收** |
 
 Cursor 对照代码、137 tests、`STEP20_CACHE_PASS` 及 Step 19/15 vng 回归确认 Step 20 已验收。
 **测试约束**：cache/mount 验证只在 vng guest + loop；禁止 Codex 触碰物理机 zvol。
@@ -253,7 +253,8 @@ Cursor 对照代码、137 tests、vng GC 回归与参数校验（`STEP18_PARAM_P
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 | 24 | **NVMe cache hit 仍是同步原型** | Step 20 以固定 4 KiB block 和同步 BIO + `copy_to_user` 服务完整范围命中；非对齐首块不 fill，部分命中整次回退 READ_DATA。没有 DMA/零拷贝、readahead、LRU/eviction；slot 用尽只会停止新 fill。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v1 缺少崩溃完整性元数据** | 数据 flush 后才发布 index，正常 rmmod/insmod 可恢复；但单 superblock/index entry 没有 checksum、journal 或镜像，掉电 torn write 仍可能 fail closed 或极端情况下形成表面合法的坏条目。失效索引写失败会拒绝对应 mutation。 | `kestrelfs/cache.c` |
-| 26 | **cache namespace/多节点失效尚未闭环** | key 只有 inode id + offset，cache device 必须绑定同一 MetaStore namespace；切换 data-dir/Redis prefix 可能因 inode id 重用而误命中。当前只观察本机 VFS mutation，其他节点或直接 Redis mutation 不会通知本内核失效。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 26 | **cache namespace identity 依赖部署规范化** | Step 21 已在 v2 superblock 绑定 32-byte SHA-256 digest，缺失/非法/mismatch 均拒绝加载；内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1 不自动迁移，也没有 wipe 参数。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 27 | **多节点失效仍未闭环** | namespace identity 只防止不同 logical filesystem 混用 cache，不处理同 namespace 的远端 mutation。当前只观察本机 VFS mutation，其他节点或直接 Redis mutation 不会通知本内核失效。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -285,15 +286,22 @@ cargo clippy --all-targets -- -D warnings   # 零警告
 
 详细步骤见 `STEP8_VERIFICATION.md`（持久化）和 `STEP9_MANUAL_TEST.md`（mkdir/unlink），核心流程：
 
-> **固定测试启动约定**：以后提供的手工测试命令必须包含
-> `sudo insmod kestrelfs/kestrelfs.ko`；daemon 固定使用
-> `--data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &` 启动。接入 S3、Redis
-> 后再调整此约定。
+> **固定测试启动约定**：
+> 1. 手工/vng 脚本必须显式 `insmod`（及需要的 `cache_device`/`cache_namespace` 参数）。
+> 2. `--data-dir` **不强制** `/tmp/kestrelfs-debug`；由测试自选独立目录（推荐
+>    `/tmp/kestrelfs-<step>-$$` 或脚本内 `data_dir=...`），避免用例互相污染。
+> 3. daemon 标准输出/错误**不得**直接打到终端；重定向到日志文件（优先
+>    `"$data_dir/daemon.log"`），失败时可 `tail` 该文件排查。不要再用
+>    `>/dev/null 2>&1` 吞掉日志。
+> 4. Redis/S3 等额外参数按用例需要追加；日志重定向规则不变。
 
 ```bash
-# 1. 加载模块 + 启动 daemon
+# 1. 加载模块 + 启动 daemon（data_dir 可自选；日志进文件）
+data_dir=/tmp/kestrelfs-manual-$$
+mkdir -p "$data_dir"
 sudo insmod kestrelfs/kestrelfs.ko
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 
@@ -307,7 +315,8 @@ time sudo umount /mnt/kestrelfs   # 应 <1s 完成
 
 # 4. 验证持久化（杀 daemon → 同 data-dir 重启 → 文件仍在）
 kill "$daemon_pid"; wait "$daemon_pid" || true
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mount -t kestrelfs none /mnt/kestrelfs
@@ -627,7 +636,8 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
 ### 7.14 Phase 4 Step 20 持久化 cache 验证
 
 专用 vng 脚本在 guest 内创建 loop 块设备，并在 guest root 环境执行 `insmod`、
-固定 `--data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &` daemon、mount 和 rmmod。
+固定 `insmod`（含所需 cache 参数）、按用例自选 `--data-dir`、日志写入
+`"$data_dir/daemon.log"`，以及 mount/rmmod。
 它覆盖多块 READ_DATA fill、rmmod/insmod 后恢复、daemon 停止时的真实 hit，以及
 rewrite/truncate/unlink/rename-overwrite 后禁止脏命中：
 
@@ -642,6 +652,40 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 一致；四类 mutation 失效断言全过；`STEP20_CACHE_PASS`，最终复跑 umount 58 ms。
 GC 回归输出 `VNG_GC_PASS`，umount 92 ms。
 
+### 7.15 Phase 4 Step 21 cache namespace identity 验证
+
+`test-step20-cache-vng.sh` 已扩展 namespace 断言：用规范化 local descriptor 的
+SHA-256 作为 identity A，在同一 loop 填充并卸载；随后 identity B 加载必须返回
+错误且日志包含 `cache namespace identity mismatch`；最后重新用 A 加载并在停掉
+daemon 后读出持久化数据。脚本内每次 cache_device `insmod` 都显式传
+`cache_namespace`；daemon 按 §7.3 / §8 约定自选 `--data-dir` 并将日志写入
+`"$data_dir/daemon.log"`（勿再 `>/dev/null`）。
+
+```bash
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+```
+
+2026-09-14 当前实现执行通过：identity B 被拒绝，identity A 随后恢复 4 个 index
+entry 并在 daemon 停止时正确命中；最终输出 `STEP21_NAMESPACE_PASS` 和
+`STEP20_CACHE_PASS`，umount 56 ms。同期 Step 19 输出 `STEP19_CACHE_PASS`
+（umount 92 ms），Step 15 输出 `VNG_GC_PASS`（umount 100 ms）。
+
+直接使用模块时，部署层先计算无凭据规范 descriptor 的 SHA-256；示例仅用于 vng
+guest + loop，不得改成物理机 cache_device：
+
+```bash
+cache_namespace=$(printf '%s' \
+  'v1;meta=file:/tmp/kestrelfs-debug/meta.json;objects=local:/tmp/kestrelfs-debug' \
+  | sha256sum | awk '{print $1}')
+insmod kestrelfs/kestrelfs.ko cache_device=/dev/loop0 cache_size_mib=64 \
+  cache_namespace="$cache_namespace"
+./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -650,11 +694,11 @@ GC 回归输出 `VNG_GC_PASS`，umount 92 ms。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 21 提示词** | 候选：DMA/零拷贝 hit、eviction、或 cache namespace identity |
+| 1 | **等待 Cursor 验收 Step 21 / 下发下一步** | namespace identity 已实现；不自行扩大到 DMA/eviction |
 | 2 | Phase 4 后续：生产化缓存 | checksum/journal、多节点失效通知 |
 | 3 | 分布式后端生产化 | Redis 拆 key、GC 重试等（须 Cursor 明示） |
 
-> **⚠️ 明确**：在 Cursor 新提示词下达前，不继续扩大 Phase 4 hit/DMA，也不自行改做分布式生产化。
+> **⚠️ 明确**：在 Cursor 验收及新提示词下达前，不继续扩大 Phase 4 hit/DMA，也不自行改做分布式生产化。
 
 ### Codex 自动验证与权限（无交互密码）
 
@@ -667,11 +711,17 @@ device 和 mount 行为验证必须在 vng guest 内完成，禁止在物理开�
 内使用 loop block device，不能把 backing 普通文件直接传给 `cache_device`。
 宿主机 zvol 路径只作资产记录，除非人类以后明确撤销本条限制，否则不得触碰。
 
-所有新 vng/手工测试脚本仍必须显式包含 `insmod`，daemon 固定用：
+所有新 vng/手工测试脚本仍必须显式包含 `insmod`。daemon 启动约定：
 
 ```bash
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+data_dir=/tmp/kestrelfs-<step>-$$   # 或脚本自定义；勿写死成唯一全局路径
+mkdir -p "$data_dir"
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
+# 失败时：tail -n 100 "$data_dir/daemon.log"
 ```
+
+不要把 daemon 日志丢进 `/dev/null`。`--data-dir` 不必固定为 `/tmp/kestrelfs-debug`。
 
 ---
 
@@ -700,9 +750,10 @@ device 和 mount 行为验证必须在 vng guest 内完成，禁止在物理开�
 ## 10. 交接检查清单
 
 - [x] Step 20 持久化索引 + fill/hit/失效已由 Cursor 验收并提交
-- [x] ABI 版本核对无误（内核 = Rust = 11；cache format v1）
+- [ ] Step 21 cache namespace identity 已实现，等待 Cursor 验收且未 commit
+- [x] ABI 版本核对无误（内核 = Rust = 11；cache format v2）
 - [x] Step 8–19 + Phase 4 Step 20 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 21 提示词
+- [x] 下一步明确：等待 Cursor 验收 Step 21 / 下发下一步
 - [x] 测试约束：cache/mount 只在 vng+loop，禁止触碰物理机 zvol（见 §8）
 
 ---
