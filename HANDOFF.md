@@ -705,14 +705,6 @@ device 和 mount 行为验证必须在 vng guest 内完成，禁止在物理开�
 - [x] 下一步明确：等待 Cursor 的 Step 21 提示词
 - [x] 测试约束：cache/mount 只在 vng+loop，禁止触碰物理机 zvol（见 §8）
 
-- [x] Step 19 块设备 claim + v1 格式/索引骨架已由 Cursor 验收并提交
-- [ ] Step 20 持久化索引 + fill/hit/失效已实现，等待 Cursor 验收且未 commit
-- [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–18 + Phase 4 Step 19 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 验收 Step 20 / 下发下一步
-- [x] 开发 zvol 路径：`/dev/zvol/nvraid1tank1/kestrel-cache`（4K volblocksize）
-- [x] 最新权限策略：所有 cache/mount 验证只在 vng+loop，禁止 Codex 触碰物理机 zvol（见 §8）
-
 ---
 
 ## 11. 文档债务
