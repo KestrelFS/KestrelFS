@@ -320,7 +320,7 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 	/*
 	 * Phase 4 fast-path hook.  It deliberately runs before the bounce-buffer
 	 * mutex: a future cache hit must not serialize with daemon IPC.  The Step
-	 * 18 skeleton always reports -ENODATA, so every read still follows the
+	 * 19 index skeleton still reports -ENODATA, so every read follows the
 	 * ABI v11 READ_DATA path below.
 	 */
 	cache_ret = kestrelfs_cache_lookup(inode, buf, count, ppos);

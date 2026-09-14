@@ -1,7 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4 Step 18 NVMe 缓存骨架已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
-> **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
+> **最后更新**：Phase 4 Step 19（claim 块设备 + v1 superblock/索引骨架）已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
 ---
@@ -15,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 4 已启动：Step 18 内核 NVMe 缓存骨架已验收；完整块 I/O/DMA 尚未开始 |
+| 当前阶段 | Phase 4 Step 19 已验收（设备 claim + v1 格式）；hit/DMA/fill 尚未开始 |
 
 ---
 
@@ -53,7 +52,7 @@
                     │                                  │
                     │  VFS (super/inode/dir/file ops)  │
                     │  /dev/kestrel_ctl char device     │
-                    │  本地 NVMe 缓存 (Step 18 骨架)     │
+                    │  本地 NVMe 缓存 (Step 19 格式骨架) │
                     └──────────────────────────────────┘
 ```
 
@@ -61,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；Step 18 已加入块设备参数校验与恒 miss read hook，尚无设备 I/O/索引/DMA。只允许 loop、zvol 或 raw block device，禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；Step 19 会独占 claim loop/zvol/raw block device，校验容量/sector，并格式化或复用 v1 superblock 与空 `rhashtable` 索引骨架。read hook 仍恒 miss，尚无 data block I/O/DMA/fill/invalidation。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -77,7 +76,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │   ├── file.c                   # file_operations (read/write/setattr) + IPC sync call helper
 │   ├── chardev.c                # /dev/kestrel_ctl: mmap/poll/ioctl
 │   ├── ipc_ring.c               # ring buffer push/pop primitives
-│   ├── cache.c                  # Phase 4 cache 参数、设备类型校验、恒 miss read hook
+│   ├── cache.c                  # Phase 4 块设备 claim、v1 superblock、索引骨架、恒 miss hook
 │   ├── kestrelfs.h              # 内部跨文件声明
 │   └── kestrelfs_ipc.h          # ★ ABI 合约（C/Rust 共享，opcode/payload/struct 定义）
 │
@@ -101,6 +100,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── STEP8_VERIFICATION.md        # Step 8 持久化验证指南
 ├── STEP9_MANUAL_TEST.md         # Step 9 mkdir/unlink 手工测试指南
 ├── test-persistence.sh          # 持久化集成测试脚本（需 sudo）
+├── test-step19-cache-vng.sh     # Step 19 loop 格式化/复用/fail-closed/mount 回归
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -134,6 +134,10 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 16** | **可切换 RedisMetaStore 原型（单 key 快照 + Lua CAS）** | **11（未变）** | **✅ 已验收** |
 | **Step 17** | **可切换 S3ObjectStore 原型（AWS S3 / MinIO）** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 18** | **内核拥有的 NVMe 缓存骨架：块设备参数 + 恒 miss read hook** | **11（未变）** | **✅ 已验收** |
+| **Phase 4 Step 19** | **独占 claim 块设备 + v1 cache superblock + 内存/盘上索引骨架** | **11（未变）** | **✅ 已验收** |
+
+Cursor 对照代码、137 tests、`STEP19_CACHE_PASS` 与 GC 回归确认 Step 19 已验收。
+宿主机开发缓存盘：`/dev/zvol/nvraid1tank1/kestrel-cache`（已创建）。
 
 Cursor 对照代码、137 tests、vng GC 回归与参数校验（`STEP18_PARAM_PASS`）确认 Step 18 已验收；Step 17 MinIO 门控测此前已验收。
 
@@ -241,7 +245,8 @@ Cursor 对照代码、137 tests、vng GC 回归与参数校验（`STEP18_PARAM_P
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 22 | **S3 delete 仍是提交后 best-effort** | Step 15 在 metadata 提交后调用 S3 DeleteObject；成功会真删对象，缺失对象视为成功。网络/权限失败只记录泄漏，不回滚已生效的 unlink/rename/truncate，也没有持久化重试队列。 | `daemon/src/object_store_s3.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
-| 24 | **NVMe cache 仅有 Step 18 骨架** | `cache_device` 只做块设备 inode 类型校验，`cache_size_mib` 仅预留；`kestrelfs_cache_lookup()` 恒返回 miss。尚未打开/声明设备，也没有索引、block I/O、DMA、填充或失效实现。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 24 | **NVMe cache 仍不服务 hit** | Step 19 已独占打开设备、落 v1 superblock、预留 2 MiB 盘上索引区并初始化空 `rhashtable`，但不装载/持久化 index entry；`kestrelfs_cache_lookup()` 恒 miss。没有 data block I/O、DMA、填充或失效实现。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 25 | **cache v1 格式是最小骨架** | 自动格式化仅允许 2 MiB 保留元数据区全零；已有非零错误格式或参数 geometry 不一致会 fail closed。当前单 superblock 无 checksum/镜像，重新加载必须使用相同 `cache_size_mib`；格式仍可能在掉电撕裂后不可恢复。exclusive holder 阻止其他 holder claim，但 `CONFIG_BLK_DEV_WRITE_MOUNTED=y` 时不能阻止 root raw write，部署必须隔离专用设备。 | `kestrelfs/cache.c` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -588,6 +593,51 @@ kill "$daemon_pid"; wait "$daemon_pid" || true
 sudo rmmod kestrelfs
 ```
 
+### 7.13 Phase 4 Step 19 块设备格式验证
+
+专用 vng 脚本在 guest 中创建 128 MiB 稀疏文件并挂为 loop 块设备，覆盖：
+
+- 普通文件作为 `cache_device` 时拒绝加载；
+- `cache_size_mib=64` 格式化，带 cache claim 挂载后 READ_DATA 读写回归；
+- 卸载模块后以相同 geometry 重新加载，generation/superblock hash 不变；
+- `cache_size_mib` 不一致及坏 magic 均 fail closed；
+- 元数据区清零后 `cache_size_mib=0` 使用完整 128 MiB 设备。
+
+```bash
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
+```
+
+2026-09-14 对最终实现执行通过，挂载回归 `umount_ms=88`，最终输出
+`STEP19_CACHE_PASS`；最终版另跑 `test-step15-gc-vng.sh`，GC 全部通过，
+`umount_ms=90`，输出 `VNG_GC_PASS`。
+
+宿主机开发盘已创建：`/dev/zvol/nvraid1tank1/kestrel-cache`（→ `/dev/zd*`，`root:disk` 660）。
+人类创建并确认它是可清空的专用 zvol 后，可用以下命令补充验证；首次加载只在 2 MiB 保留元数据
+区全零时格式化，否则 fail closed。daemon 仍沿用固定 data-dir 约定：
+
+```bash
+cache_dev=/dev/zvol/nvraid1tank1/kestrel-cache
+test -b "$cache_dev"
+sudo insmod kestrelfs/kestrelfs.ko cache_device="$cache_dev" cache_size_mib=0
+./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mkdir -p /mnt/kestrelfs
+sudo mount -t kestrelfs none /mnt/kestrelfs
+printf 'step19 zvol READ_DATA fallback\n' | sudo tee /mnt/kestrelfs/step19-zvol.dat >/dev/null
+test "$(sudo cat /mnt/kestrelfs/step19-zvol.dat)" = "step19 zvol READ_DATA fallback"
+time sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+sudo rmmod kestrelfs
+
+# 相同参数再次加载，应在 dmesg 看到 "reusing cache device=..."
+sudo insmod kestrelfs/kestrelfs.ko cache_device="$cache_dev" cache_size_mib=0
+sudo dmesg | tail -n 30
+sudo rmmod kestrelfs
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -596,11 +646,13 @@ sudo rmmod kestrelfs
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 19 提示词** | 打开专用块设备、缓存 superblock/索引骨架；开发机可用 zvol |
-| 2 | Phase 4 后续：命中路径与填充 | LBA 索引、fill-on-miss、失效、真正块 I/O |
+| 1 | **等待 Cursor 的 Step 20 提示词** | 持久化索引 + fill-on-miss / 失效；仍可不做完整 DMA hit |
+| 2 | Phase 4 后续：命中路径 | 真正从 cache device 服务 read hit |
+| 3 | 分布式后端生产化 | Redis 拆 key、GC 重试等（须 Cursor 明示） |
+| 2 | Phase 4 后续：命中路径与填充 | index entry 恢复/持久化、fill-on-miss、失效、真正 data block I/O |
 | 3 | 分布式后端生产化 | Redis 拆 key、GC 重试、配置治理（与 Phase 4 可并行但须 Cursor 明示） |
 
-> **⚠️ 明确**：Step 18 不实现完整 DMA/direct I/O 缓存；在 Cursor 验收并下达
+> **⚠️ 明确**：Step 19 不实现完整 DMA/direct I/O hit；在 Cursor 验收并下达
 > 后续提示词前，不继续扩大 Phase 4，也不自行改做分布式生产化。
 
 ---
@@ -632,7 +684,8 @@ sudo rmmod kestrelfs
 - [x] Step 18 NVMe 缓存骨架已由 Cursor 验收并提交（设计文档 + 恒 miss hook + vng）
 - [x] ABI 版本核对无误（内核 = Rust = 11）
 - [x] Step 8–17 + Phase 4 Step 18 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 19 提示词（打开块设备 / 索引骨架）
+- [ ] Step 19 块设备/superblock/索引骨架待 Cursor 验收，worktree 尚未 commit
+- [x] 下一步明确：等待 Cursor 验收 Step 19
 - [x] 已知限制与坑已列出（第 6 节）
 - [x] vng 站立规则见 §9；cache 设备仅允许块设备（loop/zvol/raw）
 

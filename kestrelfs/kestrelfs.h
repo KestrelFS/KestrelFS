@@ -36,7 +36,7 @@
  */
 #define KESTRELFS_REMOTE_FILE_SIZE	(16 * KESTRELFS_READ_CHUNK_MAX_LEN)
 
-/* cache.c: Phase 4 kernel-owned block-device cache skeleton. */
+/* cache.c: Phase 4 kernel-owned block-device cache format/index skeleton. */
 int kestrelfs_cache_init(void);
 void kestrelfs_cache_exit(void);
 

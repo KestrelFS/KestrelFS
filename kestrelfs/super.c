@@ -83,5 +83,5 @@ module_exit(kestrelfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KestrelFS Project");
-MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and NVMe cache skeleton");
-MODULE_VERSION("0.4.0-step18");
+MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and NVMe cache format skeleton");
+MODULE_VERSION("0.4.0-step19");
