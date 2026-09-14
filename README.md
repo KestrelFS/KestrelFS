@@ -20,9 +20,9 @@
 
 > ⚠️ **Project status: early development (Phase 3 in progress; ABI v11).**
 > Phase 1–2 are done. Phase 3 currently provides a working local control plane
-> (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore` +
-> `LocalFsObjectStore`). Redis/S3 backends and Phase 4 NVMe cache are **not**
-> started — see [Roadmap](#roadmap) and `HANDOFF.md`.
+> (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore`, an
+> optional Redis metadata prototype, and `LocalFsObjectStore`). S3 and Phase 4
+> NVMe cache are **not** started — see [Roadmap](#roadmap) and `HANDOFF.md`.
 
 ---
 
@@ -129,7 +129,7 @@ phase beyond what's marked "done" below is implemented.**
 |---|---|---|
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
-| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, symlink/readlink, READ/WRITE via bounce buffer, truncate, unreferenced-block GC, local JSON + local-FS persistence (ABI v11 / Steps 1–15). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
+| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, symlink/readlink, READ/WRITE via bounce buffer, truncate, unreferenced-block GC, local JSON/local-FS persistence, and an optional RedisMetaStore prototype (ABI v11 / Steps 1–16). S3 objects still ahead. | 🚧 In progress — Redis metadata prototype implemented; shared object backend not started |
 | **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits DMA back to the VFS caller, bypassing the Rust daemon. | ⏳ Not started |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
@@ -147,7 +147,7 @@ KestrelFS/   # local checkout directory may historically be named FerroFS
 │   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v11)
 │   └── chardev_test.c
 └── daemon/                    # Rust control-plane daemon
-    └── src/{main,abi,meta,meta_persist,object_store,fs_model,device,ring,ioctl}.rs
+    └── src/{main,abi,meta,meta_persist,meta_redis,object_store,fs_model,device,ring,ioctl}.rs
 ```
 
 ---
@@ -268,6 +268,23 @@ sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
   - Must be writable by the daemon process (requires `sudo` if using system paths)
 
 - `--memory` — Use in-memory MetaStore + ObjectStore (data lost on restart; tests only)
+
+- `--meta <REDIS_URL>` — Use Redis metadata instead of `meta.json`, for example
+  `redis://127.0.0.1:6379/0`. Block objects still use `--data-dir`.
+
+- `--redis-prefix <PREFIX>` — Namespace for the Redis snapshot key (default:
+  `kestrelfs`; actual key: `<PREFIX>:meta:v1`). This option requires `--meta`.
+
+The Redis backend stores one JSON metadata snapshot and atomically replaces it
+with a Lua compare-and-swap. This preserves cross-structure rename/truncate/GC
+semantics, but transfers the full snapshot on each operation and is intended as
+a correctness prototype. A real-Redis integration test is opt-in:
+
+```bash
+cd daemon
+REDIS_URL=redis://127.0.0.1:6379/15 \
+  cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
+```
 
 **Verifying persistence:**
 
@@ -413,8 +430,9 @@ read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
   failed best-effort deletes are logged, but there is not yet a durable retry queue.
 - **Data/name IPC is globally serialized** by one mutex (correct but limits
   concurrency).
-- **Distributed backends** (Redis MetaStore, S3 ObjectStore) and **Phase 4
-  NVMe cache** are not started.
+- **Redis metadata is currently a single-key/full-snapshot prototype**, not a
+  scalable per-inode schema. S3 ObjectStore and **Phase 4 NVMe cache** are not
+  started; Redis metadata still points at node-local `--data-dir` objects.
 
 Authoritative detail lives in `HANDOFF.md` §6.
 

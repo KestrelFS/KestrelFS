@@ -3,8 +3,9 @@
 //!
 //! # Status
 //!
-//! This binary is **not yet the real control-plane daemon** described
-//! in the project roadmap (no Redis, no S3). It proves two things
+//! This binary is an early control-plane daemon: it now has local and Redis
+//! metadata backends, while S3 and the Phase 4 data plane remain unimplemented.
+//! Its original bootstrap established two things
 //! end-to-end:
 //!
 //! 1. (Phase 2) The kernel<->Rust IPC bridge itself: open
@@ -52,6 +53,7 @@ mod fs_model;
 mod ioctl;
 mod meta;
 mod meta_persist;
+mod meta_redis;
 mod object_store;
 mod ring;
 
@@ -71,7 +73,7 @@ use std::sync::Arc;
 /// KestrelFS control-plane daemon.
 ///
 /// Attaches to /dev/kestrel_ctl and handles IPC requests from the kernel module.
-/// Metadata is stored in-memory, while block data is persisted to a local directory.
+/// Metadata is selectable; block data is in-memory or persisted locally.
 #[derive(Parser, Debug)]
 #[command(name = "kestrelfs-daemon")]
 #[command(version, about, long_about = None)]
@@ -91,6 +93,22 @@ struct Args {
     /// This is useful for tests but not recommended for production use.
     #[arg(long)]
     memory: bool,
+
+    /// Redis URL for metadata, for example redis://127.0.0.1:6379/0.
+    ///
+    /// When omitted, metadata uses `{data_dir}/meta.json`. Redis metadata is
+    /// incompatible with `--memory`; block objects remain in `data_dir`.
+    #[arg(long, value_name = "REDIS_URL", conflicts_with = "memory")]
+    meta: Option<String>,
+
+    /// Namespace prefix used by the Redis metadata backend.
+    #[arg(
+        long,
+        default_value = "kestrelfs",
+        requires = "meta",
+        conflicts_with = "memory"
+    )]
+    redis_prefix: String,
 }
 
 /// Seeds the single block backing `remote.txt`'s initial content.
@@ -159,14 +177,12 @@ fn main() -> io::Result<()> {
     // below - see this module's doc comment for why the event loop
     // itself is not restructured to be async. `rt-multi-thread` is
     // enabled in Cargo.toml even though this bootstrap step's
-    // MetaStore (MemStore) never spawns additional work onto it,
-    // purely so a future MetaStore implementation that DOES need
-    // background tasks (e.g. a real Redis client's connection
-    // management) does not require touching this runtime
-    // construction again.
+    // Local MetaStores do not spawn additional work onto it, but the Redis
+    // implementation uses Tokio-aware network I/O through this same runtime.
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Initialize ObjectStore and MetaStore based on CLI flags
+    // Initialize ObjectStore and MetaStore based on CLI flags. Redis changes
+    // only the metadata backend; block objects deliberately remain LocalFs.
     let (object_store, store): (Arc<dyn ObjectStore>, Arc<dyn MetaStore>) = if args.memory {
         println!("kestrelfs-daemon: using in-memory storage (data will not persist)");
         (
@@ -183,12 +199,28 @@ fn main() -> io::Result<()> {
                 .block_on(object_store::LocalFsObjectStore::new(&args.data_dir))
                 .map_err(|e| io::Error::other(e.to_string()))?,
         );
-        let meta_path = args.data_dir.join("meta.json");
-        let meta_store = Arc::new(
-            runtime
-                .block_on(meta_persist::FileMetaStore::new(meta_path))
-                .map_err(|e| io::Error::other(e.to_string()))?,
-        );
+        let meta_store: Arc<dyn MetaStore> = if let Some(redis_url) = args.meta.as_deref() {
+            // Do not print the URL: it may contain Redis credentials.
+            println!(
+                "kestrelfs-daemon: using Redis metadata (prefix={})",
+                args.redis_prefix
+            );
+            Arc::new(
+                runtime
+                    .block_on(meta_redis::RedisMetaStore::new(
+                        redis_url,
+                        &args.redis_prefix,
+                    ))
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            )
+        } else {
+            let meta_path = args.data_dir.join("meta.json");
+            Arc::new(
+                runtime
+                    .block_on(meta_persist::FileMetaStore::new(meta_path))
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            )
+        };
         (obj_store, meta_store)
     };
 
@@ -217,7 +249,7 @@ fn main() -> io::Result<()> {
         }
     });
 
-    println!("kestrelfs-daemon: MemStore initialized (seeded: /, /remote.txt, /writable.dat)");
+    println!("kestrelfs-daemon: MetaStore initialized (seeded: /, /remote.txt, /writable.dat)");
 
     println!("kestrelfs-daemon: entering poll() event loop, waiting for REQ events ...");
 
@@ -1623,6 +1655,36 @@ mod tests {
     use crate::object_store::LocalFsObjectStore;
     use meta::{MemStore, REMOTE_TXT_INODE};
     use tempfile::TempDir;
+
+    #[test]
+    fn cli_selects_file_memory_or_redis_metadata_exclusively() {
+        let default_args = Args::try_parse_from(["kestrelfs-daemon"]).unwrap();
+        assert!(!default_args.memory);
+        assert!(default_args.meta.is_none());
+
+        let memory_args = Args::try_parse_from(["kestrelfs-daemon", "--memory"]).unwrap();
+        assert!(memory_args.memory);
+        assert!(memory_args.meta.is_none());
+
+        let redis_args = Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--meta",
+            "redis://127.0.0.1:6379/0",
+            "--redis-prefix",
+            "test-fs",
+        ])
+        .unwrap();
+        assert_eq!(redis_args.meta.as_deref(), Some("redis://127.0.0.1:6379/0"));
+        assert_eq!(redis_args.redis_prefix, "test-fs");
+
+        assert!(Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--memory",
+            "--meta",
+            "redis://127.0.0.1:6379/0",
+        ])
+        .is_err());
+    }
 
     /// Builds a raw `OP_LOOKUP` request event, encoding `(parent_inode,
     /// name)` by hand at the exact wire offsets documented in

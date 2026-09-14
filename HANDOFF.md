@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 3 Step 15 ObjectStore 孤儿块 GC 已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
+> **最后更新**：Phase 3 Step 16 RedisMetaStore 原型已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
@@ -39,7 +39,8 @@
                     │                                  │
                     │  MetaStore (元数据)               │
                     │    ├─ MemStore (内存)             │
-                    │    └─ FileMetaStore (meta.json)   │
+                    │    ├─ FileMetaStore (meta.json)   │
+                    │    └─ RedisMetaStore (可选原型)   │
                     │  ObjectStore (块数据)             │
                     │    ├─ MemObjectStore (内存)       │
                     │    └─ LocalFsObjectStore (磁盘)   │
@@ -85,6 +86,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       ├── abi.rs               # ★ ABI mirror of kestrelfs_ipc.h（opcode 常量、编解码、编译时断言）
 │       ├── meta.rs              # MetaStore trait + MemStore 实现
 │       ├── meta_persist.rs      # FileMetaStore（JSON 持久化）
+│       ├── meta_redis.rs        # RedisMetaStore（单 key 快照 + Lua CAS）
 │       ├── object_store.rs      # ObjectStore trait + MemObjectStore + LocalFsObjectStore
 │       ├── fs_model.rs          # Inode / Slice / Block 数据模型
 │       ├── device.rs            # /dev/kestrel_ctl 打开/mmap/ABI校验
@@ -125,6 +127,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 13** | **统一长名字数据面 + 批量 READDIR** | **10** | **✅ 已验收** |
 | **Step 14** | **符号链接（MetaStore 持有 target，VFS symlink/get_link）** | **11** | **✅ 已验收** |
 | **Step 15** | **unlink / rename 覆盖 / truncate 的无引用 ObjectStore block GC** | **11（未变）** | **✅ 已验收** |
+| **Step 16** | **可切换 RedisMetaStore 原型（单 key 快照 + Lua CAS）** | **11（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认 Step 15 已验收。
 
@@ -189,14 +192,16 @@ Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认
 
 ### 5.5 存储现状
 
-| 层 | 内存模式 (`--memory`) | 持久化模式 (`--data-dir <path>`) |
-|---|---|---|
-| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（包装 MemStore，每次写操作后全量序列化到 `{data_dir}/meta.json`，原子 tmp+fsync+rename） |
-| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（每个 block 存为 `{data_dir}/{slice_uuid}/{block_idx}` 文件，原子 tmp+rename；GC 真删文件及空 UUID 目录） |
+| 层 | 内存模式 (`--memory`) | 默认持久化模式 | Redis metadata 模式 (`--meta redis://...`) |
+|---|---|---|---|
+| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`{prefix}:meta:v1` 单 key JSON；Lua CAS 原子提交） |
+| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | 仍为 `LocalFsObjectStore`；本步未实现 S3 |
 
 **CLI 参数**（`daemon/src/main.rs`）：
 - `--data-dir <PATH>`：持久化目录（默认 `./.kestrelfs-data`），meta.json 和块数据均存于此
 - `--memory`：纯内存模式（元数据 + 块数据均不持久化）
+- `--meta <REDIS_URL>`：将 metadata 切到 Redis，例如 `redis://127.0.0.1:6379/0`；与 `--memory` 冲突
+- `--redis-prefix <PREFIX>`：Redis key 命名空间，默认 `kestrelfs`，实际 key 为 `<PREFIX>:meta:v1`
 
 ---
 
@@ -221,6 +226,10 @@ Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 很多时成本较高；未来 Redis/S3 后端需要引用计数或持久化 GC 队列。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` |
 | 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
+| 18 | **RedisMetaStore 是全量快照原型** | 每次读 GET/反序列化整份 JSON；每次写还要全量序列化并 Lua CAS，冲突最多重试 64 次。优点是 rename、inode 分配、slice 裁剪和 GC keys 与元数据在单 key 上线性化；大规模部署需拆 key/索引或采用服务端 Lua 数据模型。 | `daemon/src/meta_redis.rs` |
+| 19 | **Redis metadata + LocalFs objects 不是共享数据面** | 多 daemon 可共享 Redis metadata，但本步 ObjectStore 仍是节点本地目录；节点使用不同 `--data-dir` 时可能看见 slice metadata 却缺少对象。S3ObjectStore 接入前只适合单 daemon 或共享同一对象目录的原型验证。 | `daemon/src/main.rs` 存储选择 |
+| 20 | **Redis 快照损坏/丢失时 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，Redis key 已存在但 JSON 非法时 daemon 启动失败；运行中 key 被外部删除时 metadata 操作返回 EIO，避免静默创建新文件系统。 | `daemon/src/meta_redis.rs` |
+| 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -244,7 +253,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（当前 130 个）
+cargo test                    # 单元测试 + 集成测试（当前 133 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -432,6 +441,57 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 成功标记为 `VNG_GC_PASS`；guest 脚本任一断言失败均以非零状态退出。
 
+### 7.10 Step 16 RedisMetaStore 集成测试
+
+默认 `cargo test` 不要求本机存在 Redis；设置 `REDIS_URL` 后才执行真实 Redis
+语义与重连恢复断言，测试使用随机 prefix 并在成功后删除测试 key：
+
+```bash
+cd daemon
+REDIS_URL='redis://:<PASSWORD>@192.168.18.253:8379/15' \
+  cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
+```
+
+该测试覆盖两个 RedisMetaStore 并发 create、mkdir/create、symlink target、
+rename 覆盖、truncate/unlink GC keys 以及重新构造 RedisMetaStore 后的恢复。
+Redis mutation 先在快照副本上复用
+MemStore 语义，再由 Lua 比较旧 JSON 并 `SET` 新 JSON；CAS 失败会从最新快照重试。
+
+2026-09-14 已对 `192.168.18.253:8379` 的真实 Redis 执行上述门控测试：
+`1 passed; 0 failed`（约 0.03s）。密码只通过 `REDIS_URL` 环境变量注入，禁止
+硬编码进仓库文件。
+
+人类如需补充挂载/重启测试，沿用固定 data-dir 与模块加载约定：
+
+```bash
+: "${KESTRELFS_REDIS_PASSWORD:?请先 export KESTRELFS_REDIS_PASSWORD}"
+export REDIS_URL="redis://:${KESTRELFS_REDIS_PASSWORD}@192.168.18.253:8379/15"
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+sudo insmod kestrelfs/kestrelfs.ko
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step16 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mkdir -p /mnt/kestrelfs
+sudo mount -t kestrelfs none /mnt/kestrelfs
+sudo rm -f /mnt/kestrelfs/step16-file /mnt/kestrelfs/step16-link
+printf 'redis metadata survives restart\n' | sudo tee /mnt/kestrelfs/step16-file >/dev/null
+sudo ln -s step16-file /mnt/kestrelfs/step16-link
+sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step16 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mount -t kestrelfs none /mnt/kestrelfs
+test "$(sudo cat /mnt/kestrelfs/step16-file)" = "redis metadata survives restart"
+test "$(sudo readlink /mnt/kestrelfs/step16-link)" = step16-file
+sudo rm /mnt/kestrelfs/step16-link /mnt/kestrelfs/step16-file
+time sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+sudo rmmod kestrelfs
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -440,8 +500,11 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 16 提示词** | 默认候选：RedisMetaStore 原型；S3 可其后 |
-| 2 | Redis MetaStore + S3 ObjectStore | 分布式控制面 |
+| 1 | **等待 Cursor 的 Step 17 提示词** | 默认候选：S3ObjectStore 原型 |
+| 2 | S3 ObjectStore | 补齐 Redis metadata 对应的共享对象数据面 |
+| 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe |
+
+| 2 | S3 ObjectStore | 补齐 Redis metadata 对应的共享对象数据面 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
 > **⚠️ 明确**：在 Cursor 新提示词下达前，Codex **不要**自行开始 Redis/S3/Phase 4 等任何方向。只做 Cursor 提示词范围内的事。
@@ -472,10 +535,10 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 ## 10. 交接检查清单
 
-- [x] Step 15 ObjectStore GC 已由 Cursor 验收并提交（130 tests + vng）
+- [x] Step 16 RedisMetaStore 已由 Cursor 验收并提交（133 tests；真实 Redis 门控测由实现方跑通）
 - [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–15 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 16 提示词
+- [x] Step 8–16 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 17 提示词（S3ObjectStore）
 - [x] 已知限制与坑已列出（第 6 节）
 - [x] `test-step15-gc-vng.sh` 已入库；vng 站立规则见 §9
 ---
