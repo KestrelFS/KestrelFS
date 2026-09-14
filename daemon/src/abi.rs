@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 10;
+pub const ABI_VERSION: u32 = 11;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -111,6 +111,10 @@ pub const OP_MKDIR_DATA: u32 = 16;
 pub const OP_UNLINK_DATA: u32 = 17;
 /// Request: return batched directory entries through the bounce buffer.
 pub const OP_READDIR_DATA: u32 = 18;
+/// Request: create a symbolic link using name and target in the bounce buffer.
+pub const OP_SYMLINK_DATA: u32 = 19;
+/// Request: return a symbolic-link target through the bounce buffer.
+pub const OP_READLINK_DATA: u32 = 20;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -431,6 +435,56 @@ impl KestrelfsEvent {
         })
     }
 
+    /// Decodes an ABI v11 `OP_SYMLINK_DATA` request. The bounce buffer holds
+    /// the name immediately followed by the target.
+    ///
+    /// # Safety
+    ///
+    /// `data_buffer` must point to a live, exclusively owned
+    /// [`DATA_BUFFER_SIZE`]-byte buffer.
+    pub unsafe fn decode_symlink_data_req(
+        &self,
+        data_buffer: *const u8,
+    ) -> Result<SymlinkDataReq, SymlinkDataDecodeError> {
+        if self.flags != 0 {
+            return Err(SymlinkDataDecodeError::UnsupportedFlags(self.flags));
+        }
+        let parent_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let name_len = u16::from_le_bytes(self.payload[8..10].try_into().unwrap());
+        let target_len = u16::from_le_bytes(self.payload[10..12].try_into().unwrap());
+        if name_len == 0 {
+            return Err(SymlinkDataDecodeError::EmptyName);
+        }
+        if name_len as usize > NAME_DATA_MAX {
+            return Err(SymlinkDataDecodeError::NameTooLong(name_len));
+        }
+        if target_len == 0 {
+            return Err(SymlinkDataDecodeError::EmptyTarget);
+        }
+        if target_len as usize > SYMLINK_TARGET_MAX {
+            return Err(SymlinkDataDecodeError::TargetTooLong(target_len));
+        }
+        let total_len = name_len as usize + target_len as usize;
+        if total_len > DATA_BUFFER_SIZE {
+            return Err(SymlinkDataDecodeError::CombinedDataTooLong);
+        }
+        let mut bytes = vec![0; total_len];
+        // SAFETY: the checked lengths fit the buffer promised by the caller.
+        unsafe { std::ptr::copy_nonoverlapping(data_buffer, bytes.as_mut_ptr(), total_len) };
+        let split = name_len as usize;
+        let name = std::str::from_utf8(&bytes[..split])
+            .map_err(|_| SymlinkDataDecodeError::NameInvalidUtf8)?
+            .to_string();
+        let target = std::str::from_utf8(&bytes[split..])
+            .map_err(|_| SymlinkDataDecodeError::TargetInvalidUtf8)?
+            .to_string();
+        Ok(SymlinkDataReq {
+            parent_inode,
+            name,
+            target,
+        })
+    }
+
     /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
     /// `KESTRELFS_OP_READ_CHUNK` request, with `data` copied into the
     /// leading bytes of the payload and the remainder zero-padded, per
@@ -629,6 +683,8 @@ pub const NAME_DATA_MAX: usize = 255;
 /// Bytes preceding each variable-length READDIR_DATA entry name: inode u64
 /// followed by name_len u16.
 pub const READDIR_DATA_ENTRY_HEADER_SIZE: usize = 10;
+/// Maximum UTF-8 symlink target size, mirrored from the C ABI.
+pub const SYMLINK_TARGET_MAX: usize = 4095;
 
 /// Decoded form of a `KESTRELFS_OP_LOOKUP` request payload. See
 /// [`KestrelfsEvent::decode_lookup_req`].
@@ -750,6 +806,35 @@ pub struct NameDataReq {
     pub parent_inode: u64,
     pub mode: u32,
     pub name: String,
+}
+
+/// Decoded ABI v11 symbolic-link creation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymlinkDataReq {
+    pub parent_inode: u64,
+    pub name: String,
+    pub target: String,
+}
+
+/// Malformed ABI v11 `OP_SYMLINK_DATA` request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SymlinkDataDecodeError {
+    #[error("request flags {0:#x} are unsupported")]
+    UnsupportedFlags(u32),
+    #[error("link name must not be empty")]
+    EmptyName,
+    #[error("name_len {0} exceeds NAME_DATA_MAX ({NAME_DATA_MAX})")]
+    NameTooLong(u16),
+    #[error("symlink target must not be empty")]
+    EmptyTarget,
+    #[error("target_len {0} exceeds SYMLINK_TARGET_MAX ({SYMLINK_TARGET_MAX})")]
+    TargetTooLong(u16),
+    #[error("combined symlink name and target exceed DATA_BUFFER_SIZE")]
+    CombinedDataTooLong,
+    #[error("link name is not valid UTF-8")]
+    NameInvalidUtf8,
+    #[error("symlink target is not valid UTF-8")]
+    TargetInvalidUtf8,
 }
 
 /// Malformed ABI v10 single-name DATA request.
@@ -907,6 +992,9 @@ const _: () = assert!(NAME_DATA_MAX <= u16::MAX as usize);
 const _: () = assert!(NAME_DATA_MAX == RENAME_DATA_NAME_MAX);
 const _: () =
     assert!(READDIR_DATA_ENTRY_HEADER_SIZE + NAME_DATA_MAX <= DATA_BUFFER_SIZE);
+const _: () = assert!(8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(NAME_DATA_MAX + SYMLINK_TARGET_MAX <= DATA_BUFFER_SIZE);
+const _: () = assert!(SYMLINK_TARGET_MAX <= u16::MAX as usize);
 
 /// Compile-time layout assertions, mirroring the `_Static_assert`s at
 /// the bottom of `kestrelfs_ipc.h`. Called once from `main()` - Rust

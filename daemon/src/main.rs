@@ -55,6 +55,9 @@ mod meta_persist;
 mod object_store;
 mod ring;
 
+// Keep the storage model's validation limit pinned to the wire contract.
+const _: () = assert!(abi::SYMLINK_TARGET_MAX == fs_model::SYMLINK_TARGET_MAX);
+
 use abi::{AttrFields, KestrelfsEvent};
 use clap::Parser;
 use device::KestrelDevice;
@@ -382,6 +385,8 @@ async fn build_response_with_data(
         abi::OP_MKDIR_DATA => handle_mkdir_data(event, store, data_buffer).await,
         abi::OP_UNLINK_DATA => handle_unlink_data(event, store, data_buffer).await,
         abi::OP_READDIR_DATA => handle_readdir_data(event, store, data_buffer).await,
+        abi::OP_SYMLINK_DATA => handle_symlink_data(event, store, data_buffer).await,
+        abi::OP_READLINK_DATA => handle_readlink_data(event, store, data_buffer).await,
         _ => build_response(event, store, object_store).await,
     }
 }
@@ -541,6 +546,75 @@ async fn handle_create_request(
             KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
+}
+
+async fn handle_symlink_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    // SAFETY: this handler is called with the live mmap bounce buffer while
+    // the kernel holds the data IPC mutex for the synchronous transaction.
+    let req = match unsafe { event.decode_symlink_data_req(data_buffer.cast_const()) } {
+        Ok(req) => req,
+        Err(
+            abi::SymlinkDataDecodeError::NameTooLong(_)
+            | abi::SymlinkDataDecodeError::TargetTooLong(_)
+            | abi::SymlinkDataDecodeError::CombinedDataTooLong,
+        ) => return KestrelfsEvent::error_response(event.req_id, -libc::ENAMETOOLONG),
+        Err(error) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_SYMLINK_DATA req_id={} malformed: {error}",
+                event.req_id
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    let inode_id = match store
+        .symlink(req.parent_inode, &req.name, &req.target)
+        .await
+    {
+        Ok(inode_id) => inode_id,
+        Err(error) => {
+            return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error));
+        }
+    };
+    match store.getattr(inode_id).await {
+        Ok(inode) => KestrelfsEvent::lookup_response(
+            event.req_id,
+            inode_id,
+            inode_to_attr_fields(&inode),
+        ),
+        Err(_) => KestrelfsEvent::error_response(event.req_id, -libc::EIO),
+    }
+}
+
+async fn handle_readlink_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    if event.flags != 0 {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+    let inode_id = u64::from_le_bytes(event.payload[0..8].try_into().unwrap());
+    let target = match store.readlink(inode_id).await {
+        Ok(target) => target,
+        Err(error) => {
+            return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error));
+        }
+    };
+    if target.len() > abi::SYMLINK_TARGET_MAX || target.len() > abi::DATA_BUFFER_SIZE {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+
+    // SAFETY: target is bounded by DATA_BUFFER_SIZE and the mmap remains live
+    // for the complete synchronous request.
+    unsafe { std::ptr::copy_nonoverlapping(target.as_ptr(), data_buffer, target.len()) };
+    let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+    response.payload[0..4].copy_from_slice(&(target.len() as u32).to_le_bytes());
+    response
 }
 
 /// Handles `KESTRELFS_OP_READDIR` requests: lists directory entries.
@@ -905,6 +979,7 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::InvalidName(_) => -libc::ENAMETOOLONG,
         MetaError::AlreadyExists => -libc::EEXIST,
         MetaError::NotEmpty => -libc::ENOTEMPTY,
+        MetaError::NotASymlink => -libc::EINVAL,
         MetaError::Io => -libc::EIO,
     }
 }
@@ -3071,5 +3146,97 @@ mod tests {
         let rename_resp = runtime.block_on(build_response(&rename_req, &store, &object_store));
         assert_eq!(rename_resp.opcode, abi::OP_RESULT_ERROR);
         assert_eq!(rename_resp.error_code, -libc::ENOTEMPTY);
+    }
+
+    #[tokio::test]
+    async fn symlink_data_end_to_end_survives_rename_and_reload() {
+        fn raw_symlink_data_req(
+            req_id: u64,
+            parent: u64,
+            name: &str,
+            target: &str,
+            data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
+        ) -> KestrelfsEvent {
+            let name = name.as_bytes();
+            let target = target.as_bytes();
+            data_buffer[..name.len()].copy_from_slice(name);
+            data_buffer[name.len()..name.len() + target.len()].copy_from_slice(target);
+            let mut request = KestrelfsEvent::zeroed(abi::OP_SYMLINK_DATA, req_id);
+            request.payload[0..8].copy_from_slice(&parent.to_le_bytes());
+            request.payload[8..10].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            request.payload[10..12].copy_from_slice(&(target.len() as u16).to_le_bytes());
+            request
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_path = temp_dir.path().join("meta.json");
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let store: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let name = "long-symbolic-link-name-for-step-14";
+        let renamed = "renamed-symbolic-link-name-for-step-14";
+        let target = "../some/relative/target-with-a-long-name.txt";
+
+        let request = raw_symlink_data_req(
+            900,
+            fs_model::ROOT_INODE,
+            name,
+            target,
+            &mut data_buffer,
+        );
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        let inode = u64::from_le_bytes(response.payload[0..8].try_into().unwrap());
+        assert_eq!(
+            u32::from_le_bytes(response.payload[16..20].try_into().unwrap()) & 0o170000,
+            fs_model::S_IFLNK
+        );
+
+        let mut readlink = KestrelfsEvent::zeroed(abi::OP_READLINK_DATA, 901);
+        readlink.payload[0..8].copy_from_slice(&inode.to_le_bytes());
+        let response = build_response_with_data(
+            &readlink,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        let target_len =
+            u32::from_le_bytes(response.payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&data_buffer[..target_len], target.as_bytes());
+
+        let rename = raw_rename_data_req(
+            902,
+            fs_model::ROOT_INODE,
+            name,
+            fs_model::ROOT_INODE,
+            renamed,
+            &mut data_buffer,
+        );
+        let response = build_response_with_data(
+            &rename,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        drop(store);
+
+        let restored: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path).await.unwrap());
+        assert_eq!(
+            restored.lookup(fs_model::ROOT_INODE, renamed).await.unwrap(),
+            inode
+        );
+        assert_eq!(restored.readlink(inode).await.unwrap(), target);
     }
 }

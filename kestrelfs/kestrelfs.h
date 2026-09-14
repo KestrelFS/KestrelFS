@@ -112,6 +112,7 @@ int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event);
  */
 extern const struct inode_operations kestrelfs_dir_inode_operations;
 extern const struct file_operations kestrelfs_dir_file_operations;
+extern const struct inode_operations kestrelfs_symlink_inode_operations;
 
 /*
  * inode.c: inode cache management.

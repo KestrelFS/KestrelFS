@@ -119,6 +119,12 @@ pub type FileMode = u32;
 pub const S_IFDIR: FileMode = 0o040000;
 /// `S_IFREG` from `<linux/stat.h>` - regular file type bits.
 pub const S_IFREG: FileMode = 0o100000;
+/// `S_IFLNK` from `<linux/stat.h>` - symbolic-link file type bits.
+pub const S_IFLNK: FileMode = 0o120000;
+
+/// Maximum UTF-8 byte length stored for a symbolic-link target. This mirrors
+/// the ABI limit and leaves one byte for the NUL terminator returned to VFS.
+pub const SYMLINK_TARGET_MAX: usize = 4095;
 
 /// `Inode` - basic POSIX metadata for one filesystem object (file or
 /// directory).
@@ -201,9 +207,28 @@ impl Inode {
         }
     }
 
+    /// Builds a symbolic-link inode. The target bytes live in MetaStore, not
+    /// ObjectStore; `size` follows Linux convention and reports target length.
+    pub fn new_symlink(inode_id: u64, target_len: usize, mtime: u64) -> Self {
+        Inode {
+            inode_id,
+            size: target_len as u64,
+            mode: S_IFLNK | 0o777,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            mtime,
+        }
+    }
+
     /// Returns `true` if this inode represents a directory.
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFDIR == S_IFDIR
+    }
+
+    /// Returns `true` if this inode represents a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFLNK == S_IFLNK
     }
 
     /// Returns the [`CHUNK_SIZE`]-indexed chunk number that byte
@@ -324,6 +349,17 @@ mod tests {
         assert!(!file.is_dir());
         assert_eq!(file.mode & S_IFREG, S_IFREG);
         assert_eq!(file.nlink, 1);
+    }
+
+    #[test]
+    fn symlink_inode_reports_link_type_and_target_size() {
+        let link = Inode::new_symlink(43, 37, 1_700_000_000);
+        assert!(link.is_symlink());
+        assert!(!link.is_dir());
+        assert_eq!(link.mode & 0o170000, S_IFLNK);
+        assert_eq!(link.mode & 0o777, 0o777);
+        assert_eq!(link.size, 37);
+        assert_eq!(link.nlink, 1);
     }
 
     #[test]

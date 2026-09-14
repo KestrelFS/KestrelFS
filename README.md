@@ -18,7 +18,7 @@
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
-> ⚠️ **Project status: early development (Phase 3 in progress; ABI v10).**
+> ⚠️ **Project status: early development (Phase 3 in progress; ABI v11).**
 > Phase 1–2 are done. Phase 3 currently provides a working local control plane
 > (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore` +
 > `LocalFsObjectStore`). Redis/S3 backends and Phase 4 NVMe cache are **not**
@@ -129,7 +129,7 @@ phase beyond what's marked "done" below is implemented.**
 |---|---|---|
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
-| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, READ/WRITE via bounce buffer, truncate, local JSON + local-FS persistence (ABI v10 / Steps 1–13). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
+| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, symlink/readlink, READ/WRITE via bounce buffer, truncate, local JSON + local-FS persistence (ABI v11 / Steps 1–14). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
 | **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits DMA back to the VFS caller, bypassing the Rust daemon. | ⏳ Not started |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
@@ -144,7 +144,7 @@ KestrelFS/   # local checkout directory may historically be named FerroFS
 ├── kestrelfs/                 # kernel module (C) — out-of-tree build
 │   ├── Makefile, super.c, inode.c, dir.c, file.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v10)
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v11)
 │   └── chardev_test.c
 └── daemon/                    # Rust control-plane daemon
     └── src/{main,abi,meta,meta_persist,object_store,fs_model,device,ring,ioctl}.rs
@@ -404,11 +404,11 @@ without changing any existing struct's size, alignment, or field offsets.
 
 ### Known Limitations
 
-Current Phase 3 local stack supports create/mkdir/unlink/rmdir/rename,
+Current Phase 3 local stack supports create/mkdir/unlink/rmdir/rename/symlink,
 read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
-255-byte names (ABI v10). Remaining gaps include:
+255-byte names (ABI v11). Remaining gaps include:
 
-- **No symlink / hard link** yet.
+- **No hard link** yet; symlink targets currently require UTF-8 and are capped at 4095 bytes.
 - **unlink does not GC ObjectStore blocks** (orphan objects may remain on disk).
 - **Data/name IPC is globally serialized** by one mutex (correct but limits
   concurrency).

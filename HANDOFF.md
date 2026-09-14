@@ -1,6 +1,7 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 3 Step 13（ABI v10）已由 Cursor 验收并纳入本提交。
+> **最后更新**：Phase 3 Step 14（ABI v11）symlink 已由 Cursor 验收并纳入本提交。
+> **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
 ---
@@ -70,7 +71,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │   ├── Makefile                 # kbuild wrapper: make -C $(KDIR) M=$(PWD) modules
 │   ├── super.c                  # module_init/exit, register_filesystem
 │   ├── inode.c                  # super_operations, kestrelfs_get_inode, fill_super, kill_sb
-│   ├── dir.c                    # inode_operations (lookup/create/mkdir/unlink/rmdir/rename) + readdir
+│   ├── dir.c                    # inode_operations（含 symlink/get_link）+ readdir
 │   ├── file.c                   # file_operations (read/write/setattr) + IPC sync call helper
 │   ├── chardev.c                # /dev/kestrel_ctl: mmap/poll/ioctl
 │   ├── ipc_ring.c               # ring buffer push/pop primitives
@@ -122,10 +123,16 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 11** | **16 KiB bounce buffer 扩大 READ/WRITE 数据面** | **8** | **✅ 已验收** |
 | **Step 12** | **借 bounce buffer 放大 rename 名字** | **9** | **✅ 已验收** |
 | **Step 13** | **统一长名字数据面 + 批量 READDIR** | **10** | **✅ 已验收** |
+| **Step 14** | **符号链接（MetaStore 持有 target，VFS symlink/get_link）** | **11** | **✅ 已验收** |
+
+Cursor 对照代码与测试确认 Step 10–14 已验收（Step 14：124 tests；人类手工可按 §7.8 补跑）。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（所有活跃名字/数据/symlink 路径均使用 bounce buffer）
+
 
 Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests + 人类手工）。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 10`（所有活跃名字路径与文件数据路径均使用 bounce buffer）
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（所有活跃名字/数据/symlink 路径均使用 bounce buffer）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -141,7 +148,7 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 10`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 11`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -154,6 +161,7 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 8. Phase 3 Step 11：ring 后新增 16 KiB data bounce buffer；新增 WRITE_DATA / READ_DATA
 9. Phase 3 Step 12：新增 RENAME_DATA；两个名字依次放入 bounce buffer，单名上限 255 字节
 10. Phase 3 Step 13：新增 LOOKUP/CREATE/MKDIR/UNLINK/READDIR_DATA；单名统一为 255 字节，READDIR 批量打包变长条目
+11. Phase 3 Step 14：新增 SYMLINK_DATA / READLINK_DATA；link name 与 target 通过同一 16 KiB bounce 传输，target 仅存 MetaStore
 
 ### 5.4 已实现 Opcode 列表
 
@@ -178,6 +186,8 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 | 16 | `OP_MKDIR_DATA` | 从 bounce buffer 读取名字并创建目录 | 10 |
 | 17 | `OP_UNLINK_DATA` | 从 bounce buffer 读取名字并删除文件或空目录 | 10 |
 | 18 | `OP_READDIR_DATA` | 通过 bounce buffer 批量返回变长目录条目 | 10 |
+| 19 | `OP_SYMLINK_DATA` | bounce 中依次传输 link name 与 target，创建符号链接 | 11 |
+| 20 | `OP_READLINK_DATA` | daemon 将符号链接 target 返回到 bounce buffer | 11 |
 | 64 | `OP_RESULT_OK` | 响应：成功 | 1 |
 | 65 | `OP_RESULT_ERROR` | 响应：失败（error_code 携带负 errno） | 1 |
 
@@ -212,6 +222,7 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
 | 14 | **create() 忽略 kernel 传入的 mode** | `MemStore::create()` 内部用 `Inode::new_file()` 的默认 mode（`S_IFREG | 0o644`），忽略 kernel 传入的 mode 参数。 | `daemon/src/meta.rs` `create()` |
+| 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -235,7 +246,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（当前 119 个）
+cargo test                    # 单元测试 + 集成测试（当前 124 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -366,6 +377,49 @@ kill "$daemon_pid"
 wait "$daemon_pid" || true
 ```
 
+### 7.8 Step 14 symlink 与持久化重启验证（需 sudo）
+
+以下命令包含固定 data-dir、模块加载、目标跟随、`readlink`、`ls -l` 与 daemon 重启恢复：
+
+```bash
+make -C kestrelfs
+(cd daemon && cargo build --release)
+sudo insmod kestrelfs/kestrelfs.ko
+./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+
+mnt=/mnt/kestrelfs
+target=step14-target.txt
+link=step14-symbolic-link-with-a-long-name
+renamed=step14-renamed-symbolic-link-with-a-long-name
+sudo mkdir -p "$mnt"
+sudo mount -t kestrelfs none "$mnt"
+sudo rm -f "$mnt/$link" "$mnt/$renamed" "$mnt/$target"
+printf 'step14 persistent target\n' | sudo tee "$mnt/$target" >/dev/null
+sudo ln -s "$target" "$mnt/$link"
+test "$(sudo readlink "$mnt/$link")" = "$target"
+sudo ls -l "$mnt/$link"
+test "$(sudo cat "$mnt/$link")" = "step14 persistent target"
+sudo mv "$mnt/$link" "$mnt/$renamed"
+time sudo umount "$mnt"
+
+kill "$daemon_pid"
+wait "$daemon_pid" || true
+./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mount -t kestrelfs none "$mnt"
+test "$(sudo readlink "$mnt/$renamed")" = "$target"
+sudo ls -l "$mnt/$renamed"
+test "$(sudo cat "$mnt/$renamed")" = "step14 persistent target"
+sudo rm "$mnt/$renamed" "$mnt/$target"
+time sudo umount "$mnt"
+kill "$daemon_pid"
+wait "$daemon_pid" || true
+sudo rmmod kestrelfs
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -374,7 +428,7 @@ wait "$daemon_pid" || true
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 14 提示词** | 候选：symlink，或 unlink 时 ObjectStore GC，或 Redis MetaStore 原型 |
+| 1 | **等待 Cursor 的 Step 15 提示词** | 候选：ObjectStore 孤儿 GC，或 RedisMetaStore 原型 |
 | 2 | Redis MetaStore + S3 ObjectStore | 本地 POSIX 子集已较完整后启动 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
@@ -405,13 +459,12 @@ wait "$daemon_pid" || true
 
 ## 10. 交接检查清单
 
-- [x] Step 11–13 + HANDOFF/README 进度已由 Cursor 验收并提交
-- [x] ABI 版本核对无误（内核 = Rust = 10）
-- [x] Step 8–13 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 14 提示词
+- [x] Step 14 symlink 已由 Cursor 验收并提交（ABI v11，124 tests）
+- [x] ABI 版本核对无误（内核 = Rust = 11）
+- [x] Step 8–14 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 15 提示词
 - [x] 已知限制与坑已列出（第 6 节）
-- [x] README 主要进度/SHM/布局债务已在本提交同步；其余细节见第 11 节
-
+- [x] README/HANDOFF 进度已同步
 ---
 
 ## 11. 文档债务

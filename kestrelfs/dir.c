@@ -251,6 +251,125 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/* Create a metadata-only symbolic link via the serialized bounce buffer. */
+static int kestrelfs_inode_symlink(struct mnt_idmap *idmap,
+				   struct inode *dir, struct dentry *dentry,
+				   const char *symname)
+{
+	struct kestrelfs_shared_region *region;
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	struct inode *inode;
+	size_t name_len = dentry->d_name.len;
+	size_t target_len = strnlen(symname, KESTRELFS_SYMLINK_TARGET_MAX + 1);
+	u64 new_ino, size;
+	u32 mode;
+	int ret;
+
+	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
+		return -ENAMETOOLONG;
+	if (target_len == 0)
+		return -ENOENT;
+	if (target_len > KESTRELFS_SYMLINK_TARGET_MAX ||
+	    name_len + target_len > KESTRELFS_DATA_BUFFER_SIZE)
+		return -ENAMETOOLONG;
+
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock_symlink;
+	}
+
+	memcpy(region->data_buffer, dentry->d_name.name, name_len);
+	memcpy(&region->data_buffer[name_len], symname, target_len);
+	req.opcode = KESTRELFS_OP_SYMLINK_DATA;
+	put_unaligned_le64(dir->i_ino, &req.payload[0]);
+	put_unaligned_le16((u16)name_len, &req.payload[8]);
+	put_unaligned_le16((u16)target_len, &req.payload[10]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+
+out_unlock_symlink:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+
+	new_ino = get_unaligned_le64(&resp.payload[0]);
+	size = get_unaligned_le64(&resp.payload[8]);
+	mode = get_unaligned_le32(&resp.payload[16]);
+	inode = kestrelfs_get_inode(dir->i_sb, new_ino, mode, size);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	insert_inode_hash(inode);
+	d_instantiate(dentry, inode);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	return 0;
+}
+
+/*
+ * Resolve the raw target for VFS pathname walking/readlink(2). For RCU walk,
+ * return -ECHILD so VFS retries in reference-walk mode where sleeping IPC and
+ * delayed allocation are permitted.
+ */
+static const char *kestrelfs_get_link(struct dentry *dentry,
+				      struct inode *inode,
+				      struct delayed_call *done)
+{
+	struct kestrelfs_shared_region *region;
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	char *target = NULL;
+	u32 target_len;
+	int ret;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ERR_PTR(ret);
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock_readlink;
+	}
+
+	req.opcode = KESTRELFS_OP_READLINK_DATA;
+	put_unaligned_le64(inode->i_ino, &req.payload[0]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret)
+		goto out_unlock_readlink;
+
+	target_len = get_unaligned_le32(&resp.payload[0]);
+	if (target_len == 0 || target_len > KESTRELFS_SYMLINK_TARGET_MAX ||
+	    target_len > KESTRELFS_DATA_BUFFER_SIZE) {
+		ret = -EPROTO;
+		goto out_unlock_readlink;
+	}
+	target = kmalloc(target_len + 1, GFP_KERNEL);
+	if (!target) {
+		ret = -ENOMEM;
+		goto out_unlock_readlink;
+	}
+	memcpy(target, region->data_buffer, target_len);
+	target[target_len] = '\0';
+
+out_unlock_readlink:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret) {
+		kfree(target);
+		return ERR_PTR(ret);
+	}
+	set_delayed_call(done, kfree_link, target);
+	return target;
+}
+
+const struct inode_operations kestrelfs_symlink_inode_operations = {
+	.get_link	= kestrelfs_get_link,
+};
+
 /*
  * kestrelfs_inode_mkdir - VFS ->mkdir() for directories.
  *
@@ -457,6 +576,7 @@ out_unlock:
 const struct inode_operations kestrelfs_dir_inode_operations = {
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
+	.symlink	= kestrelfs_inode_symlink,
 	.mkdir		= kestrelfs_inode_mkdir,
 	.unlink		= kestrelfs_inode_unlink,
 	.rmdir		= kestrelfs_inode_rmdir,

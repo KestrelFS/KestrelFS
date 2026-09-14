@@ -141,6 +141,8 @@
 #define KESTRELFS_OP_MKDIR_DATA		16	/* req: mkdir name in data_buffer */
 #define KESTRELFS_OP_UNLINK_DATA	17	/* req: unlink name in data_buffer */
 #define KESTRELFS_OP_READDIR_DATA	18	/* req: batched readdir via data_buffer */
+#define KESTRELFS_OP_SYMLINK_DATA	19	/* req: create symlink via data_buffer */
+#define KESTRELFS_OP_READLINK_DATA	20	/* req: read symlink target via data_buffer */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -562,6 +564,26 @@
  */
 #define KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE	10
 
+/*
+ * ABI v11 symbolic-link layouts
+ * -----------------------------
+ * SYMLINK_DATA request payload:
+ *   offset 0,  8 bytes, little-endian u64: parent inode id.
+ *   offset 8,  2 bytes, little-endian u16: link name length.
+ *   offset 10, 2 bytes, little-endian u16: target length.
+ *   offset 12..32: reserved, must be zero.
+ * data_buffer contains name immediately followed by target, neither NUL-
+ * terminated. The name is limited to POSIX NAME_MAX; the UTF-8 target is
+ * limited to 4095 bytes. RESULT_OK uses the normal LOOKUP response layout.
+ *
+ * READLINK_DATA request payload:
+ *   offset 0, 8 bytes, little-endian u64: symbolic-link inode id.
+ *   offset 8..32: reserved, must be zero.
+ * On RESULT_OK, payload offset 0 holds a little-endian u32 target length and
+ * data_buffer holds exactly that many non-NUL-terminated target bytes.
+ */
+#define KESTRELFS_SYMLINK_TARGET_MAX	4095
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -711,8 +733,12 @@ struct kestrelfs_ring_ctrl {
  *  10 - Phase 3 step 13: Added LOOKUP_DATA, CREATE_DATA, MKDIR_DATA,
  *       UNLINK_DATA, and batched READDIR_DATA (opcodes 14..18). All active
  *       VFS name paths now support 255-byte names through the bounce buffer.
+ *
+ *  11 - Phase 3 step 14: Added SYMLINK_DATA and READLINK_DATA (opcodes
+ *       19..20). Link names and targets use the existing serialized bounce
+ *       buffer; symlink targets remain metadata rather than object data.
  */
-#define KESTRELFS_ABI_VERSION		10
+#define KESTRELFS_ABI_VERSION		11
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -835,6 +861,16 @@ _Static_assert(KESTRELFS_NAME_DATA_MAX == KESTRELFS_RENAME_DATA_NAME_MAX,
 _Static_assert(KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE +
 		KESTRELFS_NAME_DATA_MAX <= KESTRELFS_DATA_BUFFER_SIZE,
 		"one maximum-length READDIR_DATA entry must fit in data_buffer");
+
+_Static_assert(8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"SYMLINK_DATA request fields overflow the event payload");
+
+_Static_assert(KESTRELFS_NAME_DATA_MAX + KESTRELFS_SYMLINK_TARGET_MAX <=
+		KESTRELFS_DATA_BUFFER_SIZE,
+		"maximum symlink name and target must fit in data_buffer");
+
+_Static_assert(KESTRELFS_SYMLINK_TARGET_MAX <= (__u16)-1,
+		"symlink target maximum must fit in its u16 length field");
 
 /*
  * KESTRELFS_OP_LOOKUP request payload: 8 bytes (parent_inode) + 1

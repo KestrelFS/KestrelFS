@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::fs_model::{Inode, Slice, ROOT_INODE};
+use crate::fs_model::{Inode, Slice, ROOT_INODE, SYMLINK_TARGET_MAX};
 
 /// Errors a [`MetaStore`] implementation can report.
 ///
@@ -85,6 +85,9 @@ pub enum MetaError {
     /// `unlink()` was called on a non-empty directory.
     #[error("directory not empty")]
     NotEmpty,
+    /// `readlink()` was called for an inode whose type is not `S_IFLNK`.
+    #[error("inode is not a symbolic link")]
+    NotASymlink,
     /// I/O error during persistence operations (FileMetaStore).
     #[error("I/O error")]
     Io,
@@ -177,6 +180,13 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::AlreadyExists`] if `parent` already has a child named `name`.
     /// - [`MetaError::InvalidName`] if `name` is empty, contains '/', or is too long.
     async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64>;
+
+    /// Creates a symbolic link. The target is metadata and is never written to
+    /// ObjectStore. Dangling and relative targets are both valid.
+    async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64>;
+
+    /// Returns a symbolic link's target string without resolving it.
+    async fn readlink(&self, inode: u64) -> Result<String>;
 
     /// Appends a new [`Slice`] to the given inode's slice list for the
     /// specified chunk. Does not remove or modify existing slices (COW).
@@ -321,6 +331,8 @@ pub(crate) struct MemStoreInner {
     /// real KV store (Redis key `slices:{inode}:{chunk_idx}`) would
     /// naturally have too.
     pub(crate) slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
+    /// Symbolic-link inode id -> uninterpreted UTF-8 target string.
+    pub(crate) symlink_targets: HashMap<u64, String>,
 }
 
 /// Fixed inode id for the bootstrap `remote.txt` entry seeded by
@@ -412,6 +424,7 @@ impl MemStore {
                 inodes,
                 dir_entries,
                 slices,
+                symlink_targets: HashMap::new(),
             }),
             next_inode_id: AtomicU64::new(WRITABLE_DAT_INODE + 1),
         }
@@ -563,6 +576,65 @@ impl MetaStore for MemStore {
             .insert(name.to_string(), new_inode_id);
 
         Ok(new_inode_id)
+    }
+
+    async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid name: {name}")));
+        }
+        if name.len() > 255 {
+            return Err(MetaError::InvalidName(format!(
+                "name too long: {}",
+                name.len()
+            )));
+        }
+        if target.is_empty() || target.len() > SYMLINK_TARGET_MAX {
+            return Err(MetaError::InvalidName(format!(
+                "invalid symlink target length: {}",
+                target.len()
+            )));
+        }
+
+        let mut inner = self.inner.write().await;
+        let parent_inode = inner.inodes.get(&parent).ok_or(MetaError::NotFound)?;
+        if !parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+        if inner
+            .dir_entries
+            .get(&parent)
+            .is_some_and(|entries| entries.contains_key(name))
+        {
+            return Err(MetaError::AlreadyExists);
+        }
+
+        let new_inode_id = self.allocate_inode_id();
+        inner.inodes.insert(
+            new_inode_id,
+            Inode::new_symlink(new_inode_id, target.len(), current_unix_time()),
+        );
+        inner
+            .dir_entries
+            .entry(parent)
+            .or_insert_with(HashMap::new)
+            .insert(name.to_string(), new_inode_id);
+        inner
+            .symlink_targets
+            .insert(new_inode_id, target.to_string());
+        Ok(new_inode_id)
+    }
+
+    async fn readlink(&self, inode: u64) -> Result<String> {
+        let inner = self.inner.read().await;
+        let inode_meta = inner.inodes.get(&inode).ok_or(MetaError::NotFound)?;
+        if !inode_meta.is_symlink() {
+            return Err(MetaError::NotASymlink);
+        }
+        inner
+            .symlink_targets
+            .get(&inode)
+            .cloned()
+            .ok_or(MetaError::Io)
     }
 
     async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()> {
@@ -736,6 +808,7 @@ impl MetaStore for MemStore {
 
         // Remove any slices associated with this inode (for files)
         inner.slices.remove(&child_inode_id);
+        inner.symlink_targets.remove(&child_inode_id);
 
         Ok(())
     }
@@ -834,6 +907,7 @@ impl MetaStore for MemStore {
                 // Replace regular file: remove old target
                 inner.inodes.remove(&target_inode_id);
                 inner.slices.remove(&target_inode_id);
+                inner.symlink_targets.remove(&target_inode_id);
             }
         }
 
@@ -871,7 +945,39 @@ impl MetaStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::S_IFREG;
+    use crate::fs_model::{S_IFLNK, S_IFREG};
+
+    #[tokio::test]
+    async fn symlink_lookup_readlink_rename_and_unlink() {
+        let store = MemStore::new();
+        let target = "../target-directory/a-file.txt";
+        let inode = store
+            .symlink(ROOT_INODE, "metadata-link", target)
+            .await
+            .unwrap();
+        assert_eq!(store.lookup(ROOT_INODE, "metadata-link").await.unwrap(), inode);
+        let attrs = store.getattr(inode).await.unwrap();
+        assert_eq!(attrs.mode & 0o170000, S_IFLNK);
+        assert_eq!(attrs.size, target.len() as u64);
+        assert_eq!(store.readlink(inode).await.unwrap(), target);
+
+        store
+            .rename(ROOT_INODE, "metadata-link", ROOT_INODE, "renamed-link")
+            .await
+            .unwrap();
+        assert_eq!(store.readlink(inode).await.unwrap(), target);
+        store.unlink(ROOT_INODE, "renamed-link").await.unwrap();
+        assert!(matches!(store.readlink(inode).await, Err(MetaError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn readlink_rejects_regular_file() {
+        let store = MemStore::new();
+        assert!(matches!(
+            store.readlink(REMOTE_TXT_INODE).await,
+            Err(MetaError::NotASymlink)
+        ));
+    }
 
     #[tokio::test]
     async fn getattr_root_returns_directory() {
@@ -1461,4 +1567,3 @@ mod tests {
         assert!(matches!(err, MetaError::NotFound));
     }
 }
-

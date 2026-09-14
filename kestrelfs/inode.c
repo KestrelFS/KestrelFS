@@ -139,6 +139,10 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		inode->i_op = &kestrelfs_dir_inode_operations;
 		inode->i_fop = &kestrelfs_dir_file_operations;
 		set_nlink(inode, 2);
+	} else if (S_ISLNK(mode)) {
+		/* Target bytes are fetched from MetaStore through ->get_link(). */
+		inode->i_op = &kestrelfs_symlink_inode_operations;
+		set_nlink(inode, 1);
 	} else if (S_ISREG(mode)) {
 		/* Regular file - no custom a_ops (avoid dirty_folio without writeback) */
 		inode->i_op = &kestrelfs_reg_inode_ops;

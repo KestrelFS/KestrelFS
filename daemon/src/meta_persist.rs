@@ -9,6 +9,7 @@
 //! - All inodes (HashMap<u64, Inode>)
 //! - All directory entries (HashMap<u64, HashMap<String, u64>>)
 //! - All slices (HashMap<u64, HashMap<u32, Vec<Slice>>>)
+//! - All symbolic-link targets (HashMap<u64, String>)
 //!
 //! # Atomicity
 //!
@@ -54,6 +55,9 @@ pub(crate) struct MetaSnapshot {
     inodes: HashMap<u64, Inode>,
     dir_entries: HashMap<u64, HashMap<String, u64>>,
     slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
+    /// Default keeps ABI-v10-era snapshots loadable after symlink support lands.
+    #[serde(default)]
+    symlink_targets: HashMap<u64, String>,
     next_inode_id: u64,
 }
 
@@ -144,6 +148,16 @@ impl MetaStore for FileMetaStore {
         Ok(inode_id)
     }
 
+    async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64> {
+        let inode_id = self.mem.symlink(parent, name, target).await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
+        Ok(inode_id)
+    }
+
+    async fn readlink(&self, inode: u64) -> Result<String> {
+        self.mem.readlink(inode).await
+    }
+
     async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()> {
         self.mem.append_slice(inode, slice).await?;
         self.sync_to_disk()
@@ -203,6 +217,7 @@ impl MemStore {
             inodes: inner.inodes.clone(),
             dir_entries: inner.dir_entries.clone(),
             slices: inner.slices.clone(),
+            symlink_targets: inner.symlink_targets.clone(),
             next_inode_id: self.next_inode_id.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -217,6 +232,7 @@ impl MemStore {
                 inodes: snapshot.inodes,
                 dir_entries: snapshot.dir_entries,
                 slices: snapshot.slices,
+                symlink_targets: snapshot.symlink_targets,
             }),
             next_inode_id: AtomicU64::new(snapshot.next_inode_id),
         }
@@ -226,7 +242,7 @@ impl MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{ROOT_INODE, S_IFREG};
+    use crate::fs_model::{ROOT_INODE, S_IFLNK, S_IFREG};
     use crate::meta::{REMOTE_TXT_INODE, WRITABLE_DAT_INODE};
     use tempfile::TempDir;
 
@@ -313,6 +329,41 @@ mod tests {
         let found = store2.lookup(ROOT_INODE, "truncate.txt").await.unwrap();
         let inode = store2.getattr(found).await.unwrap();
         assert_eq!(inode.size, 1024);
+    }
+
+    #[tokio::test]
+    async fn symlink_and_renamed_path_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let target = "../persistent-target.txt";
+        let inode;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            inode = store
+                .symlink(ROOT_INODE, "persistent-link", target)
+                .await
+                .unwrap();
+            store
+                .rename(
+                    ROOT_INODE,
+                    "persistent-link",
+                    ROOT_INODE,
+                    "persistent-renamed-link",
+                )
+                .await
+                .unwrap();
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        let found = restored
+            .lookup(ROOT_INODE, "persistent-renamed-link")
+            .await
+            .unwrap();
+        assert_eq!(found, inode);
+        assert_eq!(restored.readlink(found).await.unwrap(), target);
+        let attrs = restored.getattr(found).await.unwrap();
+        assert_eq!(attrs.mode & 0o170000, S_IFLNK);
+        assert_eq!(attrs.size, target.len() as u64);
     }
 
     #[tokio::test]
