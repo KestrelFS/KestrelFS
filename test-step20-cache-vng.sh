@@ -1,18 +1,22 @@
 #!/bin/bash
-# Phase 4 Step 20 persistent cache hit/fill/invalidation test for virtme-ng.
+# Phase 4 Step 20/21 persistent cache and namespace test for virtme-ng.
 set -euo pipefail
 
 image=/tmp/kestrel-step20-cache.img
 mnt=/tmp/mnt-kestrelfs
-data_dir=/tmp/kestrelfs-debug
+data_dir=/tmp/kestrelfs-step20-$$
 expected=/tmp/kestrel-step20.expected
 actual=/tmp/kestrel-step20.actual
 loopdev=
 daemon_pid=
+namespace_a=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
+	"$data_dir" "$data_dir" | sha256sum | awk '{print $1}')
+namespace_b=$(printf 'v1;meta=file:%s-other/meta.json;objects=local:%s-other' \
+	"$data_dir" "$data_dir" | sha256sum | awk '{print $1}')
 
 start_daemon() {
 	./daemon/target/release/kestrelfs-daemon \
-		--data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+		--data-dir "$data_dir" >"$data_dir/daemon.log" 2>&1 &
 	daemon_pid=$!
 	sleep 1
 	kill -0 "$daemon_pid"
@@ -61,7 +65,8 @@ test -b "$loopdev"
 echo "STEP20_CACHE: loop_device=$loopdev"
 
 dmesg -c >/dev/null || true
-insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64
+insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_a"
 start_daemon
 busybox mount -t kestrelfs none "$mnt"
 
@@ -83,8 +88,22 @@ test "$umount_ms" -lt 1000
 stop_daemon
 rmmod kestrelfs
 
+# A cache populated for namespace A must fail closed before index restore when
+# the same device is presented as namespace B.
 dmesg -c >/dev/null || true
-insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64
+if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_b"; then
+	echo "STEP21_FAIL: namespace B accepted namespace A cache"
+	exit 1
+fi
+test ! -d /sys/module/kestrelfs
+dmesg >/tmp/kestrel-step21-dmesg
+grep -F 'cache namespace identity mismatch' /tmp/kestrel-step21-dmesg
+echo "STEP21_CACHE: mismatched namespace rejected"
+
+dmesg -c >/dev/null || true
+insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_a"
 start_daemon
 busybox mount -t kestrelfs none "$mnt"
 exec 3<"$mnt/persist.dat"
@@ -151,4 +170,5 @@ loopdev=
 trap - EXIT
 rm -f "$image" "$expected" "$actual"
 echo "STEP20_CACHE: umount_ms=$umount_ms"
+echo "STEP21_NAMESPACE_PASS"
 echo "STEP20_CACHE_PASS"

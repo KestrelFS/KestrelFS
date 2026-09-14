@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4 Step 21（cache namespace identity）实现完成，等待 Cursor 验收；尚未 commit（IPC ABI 仍为 v11，cache format bump 到 v2）。
+> **最后更新**：Phase 4 Step 21（cache namespace identity，format v2）已由 Cursor 验收并纳入本提交（IPC ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 4 Step 21 待 Cursor 验收（v2 superblock 绑定 namespace SHA-256 identity） |
+| 当前阶段 | Phase 4 Step 21 已验收（v2 namespace identity）；DMA/eviction 尚未开始 |
 
 ---
 
@@ -137,7 +137,10 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 18** | **内核拥有的 NVMe 缓存骨架：块设备参数 + 恒 miss read hook** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 19** | **独占 claim 块设备 + v1 cache superblock + 内存/盘上索引骨架** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 20** | **持久化索引恢复 + READ_DATA fill + 同步 BIO hit + mutation 失效** | **11（未变）** | **✅ 已验收** |
-| **Phase 4 Step 21** | **cache namespace identity：v2 superblock + 64-hex 模块参数 + mismatch fail-closed** | **11（未变）** | **🚧 待 Cursor 验收** |
+| **Phase 4 Step 21** | **cache namespace identity：v2 superblock + 64-hex 模块参数 + mismatch fail-closed** | **11（未变）** | **✅ 已验收** |
+
+Cursor 对照代码、137 tests、`STEP21_NAMESPACE_PASS` 及 Step 20/19/15 vng 回归确认 Step 21 已验收。
+cache format = **v2**；IPC ABI = **v11**。测试仅在 vng+loop；daemon 使用独立 `data_dir` + `"$data_dir/daemon.log"`。
 
 Cursor 对照代码、137 tests、`STEP20_CACHE_PASS` 及 Step 19/15 vng 回归确认 Step 20 已验收。
 **测试约束**：cache/mount 验证只在 vng guest + loop；禁止 Codex 触碰物理机 zvol。
@@ -694,11 +697,11 @@ insmod kestrelfs/kestrelfs.ko cache_device=/dev/loop0 cache_size_mib=64 \
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 验收 Step 21 / 下发下一步** | namespace identity 已实现；不自行扩大到 DMA/eviction |
-| 2 | Phase 4 后续：生产化缓存 | checksum/journal、多节点失效通知 |
+| 1 | **等待 Cursor 的 Step 22 提示词** | 候选：DMA/零拷贝 hit、eviction、checksum/journal |
+| 2 | Phase 4 后续：生产化缓存 | 多节点失效通知等 |
 | 3 | 分布式后端生产化 | Redis 拆 key、GC 重试等（须 Cursor 明示） |
 
-> **⚠️ 明确**：在 Cursor 验收及新提示词下达前，不继续扩大 Phase 4 hit/DMA，也不自行改做分布式生产化。
+> **⚠️ 明确**：在 Cursor 新提示词下达前，不继续扩大 Phase 4 hit/DMA，也不自行改做分布式生产化。
 
 ### Codex 自动验证与权限（无交互密码）
 
@@ -744,17 +747,13 @@ mkdir -p "$data_dir"
 7. **内核编码**：不能有编译警告（`-Werror` 级别要求）。`make -C kestrelfs` 输出必须零 warning。
 8. **Rust 编码**：`cargo clippy --all-targets -- -D warnings` 必须通过。
 9. **vng 站立规则**：凡改动 `kestrelfs/*.c` 或依赖 mount 的行为，必须用 `vng --exec`（当前环境加 `--run`）或演进后的仓库脚本完成自动验证；人类 sudo 只作补充。
+10. **daemon 启动**：`--data-dir` 由用例自选；日志重定向到 `"$data_dir/daemon.log"`（或等价日志文件），禁止 `>/dev/null` 丢弃输出。
 
----
-
-## 10. 交接检查清单
-
-- [x] Step 20 持久化索引 + fill/hit/失效已由 Cursor 验收并提交
-- [ ] Step 21 cache namespace identity 已实现，等待 Cursor 验收且未 commit
-- [x] ABI 版本核对无误（内核 = Rust = 11；cache format v2）
-- [x] Step 8–19 + Phase 4 Step 20 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 验收 Step 21 / 下发下一步
-- [x] 测试约束：cache/mount 只在 vng+loop，禁止触碰物理机 zvol（见 §8）
+- [x] Step 21 cache namespace identity 已由 Cursor 验收并提交（format v2）
+- [x] IPC ABI = 11；cache format = v2
+- [x] Step 8–20 + Phase 4 Step 21 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 22 提示词
+- [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 
 ---
 

@@ -5,9 +5,11 @@ set -euo pipefail
 image=/tmp/kestrel-cache.img
 regular=/tmp/kestrel-cache.regular
 mnt=/tmp/mnt-kestrelfs
-data_dir=/tmp/kestrelfs-debug
+data_dir=/tmp/kestrelfs-step19-$$
 loopdev=
 daemon_pid=
+namespace_id=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
+	"$data_dir" "$data_dir" | sha256sum | awk '{print $1}')
 
 cleanup() {
 	set +e
@@ -29,7 +31,8 @@ rm -f "$image" "$regular"
 mkdir -p "$data_dir" "$mnt"
 : >"$regular"
 
-if insmod kestrelfs/kestrelfs.ko cache_device="$regular"; then
+if insmod kestrelfs/kestrelfs.ko cache_device="$regular" \
+	cache_namespace="$namespace_id"; then
 	echo "STEP19_FAIL: regular file was accepted as cache_device"
 	exit 1
 fi
@@ -46,12 +49,21 @@ loopdev=$(losetup -fP --show "$image")
 test -b "$loopdev"
 echo "STEP19_CACHE: loop_device=$loopdev"
 
+if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64; then
+	echo "STEP21_FAIL: cache_device accepted without cache_namespace"
+	exit 1
+fi
+test ! -d /sys/module/kestrelfs
+echo "STEP21_CACHE: missing namespace rejected"
+
 dmesg -c >/dev/null || true
-insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64
+insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_id"
 dmesg >/tmp/step19-dmesg
 grep -F "formatted cache device=$loopdev" /tmp/step19-dmesg
 
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+	>"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 1
 busybox mount -t kestrelfs none "$mnt"
@@ -71,7 +83,8 @@ test -n "$first_hash"
 echo "STEP19_CACHE: format_mount_umount_ms=$umount_ms"
 
 dmesg -c >/dev/null || true
-insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64
+insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_id"
 dmesg >/tmp/step19-dmesg
 grep -F "reusing cache device=$loopdev" /tmp/step19-dmesg
 second_hash=$(dd if="$loopdev" bs=4096 count=1 status=none | sha256sum | awk '{print $1}')
@@ -81,7 +94,8 @@ echo "STEP19_CACHE: hash stable"
 rmmod kestrelfs
 echo "STEP19_CACHE: existing superblock reused"
 
-if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=32; then
+if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=32 \
+	cache_namespace="$namespace_id"; then
 	echo "STEP19_FAIL: mismatched geometry was accepted"
 	exit 1
 fi
@@ -89,7 +103,8 @@ test ! -d /sys/module/kestrelfs
 echo "STEP19_CACHE: mismatched geometry rejected"
 
 printf 'BADMAGIC' | dd of="$loopdev" bs=1 conv=notrunc status=none
-if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64; then
+if insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
+	cache_namespace="$namespace_id"; then
 	echo "STEP19_FAIL: corrupt superblock was accepted"
 	exit 1
 fi
@@ -99,7 +114,8 @@ echo "STEP19_CACHE: corrupt superblock rejected"
 dd if=/dev/zero of="$loopdev" bs=1M count=2 conv=notrunc \
 	oflag=direct,dsync status=none
 dmesg -c >/dev/null || true
-insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=0
+insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=0 \
+	cache_namespace="$namespace_id"
 dmesg >/tmp/step19-dmesg
 grep -F "cache geometry bytes=134217728" /tmp/step19-dmesg
 rmmod kestrelfs

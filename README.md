@@ -18,14 +18,15 @@
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
-> ⚠️ **Project status: early development (Phase 4 Step 20; ABI v11).**
+> ⚠️ **Project status: early development (Phase 4 Step 21; ABI v11).**
 > Phase 1–3 are done. Phase 3 provides a working control-plane prototype
 > (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore`, an
 > optional Redis metadata prototype, `LocalFsObjectStore`, and an optional
 > S3/MinIO object prototype). Phase 4 now persists/restores a 4 KiB block index,
 > fills successful READ_DATA misses, serves synchronous kernel BIO cache hits,
-> and invalidates rewrite/truncate/unlink/rename-overwrite mutations. Full DMA,
-> eviction, checksums, and multi-node invalidation are not implemented. See
+> invalidates rewrite/truncate/unlink/rename-overwrite mutations, and binds the
+> cache format to an explicit namespace SHA-256 identity. Full DMA, eviction,
+> checksums, and multi-node invalidation are not implemented. See
 > [Roadmap](#roadmap) and `HANDOFF.md`.
 
 ---
@@ -101,7 +102,8 @@ a language and privilege boundary:
 - Registers a VFS filesystem type and implements the inode/dentry/file
   operations needed to mount and serve files.
 - Owns the local NVMe SSD cache boundary. Step 20 restores/persists its fixed
-  block index, fills READ_DATA misses, and serves synchronous non-DMA hits — see
+  block index, fills READ_DATA misses, serves synchronous non-DMA hits, and
+  rejects namespace identity mismatches — see
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md).
 - Talks to the Rust daemon only when necessary (cache miss, metadata
   lookup) via a lock-free shared-memory IPC bridge.
@@ -135,7 +137,7 @@ phase beyond what's marked "done" below is implemented.**
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
 | **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic VFS operations, bounce-buffer I/O, symlink, truncate, GC, local persistence, optional RedisMetaStore and S3ObjectStore prototypes (ABI v11 / Steps 1–17). | ✅ Prototype complete |
-| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 20 — persistent index + fill/hit/invalidation prototype |
+| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 21 — v2 namespace-bound persistent cache prototype |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
 

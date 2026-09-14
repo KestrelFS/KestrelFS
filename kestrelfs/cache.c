@@ -2,7 +2,7 @@
 /*
  * cache.c - Kernel-owned persistent block cache for KestrelFS.
  *
- * Step 20 stores fixed 4 KiB cache blocks behind a persistent 32-byte index.
+ * Step 21 binds Step 20's persistent 4 KiB cache to one metadata namespace.
  * Cache failures never replace the authoritative daemon/ObjectStore path.
  */
 
@@ -14,6 +14,7 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
+#include <linux/hex.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -25,9 +26,12 @@
 #include "kestrelfs.h"
 
 #define KESTRELFS_CACHE_MAGIC		0x454843414353464bULL /* "KFSCACHE" LE */
-#define KESTRELFS_CACHE_FORMAT_VERSION	1U
+#define KESTRELFS_CACHE_FORMAT_VERSION	2U
 #define KESTRELFS_CACHE_SUPERBLOCK_SIZE	4096U
 #define KESTRELFS_CACHE_BLOCK_SIZE	4096U
+#define KESTRELFS_CACHE_NAMESPACE_SIZE	32U
+#define KESTRELFS_CACHE_NAMESPACE_HEX_LEN \
+	(2U * KESTRELFS_CACHE_NAMESPACE_SIZE)
 #define KESTRELFS_CACHE_METADATA_BYTES	(2ULL * 1024 * 1024)
 #define KESTRELFS_CACHE_MIN_BYTES	\
 	(KESTRELFS_CACHE_METADATA_BYTES + KESTRELFS_CACHE_BLOCK_SIZE)
@@ -54,12 +58,15 @@ struct kestrelfs_cache_disk_superblock {
 	__le64 index_capacity;
 	__le64 data_start_lba;
 	__le64 format_generation;
-	u8 reserved[KESTRELFS_CACHE_SUPERBLOCK_SIZE - 72];
+	u8 namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
+	u8 reserved[KESTRELFS_CACHE_SUPERBLOCK_SIZE - 104];
 };
 
 static_assert(sizeof(struct kestrelfs_cache_disk_index_entry) == 32);
 static_assert(sizeof(struct kestrelfs_cache_disk_superblock) ==
 	      KESTRELFS_CACHE_SUPERBLOCK_SIZE);
+static_assert(offsetof(struct kestrelfs_cache_disk_superblock, namespace_id) ==
+	      72);
 static_assert(KESTRELFS_CACHE_SUPERBLOCK_SIZE <= PAGE_SIZE);
 
 struct kestrelfs_cache_index_key {
@@ -94,6 +101,11 @@ module_param(cache_size_mib, ulong, 0444);
 MODULE_PARM_DESC(cache_size_mib,
 		 "cache capacity in MiB (0 uses the whole block device)");
 
+static char *cache_namespace;
+module_param(cache_namespace, charp, 0444);
+MODULE_PARM_DESC(cache_namespace,
+		 "SHA-256 metadata namespace identity as exactly 64 hex digits");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
@@ -108,6 +120,27 @@ static u64 kestrelfs_cache_entry_generation;
 static u32 kestrelfs_cache_slot_count;
 static u32 kestrelfs_cache_logical_size;
 static u32 kestrelfs_cache_physical_size;
+static u8 kestrelfs_cache_namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
+
+static int kestrelfs_cache_parse_namespace(void)
+{
+	int ret;
+
+	if (!cache_namespace ||
+	    strlen(cache_namespace) != KESTRELFS_CACHE_NAMESPACE_HEX_LEN) {
+		pr_err("kestrelfs: cache_namespace must be exactly 64 hex digits\n");
+		return -EINVAL;
+	}
+
+	ret = hex2bin(kestrelfs_cache_namespace_id, cache_namespace,
+		      KESTRELFS_CACHE_NAMESPACE_SIZE);
+	if (ret) {
+		pr_err("kestrelfs: cache_namespace contains non-hex characters\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
 
 static u64 kestrelfs_cache_index_capacity(void)
 {
@@ -335,6 +368,8 @@ static int kestrelfs_cache_load_or_format(void)
 		super->data_start_lba = cpu_to_le64(
 			KESTRELFS_CACHE_METADATA_BYTES >> SECTOR_SHIFT);
 		super->format_generation = cpu_to_le64(generation);
+		memcpy(super->namespace_id, kestrelfs_cache_namespace_id,
+		       sizeof(super->namespace_id));
 
 		ret = kestrelfs_cache_rw_block(super, 0, true);
 		if (ret)
@@ -343,6 +378,11 @@ static int kestrelfs_cache_load_or_format(void)
 			cache_device, (unsigned long long)generation);
 	} else if (!kestrelfs_cache_superblock_matches(super)) {
 		pr_err("kestrelfs: cache superblock format or geometry mismatch\n");
+		ret = -EINVAL;
+		goto out;
+	} else if (memcmp(super->namespace_id, kestrelfs_cache_namespace_id,
+			  sizeof(super->namespace_id))) {
+		pr_err("kestrelfs: cache namespace identity mismatch\n");
 		ret = -EINVAL;
 		goto out;
 	} else {
@@ -752,6 +792,9 @@ int kestrelfs_cache_init(void)
 		pr_info("kestrelfs: NVMe cache disabled (no cache_device)\n");
 		return 0;
 	}
+	ret = kestrelfs_cache_parse_namespace();
+	if (ret)
+		return ret;
 
 	kestrelfs_cache_file = bdev_file_open_by_path(cache_device, mode,
 						      &kestrelfs_cache_holder,

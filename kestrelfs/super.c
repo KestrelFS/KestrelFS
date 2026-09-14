@@ -84,4 +84,4 @@ module_exit(kestrelfs_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KestrelFS Project");
 MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and persistent block cache");
-MODULE_VERSION("0.4.0-step20");
+MODULE_VERSION("0.4.0-step21");
