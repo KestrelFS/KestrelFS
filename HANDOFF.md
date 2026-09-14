@@ -811,8 +811,8 @@ mkdir -p "$data_dir"
 
 ## 9. Codex 工作方式
 
-1. **每次新会话第一步**：读本 `HANDOFF.md` + `git log --oneline -20` + 相关源码文件。不要假设有任何前序对话上下文。
-2. **只实现提示词范围**：提示词外的问题先问 Cursor 或跳过，不要自行扩大范围。
+1. **每次新会话第一步**：读本 `HANDOFF.md` + `docs/remaining-capabilities.md`（尤其 §8 当前提示词）+ `git log --oneline -20` + 相关源码。不要假设有任何前序对话上下文。
+2. **只实现 §8 提示词范围**：提示词外的问题先问 Cursor 或跳过，不要自行扩大范围。完成后把汇报追加到 remaining-capabilities §9，状态改为 `REVIEW`。
 3. **完成后用中文汇报**：
    - 改动摘要（改了哪些文件、做了什么）
    - 测试输出（`cargo test` 结果、`cargo clippy` 结果、`make` 结果）
