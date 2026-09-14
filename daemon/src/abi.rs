@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 9;
+pub const ABI_VERSION: u32 = 10;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -101,6 +101,16 @@ pub const OP_WRITE_DATA: u32 = 11;
 pub const OP_READ_DATA: u32 = 12;
 /// Request: rename/move using names in the shared data bounce buffer.
 pub const OP_RENAME_DATA: u32 = 13;
+/// Request: lookup a bounce-buffer name.
+pub const OP_LOOKUP_DATA: u32 = 14;
+/// Request: create a file whose name is in the bounce buffer.
+pub const OP_CREATE_DATA: u32 = 15;
+/// Request: create a directory whose name is in the bounce buffer.
+pub const OP_MKDIR_DATA: u32 = 16;
+/// Request: unlink a bounce-buffer name.
+pub const OP_UNLINK_DATA: u32 = 17;
+/// Request: return batched directory entries through the bounce buffer.
+pub const OP_READDIR_DATA: u32 = 18;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -378,6 +388,49 @@ impl KestrelfsEvent {
         })
     }
 
+    /// Decodes the common ABI v10 single-name DATA request.
+    ///
+    /// # Safety
+    ///
+    /// `data_buffer` must point to a live [`DATA_BUFFER_SIZE`]-byte bounce
+    /// buffer exclusively owned by this request until decoding completes.
+    pub unsafe fn decode_name_data_req(
+        &self,
+        data_buffer: *const u8,
+    ) -> Result<NameDataReq, NameDataDecodeError> {
+        if self.flags != 0 {
+            return Err(NameDataDecodeError::UnsupportedFlags(self.flags));
+        }
+
+        let parent_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let name_len = u16::from_le_bytes(self.payload[8..10].try_into().unwrap());
+        let mode = u32::from_le_bytes(self.payload[12..16].try_into().unwrap());
+        if name_len == 0 {
+            return Err(NameDataDecodeError::EmptyName);
+        }
+        if name_len as usize > NAME_DATA_MAX {
+            return Err(NameDataDecodeError::NameTooLong(name_len));
+        }
+
+        let mut name_bytes = vec![0u8; name_len as usize];
+        // SAFETY: guaranteed by this function's contract; name_len has been
+        // bounded by both NAME_DATA_MAX and the bounce-buffer size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_buffer,
+                name_bytes.as_mut_ptr(),
+                name_len as usize,
+            );
+        }
+        let name = String::from_utf8(name_bytes).map_err(|_| NameDataDecodeError::InvalidUtf8)?;
+
+        Ok(NameDataReq {
+            parent_inode,
+            mode,
+            name,
+        })
+    }
+
     /// Builds a `KESTRELFS_OP_RESULT_OK` response for a
     /// `KESTRELFS_OP_READ_CHUNK` request, with `data` copied into the
     /// leading bytes of the payload and the remainder zero-padded, per
@@ -569,6 +622,14 @@ pub const RENAME_NAME_MAX: usize = 7;
 /// `OP_RENAME_DATA` request to contain up to POSIX `NAME_MAX` bytes.
 pub const RENAME_DATA_NAME_MAX: usize = 255;
 
+/// ABI v10 maximum for LOOKUP_DATA/CREATE_DATA/MKDIR_DATA/UNLINK_DATA names
+/// and READDIR_DATA entry names. Mirrors `KESTRELFS_NAME_DATA_MAX`.
+pub const NAME_DATA_MAX: usize = 255;
+
+/// Bytes preceding each variable-length READDIR_DATA entry name: inode u64
+/// followed by name_len u16.
+pub const READDIR_DATA_ENTRY_HEADER_SIZE: usize = 10;
+
 /// Decoded form of a `KESTRELFS_OP_LOOKUP` request payload. See
 /// [`KestrelfsEvent::decode_lookup_req`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +742,27 @@ pub struct CreateReq {
     pub parent_inode: u64,
     pub mode: u32,
     pub name: String,
+}
+
+/// Decoded common ABI v10 single-name DATA request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameDataReq {
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub name: String,
+}
+
+/// Malformed ABI v10 single-name DATA request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NameDataDecodeError {
+    #[error("request flags {0:#x} are unsupported")]
+    UnsupportedFlags(u32),
+    #[error("name must not be empty")]
+    EmptyName,
+    #[error("name_len {0} exceeds NAME_DATA_MAX ({NAME_DATA_MAX})")]
+    NameTooLong(u16),
+    #[error("name is not valid UTF-8")]
+    InvalidUtf8,
 }
 
 /// Decoded `KESTRELFS_OP_READDIR` request payload.
@@ -820,6 +902,11 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
+const _: () = assert!(8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(NAME_DATA_MAX <= u16::MAX as usize);
+const _: () = assert!(NAME_DATA_MAX == RENAME_DATA_NAME_MAX);
+const _: () =
+    assert!(READDIR_DATA_ENTRY_HEADER_SIZE + NAME_DATA_MAX <= DATA_BUFFER_SIZE);
 
 /// Compile-time layout assertions, mirroring the `_Static_assert`s at
 /// the bottom of `kestrelfs_ipc.h`. Called once from `main()` - Rust

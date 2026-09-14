@@ -377,6 +377,11 @@ async fn build_response_with_data(
         abi::OP_WRITE_DATA => handle_write_data(event, store, object_store, data_buffer).await,
         abi::OP_READ_DATA => handle_read_data(event, store, object_store, data_buffer).await,
         abi::OP_RENAME_DATA => handle_rename_data(event, store, data_buffer).await,
+        abi::OP_LOOKUP_DATA => handle_lookup_data(event, store, data_buffer).await,
+        abi::OP_CREATE_DATA => handle_create_data(event, store, data_buffer).await,
+        abi::OP_MKDIR_DATA => handle_mkdir_data(event, store, data_buffer).await,
+        abi::OP_UNLINK_DATA => handle_unlink_data(event, store, data_buffer).await,
+        abi::OP_READDIR_DATA => handle_readdir_data(event, store, data_buffer).await,
         _ => build_response(event, store, object_store).await,
     }
 }
@@ -420,6 +425,39 @@ async fn build_response(
     }
 }
 
+fn decode_name_data(
+    event: &KestrelfsEvent,
+    data_buffer: *const u8,
+    operation: &str,
+) -> Result<abi::NameDataReq, KestrelfsEvent> {
+    // SAFETY: every caller is reached only from build_response_with_data,
+    // which receives the live mmap pointer while the kernel owns the shared
+    // data IPC mutex for the whole synchronous request.
+    match unsafe { event.decode_name_data_req(data_buffer) } {
+        Ok(req) => Ok(req),
+        Err(abi::NameDataDecodeError::NameTooLong(_)) => {
+            eprintln!(
+                "kestrelfs-daemon:    {operation} req_id={} name too long",
+                event.req_id
+            );
+            Err(KestrelfsEvent::error_response(
+                event.req_id,
+                -libc::ENAMETOOLONG,
+            ))
+        }
+        Err(error) => {
+            eprintln!(
+                "kestrelfs-daemon:    {operation} req_id={} malformed: {error}",
+                event.req_id
+            );
+            Err(KestrelfsEvent::error_response(
+                event.req_id,
+                -libc::EINVAL,
+            ))
+        }
+    }
+}
+
 /// Handles `KESTRELFS_OP_CREATE` requests: creates a new file or directory.
 ///
 /// Decodes the request payload (parent_inode, mode, name), calls
@@ -442,8 +480,33 @@ async fn handle_create(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
+    handle_create_request(event.req_id, "OP_CREATE", req, store).await
+}
+
+async fn handle_create_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    let req = match decode_name_data(event, data_buffer, "OP_CREATE_DATA") {
+        Ok(req) => abi::CreateReq {
+            parent_inode: req.parent_inode,
+            mode: req.mode,
+            name: req.name,
+        },
+        Err(response) => return response,
+    };
+    handle_create_request(event.req_id, "OP_CREATE_DATA", req, store).await
+}
+
+async fn handle_create_request(
+    req_id: u64,
+    operation: &str,
+    req: abi::CreateReq,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
     println!(
-        "kestrelfs-daemon:    OP_CREATE parent={} name=\"{}\" mode=0o{:o}",
+        "kestrelfs-daemon:    {operation} parent={} name=\"{}\" mode=0o{:o}",
         req.parent_inode, req.name, req.mode
     );
 
@@ -459,14 +522,14 @@ async fn handle_create(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
                         new_inode_id, attrs.size, attrs.mode
                     );
                     // Response layout same as LOOKUP (child_inode_id + attrs)
-                    KestrelfsEvent::lookup_response(event.req_id, new_inode_id, attrs)
+                    KestrelfsEvent::lookup_response(req_id, new_inode_id, attrs)
                 }
                 Err(e) => {
                     eprintln!(
                         "kestrelfs-daemon:    OP_CREATE created inode={} but getattr failed: {:?}",
                         new_inode_id, e
                     );
-                    KestrelfsEvent::error_response(event.req_id, -libc::EIO)
+                    KestrelfsEvent::error_response(req_id, -libc::EIO)
                 }
             }
         }
@@ -475,7 +538,7 @@ async fn handle_create(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
                 "kestrelfs-daemon:    OP_CREATE parent={} name=\"{}\" -> {:?}",
                 req.parent_inode, req.name, e
             );
-            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+            KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
 }
@@ -536,6 +599,62 @@ async fn handle_readdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> K
     }
 }
 
+async fn handle_readdir_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    if event.flags != 0 {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+
+    let req = event.decode_readdir_req();
+    let entries = match store.readdir(req.dir_inode).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error));
+        }
+    };
+
+    let mut entries: Vec<(u64, String)> = entries;
+    entries.sort_by_key(|(inode, _)| *inode);
+    let mut encoded = Vec::with_capacity(abi::DATA_BUFFER_SIZE);
+    let mut entry_count = 0u32;
+
+    for (inode, name) in entries.iter().skip(req.offset as usize) {
+        let name = name.as_bytes();
+        if name.is_empty() || name.len() > abi::NAME_DATA_MAX {
+            return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+        }
+        let record_len = abi::READDIR_DATA_ENTRY_HEADER_SIZE + name.len();
+        if encoded.len() + record_len > abi::DATA_BUFFER_SIZE {
+            break;
+        }
+        encoded.extend_from_slice(&inode.to_le_bytes());
+        encoded.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(name);
+        entry_count += 1;
+    }
+
+    // A valid 255-byte maximum entry always fits in the 16 KiB buffer, so a
+    // non-EOF request must make progress.
+    if entry_count == 0 && (req.offset as usize) < entries.len() {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+
+    // SAFETY: build_response_with_data supplies a live DATA_BUFFER_SIZE-byte
+    // mapping and the kernel retains exclusive data-IPC ownership. encoded is
+    // bounded above by that exact size.
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), data_buffer, encoded.len());
+    }
+
+    let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+    response.payload[0..4].copy_from_slice(&entry_count.to_le_bytes());
+    response.payload[4..8].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    response
+}
+
 async fn handle_mkdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
     let mut parent_inode_bytes = [0u8; 8];
     let mut mode_bytes = [0u8; 4];
@@ -564,9 +683,39 @@ async fn handle_mkdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Kes
         }
     };
 
+    handle_mkdir_request(event.req_id, "OP_MKDIR", parent_inode, mode, name, store).await
+}
+
+async fn handle_mkdir_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    let req = match decode_name_data(event, data_buffer, "OP_MKDIR_DATA") {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    handle_mkdir_request(
+        event.req_id,
+        "OP_MKDIR_DATA",
+        req.parent_inode,
+        req.mode,
+        &req.name,
+        store,
+    )
+    .await
+}
+
+async fn handle_mkdir_request(
+    req_id: u64,
+    operation: &str,
+    parent_inode: u64,
+    mode: u32,
+    name: &str,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
     println!(
-        "kestrelfs-daemon:    OP_MKDIR parent={} name=\"{}\" mode=0o{:o}",
-        parent_inode, name, mode
+        "kestrelfs-daemon:    {operation} parent={parent_inode} name=\"{name}\" mode=0o{mode:o}"
     );
 
     // Call MetaStore::mkdir
@@ -577,7 +726,7 @@ async fn handle_mkdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Kes
                 new_inode_id
             );
             // Response: new_inode_id(u64@0)
-            let mut resp = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            let mut resp = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, req_id);
             resp.payload[0..8].copy_from_slice(&new_inode_id.to_le_bytes());
             resp
         }
@@ -586,7 +735,7 @@ async fn handle_mkdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Kes
                 "kestrelfs-daemon:    OP_MKDIR parent={} name=\"{}\" -> {:?}",
                 parent_inode, name, e
             );
-            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+            KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
 }
@@ -616,10 +765,36 @@ async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
-    println!(
-        "kestrelfs-daemon:    OP_UNLINK parent={} name=\"{}\"",
-        parent_inode, name
-    );
+    handle_unlink_request(event.req_id, "OP_UNLINK", parent_inode, name, store).await
+}
+
+async fn handle_unlink_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    let req = match decode_name_data(event, data_buffer, "OP_UNLINK_DATA") {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    handle_unlink_request(
+        event.req_id,
+        "OP_UNLINK_DATA",
+        req.parent_inode,
+        &req.name,
+        store,
+    )
+    .await
+}
+
+async fn handle_unlink_request(
+    req_id: u64,
+    operation: &str,
+    parent_inode: u64,
+    name: &str,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
+    println!("kestrelfs-daemon:    {operation} parent={parent_inode} name=\"{name}\"");
 
     // Call MetaStore::unlink
     match store.unlink(parent_inode, name).await {
@@ -628,14 +803,14 @@ async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
                 "kestrelfs-daemon:    OP_UNLINK removed \"{}\" from parent={}",
                 name, parent_inode
             );
-            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, req_id)
         }
         Err(e) => {
             println!(
                 "kestrelfs-daemon:    OP_UNLINK parent={} name=\"{}\" -> {:?}",
                 parent_inode, name, e
             );
-            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+            KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
 }
@@ -793,20 +968,45 @@ async fn handle_lookup(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
-    println!(
-        "kestrelfs-daemon:    OP_LOOKUP parent={} name={:?}",
-        req.parent_inode, req.name
-    );
+    handle_lookup_request(event.req_id, "OP_LOOKUP", req.parent_inode, &req.name, store).await
+}
 
-    let child_inode_id = match store.lookup(req.parent_inode, &req.name).await {
+async fn handle_lookup_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    let req = match decode_name_data(event, data_buffer, "OP_LOOKUP_DATA") {
+        Ok(req) => req,
+        Err(response) => return response,
+    };
+    handle_lookup_request(
+        event.req_id,
+        "OP_LOOKUP_DATA",
+        req.parent_inode,
+        &req.name,
+        store,
+    )
+    .await
+}
+
+async fn handle_lookup_request(
+    req_id: u64,
+    operation: &str,
+    parent_inode: u64,
+    name: &str,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
+    println!("kestrelfs-daemon:    {operation} parent={parent_inode} name={name:?}");
+
+    let child_inode_id = match store.lookup(parent_inode, name).await {
         Ok(id) => id,
         Err(err) => {
             let errno = meta_error_to_errno(&err);
             eprintln!(
-                "kestrelfs-daemon:    OP_LOOKUP parent={} name={:?} -> error: {err} (errno {errno})",
-                req.parent_inode, req.name
+                "kestrelfs-daemon:    {operation} parent={parent_inode} name={name:?} -> error: {err} (errno {errno})"
             );
-            return KestrelfsEvent::error_response(event.req_id, errno);
+            return KestrelfsEvent::error_response(req_id, errno);
         }
     };
 
@@ -822,16 +1022,16 @@ async fn handle_lookup(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
             eprintln!(
                 "kestrelfs-daemon:    OP_LOOKUP resolved child_inode_id={child_inode_id} but getattr failed: {err} (errno {errno})"
             );
-            return KestrelfsEvent::error_response(event.req_id, errno);
+            return KestrelfsEvent::error_response(req_id, errno);
         }
     };
 
     println!(
-        "kestrelfs-daemon:    OP_LOOKUP parent={} name={:?} -> inode={child_inode_id} size={} mode={:o}",
-        req.parent_inode, req.name, inode.size, inode.mode
+        "kestrelfs-daemon:    {operation} parent={parent_inode} name={name:?} -> inode={child_inode_id} size={} mode={:o}",
+        inode.size, inode.mode
     );
 
-    KestrelfsEvent::lookup_response(event.req_id, child_inode_id, inode_to_attr_fields(&inode))
+    KestrelfsEvent::lookup_response(req_id, child_inode_id, inode_to_attr_fields(&inode))
 }
 
 /// Answers a `KESTRELFS_OP_GETATTR` request: decodes `inode_id` from
@@ -2248,6 +2448,340 @@ mod tests {
         event.payload[16..18].copy_from_slice(&(old_name.len() as u16).to_le_bytes());
         event.payload[18..20].copy_from_slice(&(new_name.len() as u16).to_le_bytes());
         event
+    }
+
+    fn raw_name_data_req(
+        opcode: u32,
+        req_id: u64,
+        parent_inode: u64,
+        mode: u32,
+        name: &str,
+        data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
+    ) -> KestrelfsEvent {
+        let name = name.as_bytes();
+        assert!(!name.is_empty());
+        assert!(name.len() <= abi::NAME_DATA_MAX);
+        data_buffer[..name.len()].copy_from_slice(name);
+
+        let mut event = KestrelfsEvent::zeroed(opcode, req_id);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        event.payload[8..10].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        event.payload[12..16].copy_from_slice(&mode.to_le_bytes());
+        event
+    }
+
+    fn raw_readdir_data_req(req_id: u64, dir_inode: u64, offset: u32) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_READDIR_DATA, req_id);
+        event.payload[0..8].copy_from_slice(&dir_inode.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&offset.to_le_bytes());
+        event
+    }
+
+    fn decode_readdir_data_test_response(
+        response: &KestrelfsEvent,
+        data_buffer: &[u8; abi::DATA_BUFFER_SIZE],
+    ) -> Vec<(u64, String)> {
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        let count = u32::from_le_bytes(response.payload[0..4].try_into().unwrap()) as usize;
+        let data_len =
+            u32::from_le_bytes(response.payload[4..8].try_into().unwrap()) as usize;
+        assert!(data_len <= data_buffer.len());
+
+        let mut entries = Vec::with_capacity(count);
+        let mut cursor = 0usize;
+        for _ in 0..count {
+            assert!(cursor + abi::READDIR_DATA_ENTRY_HEADER_SIZE <= data_len);
+            let inode =
+                u64::from_le_bytes(data_buffer[cursor..cursor + 8].try_into().unwrap());
+            let name_len = u16::from_le_bytes(
+                data_buffer[cursor + 8..cursor + 10].try_into().unwrap(),
+            ) as usize;
+            cursor += abi::READDIR_DATA_ENTRY_HEADER_SIZE;
+            assert!(name_len <= abi::NAME_DATA_MAX);
+            assert!(cursor + name_len <= data_len);
+            let name = std::str::from_utf8(&data_buffer[cursor..cursor + name_len])
+                .unwrap()
+                .to_string();
+            cursor += name_len;
+            entries.push((inode, name));
+        }
+        assert_eq!(cursor, data_len);
+        entries
+    }
+
+    #[tokio::test]
+    async fn name_data_end_to_end_long_names_survive_reload_and_unlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_path = temp_dir.path().join("meta.json");
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let store: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+        let long_dir = format!("directory-{}", "d".repeat(48));
+        let old_name = format!("created-file-{}", "o".repeat(48));
+        let new_name = format!("renamed-file-{}", "n".repeat(48));
+        assert!(long_dir.len() > 23 && old_name.len() > 23 && new_name.len() > 23);
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+
+        let mkdir = raw_name_data_req(
+            abi::OP_MKDIR_DATA,
+            800,
+            fs_model::ROOT_INODE,
+            0o755,
+            &long_dir,
+            &mut data_buffer,
+        );
+        let mkdir_response = build_response_with_data(
+            &mkdir,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(mkdir_response.opcode, abi::OP_RESULT_OK);
+        let dir_inode =
+            u64::from_le_bytes(mkdir_response.payload[0..8].try_into().unwrap());
+
+        let create = raw_name_data_req(
+            abi::OP_CREATE_DATA,
+            801,
+            dir_inode,
+            fs_model::S_IFREG | 0o644,
+            &old_name,
+            &mut data_buffer,
+        );
+        let create_response = build_response_with_data(
+            &create,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(create_response.opcode, abi::OP_RESULT_OK);
+        let file_inode =
+            u64::from_le_bytes(create_response.payload[0..8].try_into().unwrap());
+
+        let lookup = raw_name_data_req(
+            abi::OP_LOOKUP_DATA,
+            802,
+            dir_inode,
+            0,
+            &old_name,
+            &mut data_buffer,
+        );
+        let lookup_response = build_response_with_data(
+            &lookup,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(lookup_response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u64::from_le_bytes(lookup_response.payload[0..8].try_into().unwrap()),
+            file_inode
+        );
+
+        let readdir = raw_readdir_data_req(803, dir_inode, 0);
+        let readdir_response = build_response_with_data(
+            &readdir,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
+            .iter()
+            .any(|(inode, name)| *inode == file_inode && name == &old_name));
+
+        let rename = raw_rename_data_req(
+            804,
+            dir_inode,
+            &old_name,
+            dir_inode,
+            &new_name,
+            &mut data_buffer,
+        );
+        let rename_response = build_response_with_data(
+            &rename,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(rename_response.opcode, abi::OP_RESULT_OK);
+        drop(store);
+
+        let store: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path).await.unwrap());
+        let lookup_dir = raw_name_data_req(
+            abi::OP_LOOKUP_DATA,
+            805,
+            fs_model::ROOT_INODE,
+            0,
+            &long_dir,
+            &mut data_buffer,
+        );
+        let lookup_dir_response = build_response_with_data(
+            &lookup_dir,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(lookup_dir_response.opcode, abi::OP_RESULT_OK);
+
+        let lookup_new = raw_name_data_req(
+            abi::OP_LOOKUP_DATA,
+            806,
+            dir_inode,
+            0,
+            &new_name,
+            &mut data_buffer,
+        );
+        let lookup_new_response = build_response_with_data(
+            &lookup_new,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(lookup_new_response.opcode, abi::OP_RESULT_OK);
+
+        let readdir = raw_readdir_data_req(807, dir_inode, 0);
+        let readdir_response = build_response_with_data(
+            &readdir,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
+            .iter()
+            .any(|(inode, name)| *inode == file_inode && name == &new_name));
+
+        let unlink = raw_name_data_req(
+            abi::OP_UNLINK_DATA,
+            808,
+            dir_inode,
+            0,
+            &new_name,
+            &mut data_buffer,
+        );
+        let unlink_response = build_response_with_data(
+            &unlink,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(unlink_response.opcode, abi::OP_RESULT_OK);
+        assert!(matches!(
+            store.lookup(dir_inode, &new_name).await,
+            Err(MetaError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn readdir_data_batches_multiple_long_entries() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let mut expected = Vec::new();
+        for index in 0..20 {
+            let name = format!("batch-entry-{index:02}-{}", "x".repeat(40));
+            let inode = store
+                .create(fs_model::ROOT_INODE, &name, fs_model::S_IFREG | 0o644)
+                .await
+                .unwrap();
+            expected.push((inode, name));
+        }
+
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_readdir_data_req(809, fs_model::ROOT_INODE, 0);
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        let entries = decode_readdir_data_test_response(&response, &data_buffer);
+        for expected_entry in expected {
+            assert!(entries.contains(&expected_entry));
+        }
+    }
+
+    #[tokio::test]
+    async fn name_data_accepts_name_max_boundary() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let max_name = "m".repeat(abi::NAME_DATA_MAX);
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+
+        let create = raw_name_data_req(
+            abi::OP_CREATE_DATA,
+            810,
+            fs_model::ROOT_INODE,
+            fs_model::S_IFREG | 0o644,
+            &max_name,
+            &mut data_buffer,
+        );
+        let create_response = build_response_with_data(
+            &create,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(create_response.opcode, abi::OP_RESULT_OK);
+        let inode = u64::from_le_bytes(create_response.payload[0..8].try_into().unwrap());
+
+        let lookup = raw_name_data_req(
+            abi::OP_LOOKUP_DATA,
+            811,
+            fs_model::ROOT_INODE,
+            0,
+            &max_name,
+            &mut data_buffer,
+        );
+        let lookup_response = build_response_with_data(
+            &lookup,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(lookup_response.opcode, abi::OP_RESULT_OK);
+
+        let readdir = raw_readdir_data_req(812, fs_model::ROOT_INODE, 0);
+        let readdir_response = build_response_with_data(
+            &readdir,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
+            .contains(&(inode, max_name.clone())));
+
+        let unlink = raw_name_data_req(
+            abi::OP_UNLINK_DATA,
+            813,
+            fs_model::ROOT_INODE,
+            0,
+            &max_name,
+            &mut data_buffer,
+        );
+        let unlink_response = build_response_with_data(
+            &unlink,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(unlink_response.opcode, abi::OP_RESULT_OK);
     }
 
     #[tokio::test]

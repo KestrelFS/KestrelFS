@@ -105,9 +105,9 @@
 #define KESTRELFS_CACHELINE_SIZE	64
 
 /*
- * Single shared bounce buffer for ABI v8+ bulk file I/O and ABI v9+ rename
- * names. Data IPC is synchronous and serialized, so exactly one READ_DATA,
- * WRITE_DATA, or RENAME_DATA request owns these bytes at a time.
+ * Single shared bounce buffer for bulk file I/O and names. Data/name IPC is
+ * synchronous and serialized, so exactly one *_DATA request owns these bytes
+ * at a time.
  */
 #define KESTRELFS_DATA_BUFFER_SIZE	(16 * 1024)
 
@@ -136,6 +136,11 @@
 #define KESTRELFS_OP_WRITE_DATA		11	/* req: write bytes from data_buffer */
 #define KESTRELFS_OP_READ_DATA		12	/* req: read bytes into data_buffer */
 #define KESTRELFS_OP_RENAME_DATA	13	/* req: rename using names in data_buffer */
+#define KESTRELFS_OP_LOOKUP_DATA	14	/* req: lookup name in data_buffer */
+#define KESTRELFS_OP_CREATE_DATA	15	/* req: create name in data_buffer */
+#define KESTRELFS_OP_MKDIR_DATA		16	/* req: mkdir name in data_buffer */
+#define KESTRELFS_OP_UNLINK_DATA	17	/* req: unlink name in data_buffer */
+#define KESTRELFS_OP_READDIR_DATA	18	/* req: batched readdir via data_buffer */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -518,6 +523,45 @@
  */
 #define KESTRELFS_RENAME_DATA_NAME_MAX	255
 
+/*
+ * Common ABI v10 single-name request layout
+ * ------------------------------------------
+ * Used by LOOKUP_DATA, CREATE_DATA, MKDIR_DATA, and UNLINK_DATA:
+ *
+ *   offset  0, 8 bytes, little-endian u64: parent_inode_id.
+ *   offset  8, 2 bytes, little-endian u16: name_len.
+ *   offset 10, 2 bytes: reserved, must be zero.
+ *   offset 12, 4 bytes, little-endian u32: mode for CREATE_DATA and
+ *            MKDIR_DATA; zero for LOOKUP_DATA and UNLINK_DATA.
+ *   offset 16..32: reserved, must be zero.
+ *
+ * Exactly name_len bytes at the start of data_buffer hold the name, without
+ * a trailing NUL. name_len MUST be 1..KESTRELFS_NAME_DATA_MAX and request
+ * flags MUST be zero. Success responses match the corresponding legacy
+ * opcode. The legacy short-name opcodes remain available for compatibility
+ * tests; normal VFS paths use these DATA opcodes.
+ */
+#define KESTRELFS_NAME_DATA_MAX		255
+
+/*
+ * ABI v10 READDIR_DATA layout
+ * ---------------------------
+ * REQUEST payload:
+ *   offset 0, 8 bytes, little-endian u64: directory inode id.
+ *   offset 8, 4 bytes, little-endian u32: first entry index.
+ *   offset 12..32: reserved, must be zero.
+ *
+ * RESULT_OK payload:
+ *   offset 0, 4 bytes, little-endian u32: entry_count.
+ *   offset 4, 4 bytes, little-endian u32: encoded byte count in data_buffer.
+ *
+ * data_buffer contains entry_count adjacent variable-length records:
+ *   little-endian u64 inode_id, little-endian u16 name_len, then name_len
+ *   bytes of non-NUL-terminated name. Each name is at most 255 bytes. The
+ * daemon packs as many complete records as fit; entry_count == 0 marks EOF.
+ */
+#define KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE	10
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -663,8 +707,12 @@ struct kestrelfs_ring_ctrl {
  *   9 - Phase 3 step 12: Added KESTRELFS_OP_RENAME_DATA (opcode 13). Old and
  *       new names are concatenated in the bounce buffer and may each be up
  *       to 255 bytes. Legacy KESTRELFS_OP_RENAME remains available.
+ *
+ *  10 - Phase 3 step 13: Added LOOKUP_DATA, CREATE_DATA, MKDIR_DATA,
+ *       UNLINK_DATA, and batched READDIR_DATA (opcodes 14..18). All active
+ *       VFS name paths now support 255-byte names through the bounce buffer.
  */
-#define KESTRELFS_ABI_VERSION		9
+#define KESTRELFS_ABI_VERSION		10
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -677,8 +725,7 @@ struct kestrelfs_ring_ctrl {
  * @resp_ctrl:    head/tail for the Rust->kernel response ring.
  * @req_slots:    fixed-size array of request event slots.
  * @resp_slots:   fixed-size array of response event slots.
- * @data_buffer:  serialized 16 KiB bounce buffer for READ_DATA, WRITE_DATA,
- *                and RENAME_DATA.
+ * @data_buffer:  serialized 16 KiB bounce buffer for all *_DATA operations.
  *
  * This whole struct is what gets mmap()-ed by the Rust daemon over
  * the /dev/kestrel_ctl char device. Its total size
@@ -775,6 +822,19 @@ _Static_assert(8 + 8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 _Static_assert(2 * KESTRELFS_RENAME_DATA_NAME_MAX <=
 		KESTRELFS_DATA_BUFFER_SIZE,
 		"two maximum-length rename names must fit in data_buffer");
+
+_Static_assert(8 + 2 + 2 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"single-name DATA request fields overflow the event payload");
+
+_Static_assert(KESTRELFS_NAME_DATA_MAX <= (__u16)-1,
+		"NAME_DATA maximum must fit in its u16 length field");
+
+_Static_assert(KESTRELFS_NAME_DATA_MAX == KESTRELFS_RENAME_DATA_NAME_MAX,
+		"all active name opcodes must share one NAME_MAX limit");
+
+_Static_assert(KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE +
+		KESTRELFS_NAME_DATA_MAX <= KESTRELFS_DATA_BUFFER_SIZE,
+		"one maximum-length READDIR_DATA entry must fit in data_buffer");
 
 /*
  * KESTRELFS_OP_LOOKUP request payload: 8 bytes (parent_inode) + 1

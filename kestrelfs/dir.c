@@ -86,9 +86,48 @@ static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
 }
 
 /*
+ * Send one ABI v10 request whose single name lives at data_buffer[0].
+ * The shared mutex covers both publication and response consumption, so the
+ * daemon has exclusive access to the name until it finishes the request.
+ */
+static int kestrelfs_name_data_call(u32 opcode, u64 parent_ino, u32 mode,
+				    const char *name, size_t name_len,
+				    struct kestrelfs_event *resp)
+{
+	struct kestrelfs_shared_region *region;
+	struct kestrelfs_event req = { 0 };
+	int ret;
+
+	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
+		return -ENAMETOOLONG;
+
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock;
+	}
+
+	memcpy(region->data_buffer, name, name_len);
+	req.opcode = opcode;
+	put_unaligned_le64(parent_ino, &req.payload[0]);
+	put_unaligned_le16((u16)name_len, &req.payload[8]);
+	put_unaligned_le32(mode, &req.payload[12]);
+
+	ret = kestrelfs_ipc_sync_call(&req, resp);
+
+out_unlock:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	return ret;
+}
+
+/*
  * kestrelfs_inode_lookup - VFS ->lookup() for directories.
  * 
- * Sends KESTRELFS_OP_LOOKUP to daemon, creates and returns a new inode
+ * Sends KESTRELFS_OP_LOOKUP_DATA to daemon, creates and returns a new inode
  * on success, or ERR_PTR(-errno) on failure.
  */
 static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
@@ -96,7 +135,6 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 					     unsigned int flags)
 {
 	struct super_block *sb = dir->i_sb;
-	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
 	struct inode *inode;
 	const char *name = dentry->d_name.name;
@@ -109,21 +147,13 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 	pr_info("kestrelfs: lookup parent=%lu name=\"%s\"\n",
 		dir->i_ino, name);
 
-	/* Check name length (LOOKUP max is 23 bytes) */
-	if (name_len > 23) {
+	if (name_len > KESTRELFS_NAME_DATA_MAX) {
 		pr_err("kestrelfs: lookup name too long: %zu\n", name_len);
 		return ERR_PTR(-ENAMETOOLONG);
 	}
 
-	/* Build LOOKUP request: parent(u64@0) + name_len(u8@8) + name@9 */
-	req.opcode = KESTRELFS_OP_LOOKUP;
-	req.flags = 0;
-	memcpy(&req.payload[0], &dir->i_ino, sizeof(u64));
-	req.payload[8] = (u8)name_len;
-	memcpy(&req.payload[9], name, name_len);
-
-	/* Send IPC request */
-	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	ret = kestrelfs_name_data_call(KESTRELFS_OP_LOOKUP_DATA,
+				      dir->i_ino, 0, name, name_len, &resp);
 	if (ret) {
 		pr_info("kestrelfs: lookup failed: %d\n", ret);
 		if (ret == -ENOENT) {
@@ -159,7 +189,8 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 /*
  * kestrelfs_inode_create - VFS ->create() for directories.
  *
- * Sends KESTRELFS_OP_CREATE to daemon, creates inode and instantiates dentry.
+ * Sends KESTRELFS_OP_CREATE_DATA to daemon, creates inode and instantiates
+ * dentry.
  */
 static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 				  struct inode *dir,
@@ -168,7 +199,6 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 				  bool excl)
 {
 	struct super_block *sb = dir->i_sb;
-	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
 	struct inode *inode;
 	const char *name = dentry->d_name.name;
@@ -182,23 +212,15 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	pr_info("kestrelfs: create parent=%lu name=\"%s\" mode=0%o\n",
 		dir->i_ino, name, mode);
 
-	/* Check name length (CREATE max is 19 + NUL = 20 bytes) */
-	if (name_len > 19) {
+	if (name_len > KESTRELFS_NAME_DATA_MAX) {
 		pr_err("kestrelfs: create name too long: %zu\n", name_len);
 		return -ENAMETOOLONG;
 	}
 
-	/* Build CREATE request: parent(u64@0) + mode(u32@8) + name@12 (NUL-terminated) */
-	req.opcode = KESTRELFS_OP_CREATE;
-	req.flags = 0;
 	create_mode = S_IFREG | (mode & 0777);
-	memcpy(&req.payload[0], &dir->i_ino, sizeof(u64));
-	memcpy(&req.payload[8], &create_mode, sizeof(u32));
-	memcpy(&req.payload[12], name, name_len);
-	req.payload[12 + name_len] = 0; /* NUL terminator */
-
-	/* Send IPC request */
-	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	ret = kestrelfs_name_data_call(KESTRELFS_OP_CREATE_DATA,
+				      dir->i_ino, create_mode,
+				      name, name_len, &resp);
 	if (ret) {
 		pr_err("kestrelfs: create failed: %d\n", ret);
 		return ret;
@@ -232,15 +254,14 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 /*
  * kestrelfs_inode_mkdir - VFS ->mkdir() for directories.
  *
- * Sends KESTRELFS_OP_MKDIR to daemon, waits for response, creates VFS inode.
+ * Sends KESTRELFS_OP_MKDIR_DATA to daemon, waits for response, creates VFS
+ * inode.
  */
 static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 				 struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
-	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
-	u64 parent_ino = dir->i_ino;
 	u64 new_ino;
 	struct inode *inode;
 	const char *name = dentry->d_name.name;
@@ -250,25 +271,14 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	pr_info("kestrelfs: mkdir parent=%lu name=\"%s\" mode=0%o\n",
 		dir->i_ino, name, mode);
 
-	/* Validate name length (20 bytes max for payload) */
-	if (name_len >= 20) {
+	if (name_len > KESTRELFS_NAME_DATA_MAX) {
 		pr_warn("kestrelfs: mkdir name too long: %zu bytes\n", name_len);
 		return -ENAMETOOLONG;
 	}
 
-	/* Build request: parent(u64@0) + mode(u32@8) + name(NUL-terminated@12) */
-	req.opcode = KESTRELFS_OP_MKDIR;
-	req.req_id = 0;
-	memcpy(&req.payload[0], &parent_ino, sizeof(u64));
-	{
-		u32 mode32 = (u32)mode;
-		memcpy(&req.payload[8], &mode32, sizeof(u32));
-	}
-	memcpy(&req.payload[12], name, name_len);
-	req.payload[12 + name_len] = '\0';
-
-	/* Send IPC request */
-	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	ret = kestrelfs_name_data_call(KESTRELFS_OP_MKDIR_DATA,
+				      dir->i_ino, (u32)mode,
+				      name, name_len, &resp);
 	if (ret) {
 		pr_info("kestrelfs: mkdir failed: %d\n", ret);
 		return ret;
@@ -296,11 +306,10 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 /*
  * kestrelfs_inode_unlink - VFS ->unlink() for files.
  *
- * Sends KESTRELFS_OP_UNLINK to daemon, waits for response.
+ * Sends KESTRELFS_OP_UNLINK_DATA to daemon, waits for response.
  */
 static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 {
-	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
 	u64 parent_ino = dir->i_ino;
 	const char *name = dentry->d_name.name;
@@ -310,21 +319,13 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 	pr_info("kestrelfs: unlink parent=%lu name=\"%s\"\n",
 		dir->i_ino, name);
 
-	/* Validate name length (24 bytes max for payload) */
-	if (name_len >= 24) {
+	if (name_len > KESTRELFS_NAME_DATA_MAX) {
 		pr_warn("kestrelfs: unlink name too long: %zu bytes\n", name_len);
 		return -ENAMETOOLONG;
 	}
 
-	/* Build request: parent(u64@0) + name(NUL-terminated@8) */
-	req.opcode = KESTRELFS_OP_UNLINK;
-	req.req_id = 0;
-	memcpy(&req.payload[0], &parent_ino, sizeof(u64));
-	memcpy(&req.payload[8], name, name_len);
-	req.payload[8 + name_len] = '\0';
-
-	/* Send IPC request */
-	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	ret = kestrelfs_name_data_call(KESTRELFS_OP_UNLINK_DATA,
+				      parent_ino, 0, name, name_len, &resp);
 	if (ret) {
 		pr_info("kestrelfs: unlink failed: %d\n", ret);
 		return ret;
@@ -347,7 +348,8 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 /*
  * kestrelfs_inode_rmdir - VFS ->rmdir() for directories.
  *
- * Uses the same KESTRELFS_OP_UNLINK opcode; daemon checks if directory is empty.
+ * Uses the same KESTRELFS_OP_UNLINK_DATA opcode; daemon checks whether the
+ * directory is empty.
  */
 static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
 {
@@ -464,24 +466,15 @@ const struct inode_operations kestrelfs_dir_inode_operations = {
 /*
  * kestrelfs_readdir - VFS ->iterate_shared() for directories.
  *
- * Sends KESTRELFS_OP_READDIR to daemon repeatedly with increasing offset
- * until entry_count == 0. Emits entries via dir_emit().
- *
- * PAYLOAD LIMITATION: To avoid name truncation, daemon now returns only
- * 1 entry per response (changed from 2). Layout:
- *   - entry_count (u8@0)
- *   - entry[0]: inode (u64@1) + name (up to 23 bytes@9)
- * This allows full names like "remote.txt" and "writable.dat" without
- * truncation (previously "remo" and "writ").
- *
- * ORDERING NOTE: MemStore uses HashMap, so entries appear in arbitrary order.
- * For stable listings, daemon should sort by name or inode (not yet implemented).
+ * READDIR_DATA returns a batch of variable-length records in the bounce
+ * buffer. The daemon sorts by inode for stable pagination. If dir_emit()
+ * fills the caller's buffer mid-batch, ctx->pos remains at the first un-emitted
+ * entry so the next iterate call requests it again.
  */
 static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	struct kestrelfs_event req = { 0 };
-	struct kestrelfs_event resp = { 0 };
+	struct kestrelfs_shared_region *region;
 	u32 offset;
 	int ret;
 
@@ -491,68 +484,92 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
-	/* Calculate offset for daemon (skip . and ..) */
+	if (ctx->pos - 2 > U32_MAX)
+		return -EOVERFLOW;
+
 	offset = (ctx->pos >= 2) ? (u32)(ctx->pos - 2) : 0;
 
-	/* Loop: send READDIR requests until entry_count == 0 */
-	while (1) {
-		u8 entry_count;
-		u64 ino;
-		char name[24];  /* 23 bytes + NUL */
-		int name_len;
-		int i;
+	for (;;) {
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+		u32 entry_count, data_len, cursor = 0, i;
 
-		/* Build READDIR request: dir_ino(u64@0) + offset(u32@8) */
-		req.opcode = KESTRELFS_OP_READDIR;
-		req.flags = 0;
-		memcpy(&req.payload[0], &inode->i_ino, sizeof(u64));
-		memcpy(&req.payload[8], &offset, sizeof(u32));
+		ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+		if (ret)
+			return ret;
+
+		region = kestrelfs_shm_region();
+		if (!region) {
+			ret = -ENOTCONN;
+			goto out_unlock_batch;
+		}
+
+		req.opcode = KESTRELFS_OP_READDIR_DATA;
+		put_unaligned_le64(inode->i_ino, &req.payload[0]);
+		put_unaligned_le32(offset, &req.payload[8]);
 
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		if (ret) {
 			pr_err("kestrelfs: readdir failed: %d\n", ret);
+			goto out_unlock_batch;
+		}
+
+		entry_count = get_unaligned_le32(&resp.payload[0]);
+		data_len = get_unaligned_le32(&resp.payload[4]);
+		if (data_len > KESTRELFS_DATA_BUFFER_SIZE) {
+			ret = -EPROTO;
+			goto out_unlock_batch;
+		}
+
+		pr_info("kestrelfs: readdir offset=%u -> entries=%u bytes=%u\n",
+			offset, entry_count, data_len);
+
+		if (entry_count == 0) {
+			ret = data_len == 0 ? 0 : -EPROTO;
+			mutex_unlock(&kestrelfs_data_ipc_lock);
 			return ret;
 		}
 
-		/* Parse response: entry_count(u8@0) + entry */
-		entry_count = resp.payload[0];
+		for (i = 0; i < entry_count; i++) {
+			u64 ino;
+			u16 name_len;
 
-		pr_info("kestrelfs: readdir offset=%u -> entry_count=%u\n",
-			offset, entry_count);
+			if (cursor + KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE > data_len) {
+				ret = -EPROTO;
+				goto out_unlock_batch;
+			}
 
-		if (entry_count == 0) {
-			/* End of directory */
-			break;
+			ino = get_unaligned_le64(&region->data_buffer[cursor]);
+			name_len = get_unaligned_le16(
+				&region->data_buffer[cursor + sizeof(u64)]);
+			cursor += KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE;
+			if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX ||
+			    cursor + name_len > data_len) {
+				ret = -EPROTO;
+				goto out_unlock_batch;
+			}
+
+			if (!dir_emit(ctx, &region->data_buffer[cursor], name_len,
+				      ino, DT_UNKNOWN)) {
+				mutex_unlock(&kestrelfs_data_ipc_lock);
+				return 0;
+			}
+			cursor += name_len;
+			ctx->pos++;
+			offset++;
 		}
 
-		/* Entry: ino(u64@1) + name(up to 23 bytes@9) */
-		memcpy(&ino, &resp.payload[1], sizeof(u64));
-		memcpy(name, &resp.payload[9], 23);
-		name[23] = 0; /* ensure NUL termination */
-
-		/* Find actual name length (look for NUL or end of buffer) */
-		name_len = 0;
-		for (i = 0; i < 23; i++) {
-			if (name[i] == 0)
-				break;
-			name_len++;
+		if (cursor != data_len) {
+			ret = -EPROTO;
+			goto out_unlock_batch;
 		}
+		mutex_unlock(&kestrelfs_data_ipc_lock);
+		continue;
 
-		/* Protocol error: entry_count > 0 but name is empty */
-		if (name_len == 0) {
-			pr_err("kestrelfs: protocol error - entry_count=%u but name is empty\n",
-			       entry_count);
-			return -EIO;
-		}
-
-		if (!dir_emit(ctx, name, name_len, ino, DT_UNKNOWN)) {
-			return 0; /* Buffer full */
-		}
-		ctx->pos++;
-		offset++;
+out_unlock_batch:
+		mutex_unlock(&kestrelfs_data_ipc_lock);
+		return ret;
 	}
-
-	return 0;
 }
 
 const struct file_operations kestrelfs_dir_file_operations = {

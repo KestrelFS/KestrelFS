@@ -18,11 +18,11 @@
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
-> ⚠️ **Project status: early development (Phase 1/4 + Phase 2 in progress).**
-> The current codebase implements a minimal read-only kernel VFS skeleton and
-> the foundational kernel↔userspace IPC bridge. It is **not yet a usable
-> filesystem** — see [Roadmap](#roadmap) for what exists today versus what's
-> planned.
+> ⚠️ **Project status: early development (Phase 3 in progress; ABI v10).**
+> Phase 1–2 are done. Phase 3 currently provides a working local control plane
+> (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore` +
+> `LocalFsObjectStore`). Redis/S3 backends and Phase 4 NVMe cache are **not**
+> started — see [Roadmap](#roadmap) and `HANDOFF.md`.
 
 ---
 
@@ -127,32 +127,28 @@ phase beyond what's marked "done" below is implemented.**
 
 | Phase | Goal | Status |
 |---|---|---|
-| **1. Minimal C kernel VFS skeleton** | `super.c`/`inode.c`/`file.c`, `register_filesystem()`, in-memory read-only mount exposing `hello.txt`. Out-of-tree `Makefile`. | ✅ Done |
-| **2. C↔Rust IPC bridge** | Shared-memory protocol (`kestrelfs_ipc.h`): two mmap'd lock-free ring buffers, `/dev/kestrel_ctl` char device with `.mmap`/`.poll`/`.ioctl`. Rust-side consumer (`#[repr(C)]` mirrors, mmap, ring push/pop). | 🚧 In progress — kernel-side infrastructure (allocation, mmap, poll, ioctl wakeups) is done; ring push/pop business logic and the Rust consumer are not yet written. |
-| **3. Rust daemon closed loop** | Real chunk/block data flow via Tokio + AWS S3 SDK, Redis-backed metadata. Cache misses go over the network end-to-end. | ⏳ Not started |
-| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits perform a DMA copy straight back to the VFS caller, bypassing the Rust daemon entirely. | ⏳ Not started |
+| **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
+| **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
+| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, READ/WRITE via bounce buffer, truncate, local JSON + local-FS persistence (ABI v10 / Steps 1–13). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
+| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits DMA back to the VFS caller, bypassing the Rust daemon. | ⏳ Not started |
+
+See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
 
 ---
 
 ## Repository Layout
 
 ```
-FerroFS/
-├── LICENSE                  # Apache License 2.0
-├── README.md                # this file
-└── kestrelfs/                # kernel module (C) — out-of-tree build
-    ├── Makefile               # kbuild wrapper, never builds the kernel itself
-    ├── super.c                # module init/exit, filesystem_type registration
-    ├── inode.c                # superblock ops, simple_fill_super()-based tree
-    ├── file.c                 # hello.txt read-only file_operations
-    ├── chardev.c               # /dev/kestrel_ctl: mmap + poll + ioctl bridge
-    ├── kestrelfs.h             # internal cross-file declarations
-    ├── kestrelfs_ipc.h         # kernel↔Rust ABI contract (ring buffers, ioctls)
-    └── chardev_test.c          # standalone userspace smoke test for the chardev
+KestrelFS/   # local checkout directory may historically be named FerroFS
+├── LICENSE / README.md / HANDOFF.md
+├── kestrelfs/                 # kernel module (C) — out-of-tree build
+│   ├── Makefile, super.c, inode.c, dir.c, file.c
+│   ├── chardev.c, ipc_ring.c
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v10)
+│   └── chardev_test.c
+└── daemon/                    # Rust control-plane daemon
+    └── src/{main,abi,meta,meta_persist,object_store,fs_model,device,ring,ioctl}.rs
 ```
-
-The Rust control-plane daemon does not exist yet; it will land under a
-`daemon/` directory starting in Phase 2's Rust-consumer step.
 
 ---
 
@@ -266,12 +262,12 @@ sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
 
 **Command-line options:**
 
-- `--data-dir <PATH>` — Directory for persistent block storage (default: `./.kestrelfs-objects`)
-  - The daemon stores file data as individual blocks under this directory
-  - Blocks persist across daemon restarts, allowing data recovery
+- `--data-dir <PATH>` — Directory for persistent metadata (`meta.json`) and block
+  objects (default: `./.kestrelfs-data`)
+  - Blocks and metadata persist across daemon restarts
   - Must be writable by the daemon process (requires `sudo` if using system paths)
 
-- `--memory` — Use in-memory storage (data lost on restart, for testing only)
+- `--memory` — Use in-memory MetaStore + ObjectStore (data lost on restart; tests only)
 
 **Verifying persistence:**
 
@@ -328,7 +324,7 @@ touch /mnt/kestrelfs/new_file           # expect: Read-only file system
 # 5. Exercise the chardev bridge
 gcc -O2 -Wall -I . -o chardev_test chardev_test.c
 sudo ./chardev_test                     # expect "[PASS] all chardev infrastructure checks succeeded"
-dmesg | tail -5                          # expect: "chardev shared region allocated (131264 bytes, 1024 slots/ring)"
+dmesg | tail -5                          # expect: shared region allocated (~147648 bytes, 1024 slots/ring + 16 KiB bounce)
 
 # 6. Unmount and unload cleanly
 sudo umount /mnt/kestrelfs
@@ -350,13 +346,17 @@ The shared memory region (`struct kestrelfs_shared_region` in
 `kestrelfs_ipc.h`) is laid out as:
 
 ```
-offset 0      : header (magic, abi_version, padding)     — 64 B
-offset 64     : req_ctrl  (head/tail/capacity)             — 64 B (own cacheline)
-offset 128    : resp_ctrl (head/tail/capacity)              — 64 B (own cacheline)
-offset 192    : req_slots[1024]   (kernel  -> Rust requests)  — 64 KiB
-offset 65728  : resp_slots[1024]  (Rust -> kernel responses)   — 64 KiB
-                                                    total: 131264 B (~128 KiB)
+offset 0       : header (magic, abi_version, padding)      — 64 B
+offset 64      : req_ctrl  (head/tail/capacity)            — 64 B (own cacheline)
+offset 128     : resp_ctrl (head/tail/capacity)            — 64 B (own cacheline)
+offset 192     : req_slots[1024]   (kernel -> Rust)        — 64 KiB
+offset 65728   : resp_slots[1024]  (Rust -> kernel)        — 64 KiB
+offset 131264  : data_buffer (ABI v8+ bounce for bulk I/O  — 16 KiB
+                 and long names)
+                                         total: 147648 B (~144 KiB)
 ```
+Exact sizes are asserted in `kestrelfs_ipc.h` / `daemon/src/abi.rs`
+(`KESTRELFS_SHM_REGION_SIZE` / `SHM_REGION_SIZE`).
 
 Each event slot is exactly 64 bytes (one cacheline): a sequence number,
 opcode, flags, request ID (echoed back on the matching response), an error
@@ -404,36 +404,18 @@ without changing any existing struct's size, alignment, or field offsets.
 
 ### Known Limitations
 
-**Write path (Phase 3 step 4)**: The current implementation does **not** yet
-handle file truncation or `O_TRUNC` semantics. When shell redirection
-(`> file`) overwrites a file with shorter content, the file size remains at
-its previous (larger) value, and subsequent reads may return stale tail bytes
-from earlier writes.
+Current Phase 3 local stack supports create/mkdir/unlink/rmdir/rename,
+read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
+255-byte names (ABI v10). Remaining gaps include:
 
-**Root cause**: The kernel module does not detect or communicate `O_TRUNC` to
-the daemon, and the daemon's `append_slice()` method only ever grows file
-size (`max(old_size, new_end)`), never shrinks it. The COW (copy-on-write)
-slice model preserves all historical writes; reads correctly select the newest
-slice for each byte range, but the reported file size stays at the maximum
-offset ever written.
+- **No symlink / hard link** yet.
+- **unlink does not GC ObjectStore blocks** (orphan objects may remain on disk).
+- **Data/name IPC is globally serialized** by one mutex (correct but limits
+  concurrency).
+- **Distributed backends** (Redis MetaStore, S3 ObjectStore) and **Phase 4
+  NVMe cache** are not started.
 
-**Example failure**:
-```bash
-echo "LONGCONTENT" > /mnt/kestrelfs/writable.dat  # size=11
-echo "SHORT" > /mnt/kestrelfs/writable.dat        # size still 11
-cat /mnt/kestrelfs/writable.dat                   # reads "SHORTONTENT" (stale tail)
-```
-
-**Workaround** (until `truncate` support is added in a future step):
-```bash
-truncate -s 0 /mnt/kestrelfs/writable.dat  # manually shrink to 0 first
-echo "newdata" > /mnt/kestrelfs/writable.dat
-```
-
-Or ensure every overwrite is at least as long as the previous file size.
-
-A future step will add `KESTRELFS_OP_TRUNCATE` (IPC opcode 5) and kernel-side
-`O_TRUNC` detection to properly implement POSIX file truncation semantics.
+Authoritative detail lives in `HANDOFF.md` §6.
 
 ### Coding standards
 
