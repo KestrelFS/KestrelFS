@@ -636,13 +636,6 @@ sudo rmmod kestrelfs
 - [x] 已知限制与坑已列出（第 6 节）
 - [x] vng 站立规则见 §9；cache 设备仅允许块设备（loop/zvol/raw）
 
-- [x] Step 17 S3ObjectStore 已由 Cursor 验收并提交（137 tests；MinIO 门控测由实现方跑通）
-- [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–17 已验收状态已写清
-- [ ] Step 18 NVMe 缓存骨架待 Cursor 验收，worktree 尚未 commit
-- [x] 下一步明确：等待 Cursor 验收 Step 18
-- [x] 已知限制与坑已列出（第 6 节）
-- [x] vng 站立规则见 §9
 ---
 
 ## 11. 文档债务
