@@ -47,9 +47,13 @@ pub const CACHELINE_SIZE: usize = 64;
 /// Mirrors `KESTRELFS_EVENT_PAYLOAD_SIZE`.
 pub const EVENT_PAYLOAD_SIZE: usize = 32;
 
+/// Size of the serialized bulk-I/O bounce buffer appended after both rings.
+/// Mirrors `KESTRELFS_DATA_BUFFER_SIZE` (16 KiB).
+pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
+
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 9;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -91,6 +95,12 @@ pub const OP_MKDIR: u32 = 8;
 pub const OP_UNLINK: u32 = 9;
 /// Request: rename/move file or directory. Mirrors `KESTRELFS_OP_RENAME`.
 pub const OP_RENAME: u32 = 10;
+/// Request: write bytes from the shared data bounce buffer.
+pub const OP_WRITE_DATA: u32 = 11;
+/// Request: read bytes into the shared data bounce buffer.
+pub const OP_READ_DATA: u32 = 12;
+/// Request: rename/move using names in the shared data bounce buffer.
+pub const OP_RENAME_DATA: u32 = 13;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -198,6 +208,16 @@ impl KestrelfsEvent {
         }
     }
 
+    /// Decodes the common ABI v8 `OP_WRITE_DATA` / `OP_READ_DATA`
+    /// request payload: inode_id@0, file_offset@8, length@16.
+    pub fn decode_data_req(&self) -> DataReq {
+        DataReq {
+            inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(self.payload[8..16].try_into().unwrap()),
+            length: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
+        }
+    }
+
     /// Decodes a `KESTRELFS_OP_TRUNCATE` request from the payload.
     ///
     /// Payload layout (little-endian):
@@ -286,6 +306,68 @@ impl KestrelfsEvent {
             .to_string();
         let new_name = std::str::from_utf8(new_name_bytes)
             .map_err(|_| RenameDecodeError::NewNameInvalidUtf8)?
+            .to_string();
+
+        Ok(RenameReq {
+            old_parent,
+            new_parent,
+            old_name,
+            new_name,
+        })
+    }
+
+    /// Decodes an ABI v9 `KESTRELFS_OP_RENAME_DATA` request.
+    ///
+    /// The payload carries `old_parent@0`, `new_parent@8`, and two little-endian
+    /// `u16` lengths at offsets 16 and 18. The old and new names are adjacent at
+    /// the beginning of the shared data bounce buffer.
+    ///
+    /// # Safety
+    ///
+    /// `data_buffer` must point to the start of a live
+    /// [`DATA_BUFFER_SIZE`]-byte shared bounce buffer. The caller must ensure
+    /// exclusive data-IPC ownership until this method returns.
+    pub unsafe fn decode_rename_data_req(
+        &self,
+        data_buffer: *const u8,
+    ) -> Result<RenameReq, RenameDataDecodeError> {
+        if self.flags != 0 {
+            return Err(RenameDataDecodeError::UnsupportedFlags(self.flags));
+        }
+
+        let old_parent = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let new_parent = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
+        let old_name_len = u16::from_le_bytes(self.payload[16..18].try_into().unwrap());
+        let new_name_len = u16::from_le_bytes(self.payload[18..20].try_into().unwrap());
+
+        if old_name_len as usize > RENAME_DATA_NAME_MAX {
+            return Err(RenameDataDecodeError::OldNameTooLong(old_name_len));
+        }
+        if new_name_len as usize > RENAME_DATA_NAME_MAX {
+            return Err(RenameDataDecodeError::NewNameTooLong(new_name_len));
+        }
+
+        let total_len = (old_name_len as usize)
+            .checked_add(new_name_len as usize)
+            .ok_or(RenameDataDecodeError::CombinedNamesTooLong)?;
+        if total_len > DATA_BUFFER_SIZE {
+            return Err(RenameDataDecodeError::CombinedNamesTooLong);
+        }
+
+        let mut names = vec![0u8; total_len];
+        // SAFETY: guaranteed by this function's contract. Lengths have been
+        // checked against the mapped buffer size, and `names` owns total_len
+        // initialized writable bytes. The kernel serializes ownership.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data_buffer, names.as_mut_ptr(), total_len);
+        }
+
+        let split = old_name_len as usize;
+        let old_name = std::str::from_utf8(&names[..split])
+            .map_err(|_| RenameDataDecodeError::OldNameInvalidUtf8)?
+            .to_string();
+        let new_name = std::str::from_utf8(&names[split..])
+            .map_err(|_| RenameDataDecodeError::NewNameInvalidUtf8)?
             .to_string();
 
         Ok(RenameReq {
@@ -483,6 +565,10 @@ pub const LOOKUP_NAME_MAX: usize = 23;
 /// + new_name_len(1) + old_name(7) + new_name(7) = 32 bytes.
 pub const RENAME_NAME_MAX: usize = 7;
 
+/// Mirrors `KESTRELFS_RENAME_DATA_NAME_MAX`: ABI v9 permits each name in an
+/// `OP_RENAME_DATA` request to contain up to POSIX `NAME_MAX` bytes.
+pub const RENAME_DATA_NAME_MAX: usize = 255;
+
 /// Decoded form of a `KESTRELFS_OP_LOOKUP` request payload. See
 /// [`KestrelfsEvent::decode_lookup_req`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +661,14 @@ pub struct WriteChunkReq {
     pub data: Vec<u8>,
 }
 
+/// Decoded ABI v8 bulk data request shared by READ_DATA and WRITE_DATA.
+#[derive(Debug, Clone, Copy)]
+pub struct DataReq {
+    pub inode_id: u64,
+    pub offset: u64,
+    pub length: u32,
+}
+
 /// Decoded KESTRELFS_OP_TRUNCATE request.
 #[derive(Debug, Clone)]
 pub struct TruncateReq {
@@ -617,6 +711,27 @@ pub enum RenameDecodeError {
     #[error("invalid UTF-8 in old_name")]
     OldNameInvalidUtf8,
     /// Invalid UTF-8 in new_name.
+    #[error("invalid UTF-8 in new_name")]
+    NewNameInvalidUtf8,
+}
+
+/// Errors [`KestrelfsEvent::decode_rename_data_req`] can report.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenameDataDecodeError {
+    #[error("request flags {0:#x} are unsupported")]
+    UnsupportedFlags(u32),
+    #[error(
+        "old_name_len {0} exceeds RENAME_DATA_NAME_MAX ({RENAME_DATA_NAME_MAX})"
+    )]
+    OldNameTooLong(u16),
+    #[error(
+        "new_name_len {0} exceeds RENAME_DATA_NAME_MAX ({RENAME_DATA_NAME_MAX})"
+    )]
+    NewNameTooLong(u16),
+    #[error("combined rename names exceed DATA_BUFFER_SIZE ({DATA_BUFFER_SIZE})")]
+    CombinedNamesTooLong,
+    #[error("invalid UTF-8 in old_name")]
+    OldNameInvalidUtf8,
     #[error("invalid UTF-8 in new_name")]
     NewNameInvalidUtf8,
 }
@@ -685,6 +800,7 @@ pub struct KestrelfsSharedRegion {
 
     pub req_slots: [KestrelfsEvent; RING_SLOTS],
     pub resp_slots: [KestrelfsEvent; RING_SLOTS],
+    pub data_buffer: [u8; DATA_BUFFER_SIZE],
 }
 
 /// Mirrors `KESTRELFS_SHM_REGION_SIZE` (`sizeof(struct
@@ -693,6 +809,17 @@ pub struct KestrelfsSharedRegion {
 /// via `KESTRELFS_IOC_GET_REGION_SIZE` before trusting the mapping at
 /// all - see [`super::device::KestrelDevice::open`].
 pub const SHM_REGION_SIZE: usize = std::mem::size_of::<KestrelfsSharedRegion>();
+
+// True compile-time counterparts to the C `_Static_assert`s. Array lengths
+// must match exactly or rustc rejects the ABI mirror.
+const _: [(); 147_648] = [(); SHM_REGION_SIZE];
+const _: [(); 131_264] = [(); std::mem::offset_of!(
+    KestrelfsSharedRegion,
+    data_buffer
+)];
+const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
 
 /// Compile-time layout assertions, mirroring the `_Static_assert`s at
 /// the bottom of `kestrelfs_ipc.h`. Called once from `main()` - Rust
@@ -724,12 +851,18 @@ pub fn compile_time_layout_asserts() {
     );
 
     assert_eq!(
-        SHM_REGION_SIZE, 131_264,
+        SHM_REGION_SIZE, 147_648,
         "kestrelfs_shared_region size drifted from the value verified \
          against the running kernel module during Phase 2 development \
          (see README/design notes); if this legitimately changed, the \
          C header, KESTRELFS_ABI_VERSION, and this constant must all be \
          bumped together"
+    );
+
+    assert_eq!(
+        std::mem::offset_of!(KestrelfsSharedRegion, data_buffer),
+        131_264,
+        "data_buffer must immediately follow both event rings"
     );
 
     assert_eq!(

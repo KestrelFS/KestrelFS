@@ -12,6 +12,7 @@
 #include <linux/namei.h>
 #include <linux/time.h>
 #include <linux/delay.h>
+#include <linux/unaligned.h>
 
 #include "kestrelfs.h"
 #include "kestrelfs_ipc.h"
@@ -360,11 +361,10 @@ static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
 /*
  * kestrelfs_inode_rename - VFS ->rename() for files and directories.
  *
- * Sends KESTRELFS_OP_RENAME to daemon. Supports same-directory rename and
- * cross-directory moves with POSIX semantics (atomic replacement).
- *
- * Name length limitation: both old and new names must be <= 7 bytes due to
- * payload constraints (32 bytes total: 8+8+1+1+7+7).
+ * Sends KESTRELFS_OP_RENAME_DATA to daemon. Supports same-directory rename
+ * and cross-directory moves with POSIX semantics (atomic replacement).
+ * Names are concatenated in the shared data bounce buffer, so each may be up
+ * to KESTRELFS_RENAME_DATA_NAME_MAX bytes.
  */
 static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 				  struct inode *old_dir, struct dentry *old_dentry,
@@ -379,6 +379,7 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	const char *new_name = new_dentry->d_name.name;
 	size_t old_name_len = old_dentry->d_name.len;
 	size_t new_name_len = new_dentry->d_name.len;
+	struct kestrelfs_shared_region *region;
 	int ret;
 
 	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
@@ -392,31 +393,45 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 		return -EINVAL;
 	}
 
-	/* Validate name lengths (7 bytes max each) */
-	if (old_name_len > KESTRELFS_RENAME_NAME_MAX) {
+	/* Validate the per-name ABI limit and combined bounce-buffer budget. */
+	if (old_name_len > KESTRELFS_RENAME_DATA_NAME_MAX) {
 		pr_warn("kestrelfs: rename old_name too long: %zu bytes\n", old_name_len);
 		return -ENAMETOOLONG;
 	}
-	if (new_name_len > KESTRELFS_RENAME_NAME_MAX) {
+	if (new_name_len > KESTRELFS_RENAME_DATA_NAME_MAX) {
 		pr_warn("kestrelfs: rename new_name too long: %zu bytes\n", new_name_len);
 		return -ENAMETOOLONG;
 	}
+	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
+		return -ENAMETOOLONG;
 
-	/* Build request:
-	 * old_parent(u64@0) + new_parent(u64@8) + old_name_len(u8@16) + new_name_len(u8@17)
-	 * + old_name(7@18) + new_name(7@25)
-	 */
-	req.opcode = KESTRELFS_OP_RENAME;
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock;
+	}
+
+	/* The lock remains held until the response transfers buffer ownership back. */
+	memcpy(&region->data_buffer[0], old_name, old_name_len);
+	memcpy(&region->data_buffer[old_name_len], new_name, new_name_len);
+
+	/* Build the fixed-size header; names live contiguously in data_buffer. */
+	req.opcode = KESTRELFS_OP_RENAME_DATA;
 	req.req_id = 0;
-	memcpy(&req.payload[0], &old_parent_ino, sizeof(u64));
-	memcpy(&req.payload[8], &new_parent_ino, sizeof(u64));
-	req.payload[16] = (u8)old_name_len;
-	req.payload[17] = (u8)new_name_len;
-	memcpy(&req.payload[18], old_name, old_name_len);
-	memcpy(&req.payload[25], new_name, new_name_len);
+	put_unaligned_le64(old_parent_ino, &req.payload[0]);
+	put_unaligned_le64(new_parent_ino, &req.payload[8]);
+	put_unaligned_le16((u16)old_name_len, &req.payload[16]);
+	put_unaligned_le16((u16)new_name_len, &req.payload[18]);
 
 	/* Send IPC request */
 	ret = kestrelfs_ipc_sync_call(&req, &resp);
+
+out_unlock:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
 	if (ret) {
 		pr_info("kestrelfs: rename failed: %d\n", ret);
 		return ret;
@@ -424,7 +439,7 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 
 	pr_info("kestrelfs: rename success\n");
 
-	/* Update VFS metadata */
+	/* Update VFS metadata. VFS performs the dentry move after this callback. */
 	if (d_really_is_positive(old_dentry)) {
 		struct inode *inode = d_inode(old_dentry);
 		inode_set_ctime_current(inode);

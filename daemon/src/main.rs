@@ -318,7 +318,16 @@ fn drain_and_respond(
                 event.seq, event.req_id, event.opcode, event.flags
             );
 
-            let response = runtime.block_on(build_response(event, store, object_store));
+            // SAFETY: the ABI places the bounce buffer inside this live
+            // mapping. DATA requests are synchronous and kernel-serialized,
+            // so only the currently drained request may access it.
+            let data_buffer = std::ptr::addr_of_mut!((*dev.region_ptr()).data_buffer).cast::<u8>();
+            let response = runtime.block_on(build_response_with_data(
+                event,
+                store,
+                object_store,
+                data_buffer,
+            ));
 
             // SAFETY: same reasoning as the `drain_requests` call
             // below - `dev.region_ptr()` is valid for the duration of
@@ -353,6 +362,22 @@ fn drain_and_respond(
         if let Err(e) = dev.notify_resp() {
             eprintln!("kestrelfs-daemon: KESTRELFS_IOC_NOTIFY_RESP failed: {e}");
         }
+    }
+}
+
+/// Dispatches opcodes that access the shared bounce buffer, delegating all
+/// legacy/control opcodes to `build_response`.
+async fn build_response_with_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    match event.opcode {
+        abi::OP_WRITE_DATA => handle_write_data(event, store, object_store, data_buffer).await,
+        abi::OP_READ_DATA => handle_read_data(event, store, object_store, data_buffer).await,
+        abi::OP_RENAME_DATA => handle_rename_data(event, store, data_buffer).await,
+        _ => build_response(event, store, object_store).await,
     }
 }
 
@@ -616,7 +641,6 @@ async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
 }
 
 async fn handle_rename(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
-    // Decode request using abi.rs helper
     let req = match event.decode_rename_req() {
         Ok(r) => r,
         Err(e) => {
@@ -625,29 +649,67 @@ async fn handle_rename(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
+    handle_rename_request(event.req_id, "OP_RENAME", req, store).await
+}
+
+async fn handle_rename_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    // SAFETY: the event loop receives the pointer from the live shared mapping.
+    // The kernel keeps kestrelfs_data_ipc_lock held until this response is
+    // consumed, so this request has exclusive ownership of the bounce buffer.
+    let req = match unsafe { event.decode_rename_data_req(data_buffer) } {
+        Ok(req) => req,
+        Err(
+            abi::RenameDataDecodeError::OldNameTooLong(_)
+            | abi::RenameDataDecodeError::NewNameTooLong(_)
+            | abi::RenameDataDecodeError::CombinedNamesTooLong,
+        ) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_RENAME_DATA req_id={} name too long",
+                event.req_id
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::ENAMETOOLONG);
+        }
+        Err(error) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_RENAME_DATA req_id={} malformed: {error}",
+                event.req_id
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    handle_rename_request(event.req_id, "OP_RENAME_DATA", req, store).await
+}
+
+async fn handle_rename_request(
+    req_id: u64,
+    operation: &str,
+    req: abi::RenameReq,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
     println!(
-        "kestrelfs-daemon:    OP_RENAME old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\"",
+        "kestrelfs-daemon:    {operation} old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\"",
         req.old_parent, req.old_name, req.new_parent, req.new_name
     );
 
-    // Call MetaStore::rename
     match store
         .rename(req.old_parent, &req.old_name, req.new_parent, &req.new_name)
         .await
     {
         Ok(()) => {
             println!(
-                "kestrelfs-daemon:    OP_RENAME success: \"{}\" -> \"{}\"",
+                "kestrelfs-daemon:    {operation} success: \"{}\" -> \"{}\"",
                 req.old_name, req.new_name
             );
-            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, req_id)
         }
         Err(e) => {
-            println!(
-                "kestrelfs-daemon:    OP_RENAME error: {:?}",
-                e
-            );
-            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e))
+            println!("kestrelfs-daemon:    {operation} error: {e:?}");
+            KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
 }
@@ -912,19 +974,79 @@ async fn handle_write_chunk(
     object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     let req = event.decode_write_chunk_req();
+    debug_assert_eq!(req.count as usize, req.data.len());
+
+    handle_write_bytes(
+        event.req_id,
+        req.inode_id,
+        req.offset,
+        req.data,
+        "OP_WRITE_CHUNK",
+        store,
+        object_store,
+    )
+    .await
+}
+
+/// Handles ABI v8 `OP_WRITE_DATA`, copying the requested bytes out of the
+/// shared bounce buffer before reusing the legacy write/slice implementation.
+async fn handle_write_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    let req = event.decode_data_req();
+    if req.length as usize > abi::DATA_BUFFER_SIZE {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+
+    let mut data = vec![0u8; req.length as usize];
+    // SAFETY: `data_buffer` points to the mapped ABI bounce buffer and the
+    // validated length is in-bounds. The kernel retains ownership until the
+    // request-ring release publication, which the daemon consumed before
+    // reaching this handler.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data_buffer.cast_const(), data.as_mut_ptr(), data.len());
+    }
+
+    handle_write_bytes(
+        event.req_id,
+        req.inode_id,
+        req.offset,
+        data,
+        "OP_WRITE_DATA",
+        store,
+        object_store,
+    )
+    .await
+}
+
+/// Stores one write as a new COW slice. Both the legacy inline opcode and the
+/// ABI v8 bounce-buffer opcode use this path, preserving MetaStore/ObjectStore
+/// semantics.
+async fn handle_write_bytes(
+    req_id: u64,
+    inode_id: u64,
+    offset: u64,
+    data: Vec<u8>,
+    operation: &str,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
+    let count = data.len() as u32;
 
     // Step 1: Validate inode exists
-    if let Err(e) = store.getattr(req.inode_id).await {
+    if let Err(e) = store.getattr(inode_id).await {
         println!(
-            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> {:?}",
-            req.inode_id, req.offset, req.count, e
+            "kestrelfs-daemon:    {operation} inode={inode_id} offset={offset} count={count} -> {e:?}"
         );
-        return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e));
+        return KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e));
     }
 
     // Step 2: Calculate chunk index and chunk offset
-    let chunk_index = (req.offset / fs_model::CHUNK_SIZE) as u32;
-    let chunk_offset = (req.offset % fs_model::CHUNK_SIZE) as u32;
+    let chunk_index = (offset / fs_model::CHUNK_SIZE) as u32;
+    let chunk_offset = (offset % fs_model::CHUNK_SIZE) as u32;
 
     // Step 3: Create a new slice
     let slice_id = uuid::Uuid::new_v4();
@@ -933,35 +1055,78 @@ async fn handle_write_chunk(
         chunk_index,
         slice_id,
         chunk_offset,
-        length: req.count,
+        length: count,
         written_at,
     };
 
     // Step 4: Store the data block in ObjectStore
     let block_key = slice.block_key(0);
-    if let Err(e) = object_store.put(block_key.clone(), req.data.clone()).await {
+    if let Err(e) = object_store.put(block_key.clone(), data).await {
         eprintln!(
-            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> EIO (ObjectStore::put failed: {:?})",
-            req.inode_id, req.offset, req.count, e
+            "kestrelfs-daemon:    {operation} inode={inode_id} offset={offset} count={count} -> EIO (ObjectStore::put failed: {e:?})"
         );
-        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+        return KestrelfsEvent::error_response(req_id, -libc::EIO);
     }
 
     // Step 5: Append slice to MetaStore (updates size and mtime)
-    if let Err(e) = store.append_slice(req.inode_id, slice).await {
+    if let Err(e) = store.append_slice(inode_id, slice).await {
         eprintln!(
-            "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> EIO (MetaStore::append_slice failed: {:?})",
-            req.inode_id, req.offset, req.count, e
+            "kestrelfs-daemon:    {operation} inode={inode_id} offset={offset} count={count} -> EIO (MetaStore::append_slice failed: {e:?})"
         );
-        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+        return KestrelfsEvent::error_response(req_id, -libc::EIO);
     }
 
     println!(
-        "kestrelfs-daemon:    OP_WRITE_CHUNK inode={} offset={} count={} -> success (slice_id={})",
-        req.inode_id, req.offset, req.count, slice_id
+        "kestrelfs-daemon:    {operation} inode={inode_id} offset={offset} count={count} -> success (slice_id={slice_id})"
     );
 
-    KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+    KestrelfsEvent::zeroed(abi::OP_RESULT_OK, req_id)
+}
+
+/// Handles ABI v8 `OP_READ_DATA`. The existing slice assembly logic fills the
+/// bounce buffer, while RESULT_OK payload[0..4] reports the actual byte count.
+async fn handle_read_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+    data_buffer: *mut u8,
+) -> KestrelfsEvent {
+    let req = event.decode_data_req();
+    if req.length as usize > abi::DATA_BUFFER_SIZE {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+
+    if let Err(e) = store.getattr(req.inode_id).await {
+        return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&e));
+    }
+
+    let data =
+        match read_from_slices(req.inode_id, req.offset, req.length, store, object_store).await {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!(
+                    "kestrelfs-daemon:    OP_READ_DATA inode={} offset={} length={} -> EIO ({e})",
+                    req.inode_id, req.offset, req.length
+                );
+                return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+            }
+        };
+
+    // SAFETY: the request length was validated against the mapped buffer and
+    // `read_from_slices` never returns more than that length. This write is
+    // ordered before response-ring publication by its Release store.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), data_buffer, data.len());
+    }
+
+    let actual = data.len() as u32;
+    let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+    response.payload[0..4].copy_from_slice(&actual.to_le_bytes());
+    println!(
+        "kestrelfs-daemon:    OP_READ_DATA inode={} offset={} length={} -> {} bytes",
+        req.inode_id, req.offset, req.length, actual
+    );
+    response
 }
 
 /// Handles `OP_TRUNCATE` requests: sets file size (truncate/ftruncate).
@@ -1118,7 +1283,10 @@ async fn read_from_slices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta_persist::FileMetaStore;
+    use crate::object_store::LocalFsObjectStore;
     use meta::{MemStore, REMOTE_TXT_INODE};
+    use tempfile::TempDir;
 
     /// Builds a raw `OP_LOOKUP` request event, encoding `(parent_inode,
     /// name)` by hand at the exact wire offsets documented in
@@ -1133,6 +1301,129 @@ mod tests {
         event.payload[8] = name_bytes.len() as u8;
         event.payload[9..9 + name_bytes.len()].copy_from_slice(name_bytes);
         event
+    }
+
+    /// Builds a raw ABI v8 READ_DATA/WRITE_DATA request.
+    fn raw_data_req(
+        opcode: u32,
+        req_id: u64,
+        inode_id: u64,
+        offset: u64,
+        length: u32,
+    ) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(opcode, req_id);
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&length.to_le_bytes());
+        event
+    }
+
+    #[tokio::test]
+    async fn data_opcodes_round_trip_100_and_4096_bytes() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+
+        for (case, length) in [100usize, 4096].into_iter().enumerate() {
+            let inode_id = store
+                .create(
+                    fs_model::ROOT_INODE,
+                    &format!("bulk-{length}.bin"),
+                    fs_model::S_IFREG | 0o644,
+                )
+                .await
+                .expect("create must succeed");
+            let expected: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+            let mut bounce = [0u8; abi::DATA_BUFFER_SIZE];
+            bounce[..length].copy_from_slice(&expected);
+
+            let write = raw_data_req(
+                abi::OP_WRITE_DATA,
+                10_000 + case as u64,
+                inode_id,
+                0,
+                length as u32,
+            );
+            let response =
+                handle_write_data(&write, &store, &object_store, bounce.as_mut_ptr()).await;
+            assert_eq!(response.opcode, abi::OP_RESULT_OK);
+
+            bounce[..length].fill(0);
+            let read = raw_data_req(
+                abi::OP_READ_DATA,
+                20_000 + case as u64,
+                inode_id,
+                0,
+                length as u32,
+            );
+            let response =
+                handle_read_data(&read, &store, &object_store, bounce.as_mut_ptr()).await;
+            assert_eq!(response.opcode, abi::OP_RESULT_OK);
+            assert_eq!(
+                u32::from_le_bytes(response.payload[0..4].try_into().unwrap()),
+                length as u32
+            );
+            assert_eq!(&bounce[..length], expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn data_opcode_round_trip_survives_file_meta_store_reload() {
+        let dir = TempDir::new().unwrap();
+        let meta_path = dir.path().join("meta.json");
+        let expected: Vec<u8> = (0..4096).map(|i| ((i * 7) % 253) as u8).collect();
+        let inode_id;
+
+        {
+            let store: Arc<dyn MetaStore> =
+                Arc::new(FileMetaStore::new(meta_path.clone()).await.unwrap());
+            let object_store: Arc<dyn ObjectStore> =
+                Arc::new(LocalFsObjectStore::new(dir.path()).await.unwrap());
+            inode_id = store
+                .create(
+                    fs_model::ROOT_INODE,
+                    "persistent-bulk.bin",
+                    fs_model::S_IFREG | 0o644,
+                )
+                .await
+                .unwrap();
+            let mut bounce = [0u8; abi::DATA_BUFFER_SIZE];
+            bounce[..expected.len()].copy_from_slice(&expected);
+            let write = raw_data_req(
+                abi::OP_WRITE_DATA,
+                30_000,
+                inode_id,
+                0,
+                expected.len() as u32,
+            );
+            let response =
+                handle_write_data(&write, &store, &object_store, bounce.as_mut_ptr()).await;
+            assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        }
+
+        let store: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(meta_path).await.unwrap());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFsObjectStore::new(dir.path()).await.unwrap());
+        assert_eq!(
+            store
+                .lookup(fs_model::ROOT_INODE, "persistent-bulk.bin")
+                .await
+                .unwrap(),
+            inode_id
+        );
+
+        let mut bounce = [0u8; abi::DATA_BUFFER_SIZE];
+        let read = raw_data_req(
+            abi::OP_READ_DATA,
+            30_001,
+            inode_id,
+            0,
+            expected.len() as u32,
+        );
+        let response = handle_read_data(&read, &store, &object_store, bounce.as_mut_ptr()).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(&bounce[..expected.len()], expected.as_slice());
     }
 
     /// Builds a raw `OP_GETATTR` request event.
@@ -1931,6 +2222,197 @@ mod tests {
         event
     }
 
+    /// Builds an ABI v9 rename request and lays old_name then new_name at the
+    /// front of the shared data bounce buffer.
+    fn raw_rename_data_req(
+        req_id: u64,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
+    ) -> KestrelfsEvent {
+        let old_name = old_name.as_bytes();
+        let new_name = new_name.as_bytes();
+        assert!(old_name.len() <= abi::RENAME_DATA_NAME_MAX);
+        assert!(new_name.len() <= abi::RENAME_DATA_NAME_MAX);
+        assert!(old_name.len() + new_name.len() <= data_buffer.len());
+
+        data_buffer[..old_name.len()].copy_from_slice(old_name);
+        data_buffer[old_name.len()..old_name.len() + new_name.len()]
+            .copy_from_slice(new_name);
+
+        let mut event = KestrelfsEvent::zeroed(abi::OP_RENAME_DATA, req_id);
+        event.payload[0..8].copy_from_slice(&old_parent.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&new_parent.to_le_bytes());
+        event.payload[16..18].copy_from_slice(&(old_name.len() as u16).to_le_bytes());
+        event.payload[18..20].copy_from_slice(&(new_name.len() as u16).to_le_bytes());
+        event
+    }
+
+    #[tokio::test]
+    async fn rename_data_long_name_same_directory() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let source_inode = store
+            .create(fs_model::ROOT_INODE, "source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let long_name = "same-directory-long.txt";
+        assert!(long_name.len() >= 20);
+
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req(
+            700,
+            fs_model::ROOT_INODE,
+            "source",
+            fs_model::ROOT_INODE,
+            long_name,
+            &mut data_buffer,
+        );
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, long_name).await.unwrap(), source_inode);
+        assert!(matches!(
+            store.lookup(fs_model::ROOT_INODE, "source").await,
+            Err(MetaError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_data_long_name_cross_directory() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let old_parent = store
+            .mkdir(fs_model::ROOT_INODE, "old-dir", 0o755)
+            .await
+            .unwrap();
+        let new_parent = store
+            .mkdir(fs_model::ROOT_INODE, "new-dir", 0o755)
+            .await
+            .unwrap();
+        let source_inode = store
+            .create(old_parent, "source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let long_name = "cross-directory-moved";
+
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req(
+            701,
+            old_parent,
+            "source",
+            new_parent,
+            long_name,
+            &mut data_buffer,
+        );
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(store.lookup(new_parent, long_name).await.unwrap(), source_inode);
+        assert!(matches!(
+            store.lookup(old_parent, "source").await,
+            Err(MetaError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_data_accepts_short_and_name_max_names() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let source_inode = store
+            .create(fs_model::ROOT_INODE, "a", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+
+        let short_request = raw_rename_data_req(
+            702,
+            fs_model::ROOT_INODE,
+            "a",
+            fs_model::ROOT_INODE,
+            "b",
+            &mut data_buffer,
+        );
+        let short_response = build_response_with_data(
+            &short_request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(short_response.opcode, abi::OP_RESULT_OK);
+
+        let max_name = "x".repeat(abi::RENAME_DATA_NAME_MAX);
+        let max_request = raw_rename_data_req(
+            703,
+            fs_model::ROOT_INODE,
+            "b",
+            fs_model::ROOT_INODE,
+            &max_name,
+            &mut data_buffer,
+        );
+        let max_response = build_response_with_data(
+            &max_request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+
+        assert_eq!(max_response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, &max_name).await.unwrap(), source_inode);
+    }
+
+    #[tokio::test]
+    async fn rename_data_long_name_survives_file_meta_store_reload() {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_path = temp_dir.path().join("meta.json");
+        let store: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+        let source_inode = store
+            .create(fs_model::ROOT_INODE, "before", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let long_name = "persisted-rename-long";
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req(
+            704,
+            fs_model::ROOT_INODE,
+            "before",
+            fs_model::ROOT_INODE,
+            long_name,
+            &mut data_buffer,
+        );
+
+        let response = handle_rename_data(&request, &store, data_buffer.as_ptr()).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        drop(store);
+
+        let reloaded = FileMetaStore::new(metadata_path).await.unwrap();
+        assert_eq!(reloaded.lookup(fs_model::ROOT_INODE, long_name).await.unwrap(), source_inode);
+        assert!(matches!(
+            reloaded.lookup(fs_model::ROOT_INODE, "before").await,
+            Err(MetaError::NotFound)
+        ));
+    }
+
     #[test]
     fn rename_same_directory() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2057,4 +2539,3 @@ mod tests {
         assert_eq!(rename_resp.error_code, -libc::ENOTEMPTY);
     }
 }
-

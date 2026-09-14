@@ -31,6 +31,7 @@
  *   |   struct kestrelfs_ring_ctrl resp_ctrl          |  (cacheline aligned)
  *   |   struct kestrelfs_event req_slots[N]           |
  *   |   struct kestrelfs_event resp_slots[N]          |
+ *   |   __u8 data_buffer[16384]                        |
  *   +------------------------------------------------+
  *
  * SYNCHRONIZATION / MEMORY ORDERING
@@ -103,6 +104,13 @@
 /* Cacheline size assumed for producer/consumer index isolation. */
 #define KESTRELFS_CACHELINE_SIZE	64
 
+/*
+ * Single shared bounce buffer for ABI v8+ bulk file I/O and ABI v9+ rename
+ * names. Data IPC is synchronous and serialized, so exactly one READ_DATA,
+ * WRITE_DATA, or RENAME_DATA request owns these bytes at a time.
+ */
+#define KESTRELFS_DATA_BUFFER_SIZE	(16 * 1024)
+
 /* ------------------------------------------------------------------
  * Event opcodes
  * ------------------------------------------------------------------ */
@@ -125,6 +133,9 @@
 #define KESTRELFS_OP_MKDIR		8	/* req: create new directory */
 #define KESTRELFS_OP_UNLINK		9	/* req: remove file or directory */
 #define KESTRELFS_OP_RENAME		10	/* req: rename/move file or directory */
+#define KESTRELFS_OP_WRITE_DATA		11	/* req: write bytes from data_buffer */
+#define KESTRELFS_OP_READ_DATA		12	/* req: read bytes into data_buffer */
+#define KESTRELFS_OP_RENAME_DATA	13	/* req: rename using names in data_buffer */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -225,6 +236,32 @@
  * shifted rather than versioned/unioned.
  */
 #define KESTRELFS_READ_CHUNK_MAX_LEN	KESTRELFS_EVENT_PAYLOAD_SIZE
+
+/*
+ * Payload layout for KESTRELFS_OP_WRITE_DATA / KESTRELFS_OP_READ_DATA
+ * -------------------------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust), packed into kestrelfs_event.payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id
+ *   offset  8, 8 bytes, little-endian u64: file_offset
+ *   offset 16, 4 bytes, little-endian u32: length
+ *   offset 20..32: reserved, must be zero
+ *
+ * length MUST be <= KESTRELFS_DATA_BUFFER_SIZE.  WRITE_DATA bytes are placed
+ * in shared_region.data_buffer before the request is published.  READ_DATA
+ * bytes are placed there by the daemon before it publishes RESULT_OK.
+ *
+ * A READ_DATA RESULT_OK response stores the actual byte count as a
+ * little-endian u32 at payload offset 0.  WRITE_DATA uses an empty RESULT_OK.
+ * Data-buffer ownership transfers at the existing request/response ring
+ * release/acquire publication points; the kernel serializes all data IPC so
+ * the buffer needs no independent lock or sequence field.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 8.  READ_CHUNK and WRITE_CHUNK remain in
+ * the ABI for legacy unit/self-tests, but normal regular-file VFS I/O uses the
+ * DATA opcodes.
+ */
 
 /*
  * Payload layout for KESTRELFS_OP_LOOKUP requests/responses
@@ -456,6 +493,31 @@
  */
 #define KESTRELFS_RENAME_NAME_MAX	7
 
+/*
+ * Payload layout for KESTRELFS_OP_RENAME_DATA requests
+ * -----------------------------------------------------
+ *
+ * REQUEST (kernel -> Rust), packed into kestrelfs_event.payload:
+ *
+ *   offset  0, 8 bytes, little-endian u64: old_parent_inode_id.
+ *   offset  8, 8 bytes, little-endian u64: new_parent_inode_id.
+ *   offset 16, 2 bytes, little-endian u16: old_name_len.
+ *   offset 18, 2 bytes, little-endian u16: new_name_len.
+ *   offset 20..32: reserved, must be zero.
+ *
+ * The first old_name_len bytes of shared_region.data_buffer hold old_name;
+ * the following new_name_len bytes hold new_name. Neither is NUL-terminated.
+ * Each name is limited to POSIX NAME_MAX (255 bytes), and their combined
+ * length MUST fit in KESTRELFS_DATA_BUFFER_SIZE. Request flags MUST be zero.
+ *
+ * RESPONSE and rename semantics are identical to legacy KESTRELFS_OP_RENAME.
+ * The legacy opcode remains in ABI v9 for compatibility tests; normal VFS
+ * rename uses RENAME_DATA.
+ *
+ * Introduced in KESTRELFS_ABI_VERSION 9.
+ */
+#define KESTRELFS_RENAME_DATA_NAME_MAX	255
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -593,8 +655,16 @@ struct kestrelfs_ring_ctrl {
  *   7 - Phase 3 step 10: Added KESTRELFS_OP_RENAME (opcode 10). Supports
  *       atomic rename/move with POSIX semantics. Names limited to 7 bytes
  *       each to fit within 32-byte payload.
+ *
+ *   8 - Phase 3 step 11: Added a 16 KiB data bounce buffer after both rings,
+ *       plus KESTRELFS_OP_WRITE_DATA (opcode 11) and
+ *       KESTRELFS_OP_READ_DATA (opcode 12).
+ *
+ *   9 - Phase 3 step 12: Added KESTRELFS_OP_RENAME_DATA (opcode 13). Old and
+ *       new names are concatenated in the bounce buffer and may each be up
+ *       to 255 bytes. Legacy KESTRELFS_OP_RENAME remains available.
  */
-#define KESTRELFS_ABI_VERSION		7
+#define KESTRELFS_ABI_VERSION		9
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -607,6 +677,8 @@ struct kestrelfs_ring_ctrl {
  * @resp_ctrl:    head/tail for the Rust->kernel response ring.
  * @req_slots:    fixed-size array of request event slots.
  * @resp_slots:   fixed-size array of response event slots.
+ * @data_buffer:  serialized 16 KiB bounce buffer for READ_DATA, WRITE_DATA,
+ *                and RENAME_DATA.
  *
  * This whole struct is what gets mmap()-ed by the Rust daemon over
  * the /dev/kestrel_ctl char device. Its total size
@@ -624,6 +696,7 @@ struct kestrelfs_shared_region {
 
 	struct kestrelfs_event		req_slots[KESTRELFS_RING_SLOTS];
 	struct kestrelfs_event		resp_slots[KESTRELFS_RING_SLOTS];
+	__u8				data_buffer[KESTRELFS_DATA_BUFFER_SIZE];
 };
 
 #define KESTRELFS_SHM_MAGIC		0x4B535253u	/* "KSRS" */
@@ -680,8 +753,28 @@ _Static_assert(sizeof(struct kestrelfs_ring_ctrl) == KESTRELFS_CACHELINE_SIZE,
 _Static_assert(sizeof(struct kestrelfs_shared_region) ==
 		KESTRELFS_CACHELINE_SIZE +
 		(2 * KESTRELFS_CACHELINE_SIZE) +
-		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)),
+		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)) +
+		KESTRELFS_DATA_BUFFER_SIZE,
 		"kestrelfs_shared_region layout drifted, check padding");
+
+_Static_assert(__builtin_offsetof(struct kestrelfs_shared_region, data_buffer) ==
+		KESTRELFS_CACHELINE_SIZE +
+		(2 * KESTRELFS_CACHELINE_SIZE) +
+		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)),
+		"data_buffer must immediately follow both rings");
+
+_Static_assert(KESTRELFS_DATA_BUFFER_SIZE <= (__u32)-1,
+		"KESTRELFS_DATA_BUFFER_SIZE must fit in the DATA opcode u32 length");
+
+_Static_assert(8 + 8 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"READ_DATA/WRITE_DATA request fields overflow the event payload");
+
+_Static_assert(8 + 8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"RENAME_DATA request fields overflow the event payload");
+
+_Static_assert(2 * KESTRELFS_RENAME_DATA_NAME_MAX <=
+		KESTRELFS_DATA_BUFFER_SIZE,
+		"two maximum-length rename names must fit in data_buffer");
 
 /*
  * KESTRELFS_OP_LOOKUP request payload: 8 bytes (parent_inode) + 1

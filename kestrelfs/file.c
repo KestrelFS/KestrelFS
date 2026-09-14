@@ -33,8 +33,15 @@
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
 
 #include "kestrelfs.h"
+
+/* One shared bounce buffer means at most one bulk data IPC may be in flight. */
+DEFINE_MUTEX(kestrelfs_data_ipc_lock);
+
+/* Must mirror daemon/src/fs_model.rs::CHUNK_SIZE for write slicing. */
+#define KESTRELFS_MODEL_CHUNK_SIZE	(64ULL * 1024 * 1024)
 
 /*
  * kestrelfs_ipc_sync_call() - unified IPC helper with total deadline.
@@ -290,17 +297,8 @@ const struct file_operations kestrelfs_remote_file_ops = {
 /*
  * kestrelfs_writable_read() - fops->read for writable.dat (inode 4).
  *
- * Similar to kestrelfs_remote_read, but uses i_size_read() instead of
- * KESTRELFS_REMOTE_FILE_SIZE. This allows writable.dat to have a dynamic
- * size that can be changed via write/truncate operations.
- *
- * Steps:
- *   0. Read current file size from inode->i_size (respects truncate)
- *   1. If *ppos >= i_size, return 0 (EOF)
- *   2. Clamp count to min(requested, 32, remaining_bytes_to_eof)
- *   3. Send READ_CHUNK IPC request to daemon
- *   4. Wait for response and copy data to userspace
- *   5. Advance *ppos and return bytes read
+ * Uses ABI v8 READ_DATA requests and loops in 16 KiB bounce-buffer chunks,
+ * allowing one read(2) to return the caller's full requested range.
  *
  * Return: bytes read on success, 0 at EOF, negative errno on error.
  */
@@ -308,56 +306,76 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 					size_t count, loff_t *ppos)
 {
 	struct inode *inode = file->f_inode;
-	struct kestrelfs_event resp;
-	u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE];
-	u64 req_id, file_size;
-	u32 clamped_count;
+	struct kestrelfs_shared_region *region;
+	loff_t file_size;
+	size_t done = 0;
 	int ret;
-
-	/* Get current file size (respects truncate) */
-	file_size = i_size_read(inode);
-
-	/* EOF check */
-	if (*ppos >= file_size)
-		return 0;
 
 	if (count == 0)
 		return 0;
+	if (*ppos < 0)
+		return -EINVAL;
 
-	/* Clamp to (requested, max_chunk_size, bytes_remaining_to_eof) */
-	clamped_count = (u32)min3((u64)count, (u64)KESTRELFS_READ_CHUNK_MAX_LEN,
-				   file_size - *ppos);
-
-	/* Build READ_CHUNK request */
-	memset(payload, 0, sizeof(payload));
-	put_unaligned_le64((u64)inode->i_ino, &payload[0]);
-	put_unaligned_le64((u64)*ppos, &payload[8]);
-	put_unaligned_le32(clamped_count, &payload[16]);
-
-	ret = kestrelfs_req_push(KESTRELFS_OP_READ_CHUNK, 0, payload, &req_id);
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)
 		return ret;
 
-	/* Wait for response */
-	for (;;) {
-		ret = kestrelfs_check_resp(req_id, &resp);
-		if (ret == 0)
-			break;
-
-		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS));
-		if (ret == -ERESTARTSYS)
-			return -EINTR;
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock;
 	}
 
-	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
-		return resp.error_code < 0 ? resp.error_code : -EIO;
+	file_size = i_size_read(inode);
+	while (done < count && *ppos < file_size) {
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+		size_t chunk = min_t(size_t, count - done,
+					 KESTRELFS_DATA_BUFFER_SIZE);
+		u32 actual, requested;
 
-	/* Copy data to userspace */
-	if (copy_to_user(buf, resp.payload, clamped_count))
-		return -EFAULT;
+		chunk = min_t(u64, chunk, (u64)(file_size - *ppos));
+		requested = (u32)chunk;
+		req.opcode = KESTRELFS_OP_READ_DATA;
+		put_unaligned_le64((u64)inode->i_ino, &req.payload[0]);
+		put_unaligned_le64((u64)*ppos, &req.payload[8]);
+		put_unaligned_le32(requested, &req.payload[16]);
 
-	*ppos += clamped_count;
-	return clamped_count;
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
+		if (ret)
+			goto out_unlock;
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
+			ret = resp.error_code < 0 ? resp.error_code : -EIO;
+			goto out_unlock;
+		}
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK) {
+			ret = -EPROTO;
+			goto out_unlock;
+		}
+
+		actual = get_unaligned_le32(&resp.payload[0]);
+		if (actual > requested || actual > KESTRELFS_DATA_BUFFER_SIZE) {
+			ret = -EPROTO;
+			goto out_unlock;
+		}
+		if (actual == 0)
+			break;
+		if (copy_to_user(buf + done, region->data_buffer, actual)) {
+			ret = -EFAULT;
+			goto out_unlock;
+		}
+
+		done += actual;
+		*ppos += actual;
+		if (actual < chunk)
+			break;
+	}
+
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	return done ? (ssize_t)done : ret;
 }
 
 /*
@@ -375,11 +393,9 @@ static loff_t kestrelfs_writable_llseek(struct file *file, loff_t offset,
 /*
  * kestrelfs_writable_write() - handle write(2) on writable.dat.
  *
- * Sends a WRITE_CHUNK IPC request to the daemon with:
- * - inode_id (u64) = file's inode number
- * - offset (u64) = *ppos (adjusted for O_APPEND if needed)
- * - count (u32) = min(len, 12) (limited by IPC payload size)
- * - data (up to 12 bytes)
+ * Sends ABI v8 WRITE_DATA requests in 16 KiB bounce-buffer chunks. One
+ * write(2) therefore completes a large buffer without relying on repeated
+ * VFS short writes.
  *
  * O_APPEND handling: Unlike write_iter-based paths, when a filesystem
  * implements f_op->write directly, the VFS vfs_write() does NOT call
@@ -393,71 +409,74 @@ static loff_t kestrelfs_writable_llseek(struct file *file, loff_t offset,
 static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *buf,
 					 size_t len, loff_t *ppos)
 {
-	struct kestrelfs_event resp;
-	u8 payload[KESTRELFS_EVENT_PAYLOAD_SIZE];
-	unsigned long deadline;
-	u64 req_id;
-	size_t write_len;
+	struct kestrelfs_shared_region *region;
+	size_t done = 0;
 	int ret;
 
 	if (len == 0)
 		return 0;
+	if (*ppos < 0)
+		return -EINVAL;
+
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock;
+	}
 
 	/* Handle O_APPEND: VFS does not automatically seek to EOF for us
 	 * when using f_op->write (only for write_iter). */
 	if (filp->f_flags & O_APPEND)
 		*ppos = i_size_read(filp->f_inode);
 
-	/* Clamp to max 12 bytes per IPC call */
-	write_len = min_t(size_t, len, 12);
+	while (done < len) {
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+		size_t chunk = min_t(size_t, len - done,
+					 KESTRELFS_DATA_BUFFER_SIZE);
+		u64 chunk_boundary = KESTRELFS_MODEL_CHUNK_SIZE -
+			((u64)*ppos % KESTRELFS_MODEL_CHUNK_SIZE);
 
-	/* Build payload: inode_id@0, offset@8, count@16, data@20 */
-	memset(payload, 0, sizeof(payload));
-	put_unaligned_le64((u64)filp->f_inode->i_ino, &payload[0]);
-	put_unaligned_le64((u64)*ppos, &payload[8]);
-	put_unaligned_le32(write_len, &payload[16]);
+		/* A daemon Slice belongs to exactly one 64 MiB logical chunk. */
+		chunk = min_t(u64, chunk, chunk_boundary);
 
-	/* Copy user data to payload */
-	if (copy_from_user(&payload[20], buf, write_len))
-		return -EFAULT;
+		if (copy_from_user(region->data_buffer, buf + done, chunk)) {
+			ret = -EFAULT;
+			goto out_unlock;
+		}
 
-	ret = kestrelfs_req_push(KESTRELFS_OP_WRITE_CHUNK, 0, payload, &req_id);
-	if (ret)
-		return ret;
+		req.opcode = KESTRELFS_OP_WRITE_DATA;
+		put_unaligned_le64((u64)filp->f_inode->i_ino, &req.payload[0]);
+		put_unaligned_le64((u64)*ppos, &req.payload[8]);
+		put_unaligned_le32((u32)chunk, &req.payload[16]);
 
-	deadline = jiffies + msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS);
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
+		if (ret)
+			goto out_unlock;
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
+			ret = resp.error_code < 0 ? resp.error_code : -EIO;
+			goto out_unlock;
+		}
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK) {
+			ret = -EPROTO;
+			goto out_unlock;
+		}
 
-	for (;;) {
-		ret = kestrelfs_check_resp(req_id, &resp);
-		if (ret == 0)
-			break;
-
-		if (time_after_eq(jiffies, deadline))
-			return -ETIMEDOUT;
-
-		ret = kestrelfs_wait_for_resp(msecs_to_jiffies(KESTRELFS_REMOTE_WAIT_MS));
-		if (ret == -ERESTARTSYS)
-			return -EINTR;
+		done += chunk;
+		*ppos += chunk;
+		if (*ppos > i_size_read(filp->f_inode))
+			i_size_write(filp->f_inode, *ppos);
 	}
 
-	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
-		return resp.error_code < 0 ? resp.error_code : -EIO;
+	ret = 0;
 
-	/* Daemon succeeded: update file position */
-	*ppos += write_len;
-
-	/* Update i_size if write extended the file.
-	 * This ensures stat() reflects the new size after write.
-	 * 
-	 * DO NOT mark_inode_dirty(): daemon is the authoritative metadata store.
-	 * Marking dirty would cause umount to call .write_inode (which we don't
-	 * implement), leading to "busy inodes after umount" warnings or hangs.
-	 */
-	if (*ppos > i_size_read(filp->f_inode)) {
-		i_size_write(filp->f_inode, *ppos);
-	}
-
-	return write_len;
+out_unlock:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	return done ? (ssize_t)done : ret;
 }
 
 const struct file_operations kestrelfs_writable_file_ops = {

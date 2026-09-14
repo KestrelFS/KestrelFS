@@ -15,6 +15,7 @@
 
 #include <linux/fs.h>
 #include <linux/magic.h>
+#include <linux/mutex.h>
 
 #include "kestrelfs_ipc.h"
 
@@ -83,6 +84,9 @@ struct kestrelfs_shared_region *kestrelfs_shm_region(void);
 void kestrelfs_wake_req_waiters(void);
 long kestrelfs_wait_for_resp(long timeout_jiffies);
 int kestrelfs_is_daemon_alive(void);
+
+/* Serializes every request that owns the single shared data bounce buffer. */
+extern struct mutex kestrelfs_data_ipc_lock;
 
 /*
  * ipc_ring.c: lock-free-consumer ring buffer push/pop primitives.
