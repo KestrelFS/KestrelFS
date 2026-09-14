@@ -60,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；工作树 v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22 将完整、对齐且 LBA 连续的 hit 合并成最多 128 KiB BIO，直接写入 pinned user pages；partial/unaligned 情形保留 Step 20 buffered-copy fallback。Step 23 以运行期 block-LRU 回收满盘 slot。Step 24 给每个 4 KiB data block 和 32-byte index entry 持久化 CRC32。Step 25 在 superblock 后增加单页 intent journal，fill/invalidate/evict/坏块退休先写 PREPARED，提交后清零；恢复合法半提交事务时清空受影响 slot 并安全 miss，torn journal 则拒绝加载。尚无双 superblock、异步 DMA pipeline 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22 将完整、对齐且 LBA 连续的 hit 合并成最多 128 KiB BIO，直接写入 pinned user pages；partial/unaligned 情形保留 Step 20 buffered-copy fallback。Step 23 以运行期 block-LRU 回收满盘 slot。Step 24 给每个 4 KiB data block 和 32-byte index entry 持久化 CRC32。Step 25 在 superblock 后增加单页 intent journal，fill/invalidate/evict/坏块退休先写 PREPARED，提交后清零；恢复合法半提交事务时清空受影响 slot 并安全 miss，torn journal 则拒绝加载。尚无双 superblock、异步 DMA pipeline 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
