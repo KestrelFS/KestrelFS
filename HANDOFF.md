@@ -649,11 +649,31 @@ sudo rmmod kestrelfs
 | 1 | **等待 Cursor 的 Step 20 提示词** | 持久化索引 + fill-on-miss / 失效；仍可不做完整 DMA hit |
 | 2 | Phase 4 后续：命中路径 | 真正从 cache device 服务 read hit |
 | 3 | 分布式后端生产化 | Redis 拆 key、GC 重试等（须 Cursor 明示） |
-| 2 | Phase 4 后续：命中路径与填充 | index entry 恢复/持久化、fill-on-miss、失效、真正 data block I/O |
-| 3 | 分布式后端生产化 | Redis 拆 key、GC 重试、配置治理（与 Phase 4 可并行但须 Cursor 明示） |
 
-> **⚠️ 明确**：Step 19 不实现完整 DMA/direct I/O hit；在 Cursor 验收并下达
-> 后续提示词前，不继续扩大 Phase 4，也不自行改做分布式生产化。
+> **⚠️ 明确**：在 Cursor 新提示词下达前，不继续扩大 Phase 4 hit/DMA，也不自行改做分布式生产化。
+
+### Codex 自动验证与权限（无交互密码）
+
+**硬门槛是 `insmod`/`rmmod`（需要 root），不是 zvol 的用户态 ACL。**
+模块加载后由内核以 root 打开 `cache_device`，因此把用户加入 `disk` 组或 chmod zvol
+**不能**单独替代 sudo。
+
+推荐两层策略：
+
+1. **默认（无需宿主机 sudo）**：继续用 `vng` + loop 块设备跑 `test-step19-cache-vng.sh` /
+   GC 回归。guest 内已是 root，不询问宿主机 sudo 密码。
+2. **宿主机 zvol（可选）**：人类一次性配置 passwordless sudo 后，Codex 才跑
+   `cache_device=/dev/zvol/nvraid1tank1/kestrel-cache` 的宿主机验证。示例
+   `/etc/sudoers.d/kestrelfs-codex`（用 `visudo -f` 安装）：
+
+```text
+roots ALL=(root) NOPASSWD: /sbin/insmod, /usr/sbin/insmod, /sbin/rmmod, /usr/sbin/rmmod
+roots ALL=(root) NOPASSWD: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umount
+roots ALL=(root) NOPASSWD: /sbin/losetup, /usr/sbin/losetup
+```
+
+验证：`sudo -n true` 与 `sudo -n /sbin/insmod ...` 应无需密码。未配置前，Codex
+**不得**阻塞在交互式 sudo；应报告「zvol 宿主机测跳过，vng/loop 已通过」。
 
 ---
 
