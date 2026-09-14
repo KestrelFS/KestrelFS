@@ -672,8 +672,19 @@ roots ALL=(root) NOPASSWD: /bin/mount, /usr/bin/mount, /bin/umount, /usr/bin/umo
 roots ALL=(root) NOPASSWD: /sbin/losetup, /usr/sbin/losetup
 ```
 
-验证：`sudo -n true` 与 `sudo -n /sbin/insmod ...` 应无需密码。未配置前，Codex
-**不得**阻塞在交互式 sudo；应报告「zvol 宿主机测跳过，vng/loop 已通过」。
+验证：对允许的命令使用 `sudo -n`（注意：`sudo -n true` 会失败，因为 `true` 不在白名单）。
+例如：`sudo -n /sbin/insmod ...` / `sudo -n /sbin/rmmod kestrelfs`。
+
+**当前状态（2026-09-14）**：宿主机已配置 NOPASSWD；开发 zvol
+`/dev/zvol/nvraid1tank1/kestrel-cache` 已按 **4K volblocksize** 重建并可成功
+`insmod cache_device=...`（物理扇区 4096；原先 8K volblocksize 会被 Step 19 几何校验拒绝）。
+
+Codex 策略：
+1. **必须**继续跑 vng + loop 回归（不依赖宿主机 sudo）。
+2. **必须**在 `sudo -n /sbin/insmod` 可用时，额外跑一遍宿主机 zvol 验证（format/reload 或本步新脚本）。
+3. 若 `sudo -n /sbin/insmod` 失败：跳过 zvol 并写明原因，**禁止**交互式 sudo。
+4. sudoers 里若仍有旧路径 `/home/roots/work/code/FerroFS/.../kestrelfs-daemon`，人类应补上
+   `/home/roots/work/code/KestrelFS/daemon/target/release/kestrelfs-daemon`。
 
 ---
 
