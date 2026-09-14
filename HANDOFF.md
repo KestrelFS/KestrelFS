@@ -440,11 +440,8 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 16 提示词** | 候选：RedisMetaStore 原型；S3 ObjectStore 可其后 |
+| 1 | **等待 Cursor 的 Step 16 提示词** | 默认候选：RedisMetaStore 原型；S3 可其后 |
 | 2 | Redis MetaStore + S3 ObjectStore | 分布式控制面 |
-| 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe |
-
-| 2 | Redis MetaStore + S3 ObjectStore | 本地 POSIX 子集已较完整后启动 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
 > **⚠️ 明确**：在 Cursor 新提示词下达前，Codex **不要**自行开始 Redis/S3/Phase 4 等任何方向。只做 Cursor 提示词范围内的事。
