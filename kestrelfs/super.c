@@ -49,7 +49,7 @@ static int __init kestrelfs_init(void)
 
 	kestrelfs_ipc_ring_init();
 
-	pr_info("kestrelfs: module loaded, filesystem + chardev + cache skeleton registered\n");
+	pr_info("kestrelfs: module loaded, filesystem + chardev + persistent cache registered\n");
 	return 0;
 
 err_cache:
@@ -83,5 +83,5 @@ module_exit(kestrelfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KestrelFS Project");
-MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and NVMe cache format skeleton");
-MODULE_VERSION("0.4.0-step19");
+MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and persistent block cache");
+MODULE_VERSION("0.4.0-step20");

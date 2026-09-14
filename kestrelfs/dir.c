@@ -442,6 +442,11 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 		pr_warn("kestrelfs: unlink name too long: %zu bytes\n", name_len);
 		return -ENAMETOOLONG;
 	}
+	if (d_really_is_positive(dentry)) {
+		ret = kestrelfs_cache_invalidate_inode(d_inode(dentry)->i_ino);
+		if (ret)
+			return ret;
+	}
 
 	ret = kestrelfs_name_data_call(KESTRELFS_OP_UNLINK_DATA,
 				      parent_ino, 0, name, name_len, &resp);
@@ -525,6 +530,12 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	}
 	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
 		return -ENAMETOOLONG;
+	/* An atomic replacement must make the overwritten inode uncacheable first. */
+	if (d_really_is_positive(new_dentry)) {
+		ret = kestrelfs_cache_invalidate_inode(d_inode(new_dentry)->i_ino);
+		if (ret)
+			return ret;
+	}
 
 	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)

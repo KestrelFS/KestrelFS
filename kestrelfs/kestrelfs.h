@@ -36,7 +36,7 @@
  */
 #define KESTRELFS_REMOTE_FILE_SIZE	(16 * KESTRELFS_READ_CHUNK_MAX_LEN)
 
-/* cache.c: Phase 4 kernel-owned block-device cache format/index skeleton. */
+/* cache.c: Phase 4 kernel-owned persistent block-device cache. */
 int kestrelfs_cache_init(void);
 void kestrelfs_cache_exit(void);
 
@@ -46,7 +46,10 @@ void kestrelfs_cache_exit(void);
  * caller to use the existing daemon READ_DATA path.
  */
 ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
-			       size_t count, loff_t *ppos);
+			       size_t count, loff_t *ppos, u64 *miss_epoch);
+void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
+			  size_t length, u64 miss_epoch);
+int kestrelfs_cache_invalidate_inode(u64 inode_id);
 
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;

@@ -310,6 +310,7 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 	loff_t file_size;
 	size_t done = 0;
 	ssize_t cache_ret;
+	u64 miss_epoch;
 	int ret;
 
 	if (count == 0)
@@ -320,10 +321,11 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 	/*
 	 * Phase 4 fast-path hook.  It deliberately runs before the bounce-buffer
 	 * mutex: a future cache hit must not serialize with daemon IPC.  The Step
-	 * 19 index skeleton still reports -ENODATA, so every read follows the
-	 * ABI v11 READ_DATA path below.
+	 * 20 cache serves a request only when its complete range is indexed;
+	 * otherwise READ_DATA remains the authoritative miss path.
 	 */
-	cache_ret = kestrelfs_cache_lookup(inode, buf, count, ppos);
+	cache_ret = kestrelfs_cache_lookup(inode, buf, count, ppos,
+					   &miss_epoch);
 	if (cache_ret != -ENODATA)
 		return cache_ret;
 
@@ -375,6 +377,8 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 			ret = -EFAULT;
 			goto out_unlock;
 		}
+		kestrelfs_cache_fill(inode, (u64)*ppos, region->data_buffer,
+				       actual, miss_epoch);
 
 		done += actual;
 		*ppos += actual;
@@ -428,6 +432,10 @@ static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *bu
 		return 0;
 	if (*ppos < 0)
 		return -EINVAL;
+	/* Persist invalidation before the authoritative write is committed. */
+	ret = kestrelfs_cache_invalidate_inode(filp->f_inode->i_ino);
+	if (ret)
+		return ret;
 
 	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)
@@ -532,6 +540,11 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 		u64 new_size = attr->ia_size;
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
+
+		/* Fail the mutation if its persistent invalidation cannot commit. */
+		ret = kestrelfs_cache_invalidate_inode(inode_id);
+		if (ret)
+			return ret;
 
 		/* Build KESTRELFS_OP_TRUNCATE request payload:
 		 * inode_id@0 (u64), new_size@8 (u64) */
