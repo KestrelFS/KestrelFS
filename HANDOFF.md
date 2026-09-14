@@ -681,12 +681,14 @@ entry 并在 daemon 停止时正确命中；最终输出 `STEP21_NAMESPACE_PASS`
 guest + loop，不得改成物理机 cache_device：
 
 ```bash
-cache_namespace=$(printf '%s' \
-  'v1;meta=file:/tmp/kestrelfs-debug/meta.json;objects=local:/tmp/kestrelfs-debug' \
-  | sha256sum | awk '{print $1}')
+data_dir=/tmp/kestrelfs-step21-demo
+mkdir -p "$data_dir"
+cache_namespace=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
+  "$data_dir" "$data_dir" | sha256sum | awk '{print $1}')
 insmod kestrelfs/kestrelfs.ko cache_device=/dev/loop0 cache_size_mib=64 \
   cache_namespace="$cache_namespace"
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 ```
 
 ---
