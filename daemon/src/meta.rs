@@ -36,7 +36,7 @@
 //! scaffolding rather than genuinely dead code - both are exercised
 //! by this module's own unit tests (`cargo test`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -205,11 +205,12 @@ pub trait MetaStore: Send + Sync {
     /// - If `new_size < current_size`, the file is shrunk (logically).
     /// - If `new_size > current_size`, the file is extended with zeros.
     ///
-    /// Historical slices beyond `new_size` MAY be retained (lazy GC), but
-    /// read operations MUST respect the new size (clamp to [0, new_size)).
+    /// Slices wholly beyond the retained EOF are removed; a crossing slice is
+    /// shortened so later extension cannot expose discarded bytes. Returns
+    /// block keys confirmed unreferenced after the mutation.
     ///
     /// Returns [`MetaError::NotFound`] if `inode` does not exist.
-    async fn truncate(&self, inode: u64, new_size: u64) -> Result<()>;
+    async fn truncate(&self, inode: u64, new_size: u64) -> Result<Vec<String>>;
 
     /// Lists directory entries for the given directory inode.
     ///
@@ -244,7 +245,8 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotFound`] if `parent` does not exist or `name` not found.
     /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
     /// - [`MetaError::InvalidName`] if attempting to unlink "." or "..".
-    async fn unlink(&self, parent: u64, name: &str) -> Result<()>;
+    /// Returns block keys confirmed unreferenced after removal.
+    async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>>;
 
     /// Renames/moves a file or directory from `(old_parent, old_name)` to `(new_parent, new_name)`.
     ///
@@ -262,13 +264,14 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotEmpty`] if target is a non-empty directory
     ///
     /// Implementation must prevent renaming a directory into its own subtree.
+    /// On replacement, returns block keys confirmed unreferenced afterward.
     async fn rename(
         &self,
         old_parent: u64,
         old_name: &str,
         new_parent: u64,
         new_name: &str,
-    ) -> Result<()>;
+    ) -> Result<Vec<String>>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -333,6 +336,35 @@ pub(crate) struct MemStoreInner {
     pub(crate) slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
     /// Symbolic-link inode id -> uninterpreted UTF-8 target string.
     pub(crate) symlink_targets: HashMap<u64, String>,
+}
+
+fn slice_block_keys<'a>(slices: impl Iterator<Item = &'a Slice>) -> HashSet<String> {
+    slices
+        .flat_map(|slice| (0..slice.block_count()).map(|index| slice.block_key(index)))
+        .collect()
+}
+
+fn referenced_block_keys(inner: &MemStoreInner) -> HashSet<String> {
+    slice_block_keys(
+        inner
+            .slices
+            .values()
+            .flat_map(|chunks| chunks.values())
+            .flat_map(|slices| slices.iter()),
+    )
+}
+
+/// Filters mutation candidates against every slice that remains in metadata.
+/// This deliberately tolerates duplicate/shared slice ids: a key is returned
+/// only when no surviving slice references it.
+fn confirmed_garbage_keys(
+    inner: &MemStoreInner,
+    candidates: HashSet<String>,
+) -> Vec<String> {
+    let referenced = referenced_block_keys(inner);
+    let mut garbage: Vec<_> = candidates.difference(&referenced).cloned().collect();
+    garbage.sort();
+    garbage
 }
 
 /// Fixed inode id for the bootstrap `remote.txt` entry seeded by
@@ -666,23 +698,48 @@ impl MetaStore for MemStore {
         Ok(())
     }
 
-    async fn truncate(&self, inode: u64, new_size: u64) -> Result<()> {
+    async fn truncate(&self, inode: u64, new_size: u64) -> Result<Vec<String>> {
         let mut inner = self.inner.write().await;
 
-        // Check inode exists
+        let old_size = inner
+            .inodes
+            .get(&inode)
+            .ok_or(MetaError::NotFound)?
+            .size;
+        let candidates = inner
+            .slices
+            .get(&inode)
+            .map(|chunks| {
+                slice_block_keys(chunks.values().flat_map(|slices| slices.iter()))
+            })
+            .unwrap_or_default();
+
+        // Data above the old EOF is never logically valid, including when an
+        // older daemon retained stale slices and this call extends the file.
+        let retained_size = old_size.min(new_size);
+        if let Some(chunks) = inner.slices.get_mut(&inode) {
+            chunks.retain(|_, slices| {
+                slices.retain_mut(|slice| {
+                    let start = slice.chunk_index as u64 * crate::fs_model::CHUNK_SIZE
+                        + slice.chunk_offset as u64;
+                    if start >= retained_size {
+                        return false;
+                    }
+                    let retained_len = retained_size - start;
+                    if slice.length as u64 > retained_len {
+                        slice.length = retained_len as u32;
+                    }
+                    slice.length != 0
+                });
+                !slices.is_empty()
+            });
+        }
+
         let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
-
-        // Update size unconditionally (can shrink or grow)
         inode_meta.size = new_size;
-
-        // Update mtime
         inode_meta.mtime = current_unix_time();
 
-        // Note: We do NOT delete slices beyond new_size here (lazy GC).
-        // The read path (read_from_slices in main.rs) MUST respect the
-        // inode's size limit and clamp reads to [0, size).
-
-        Ok(())
+        Ok(confirmed_garbage_keys(&inner, candidates))
     }
 
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
@@ -760,7 +817,7 @@ impl MetaStore for MemStore {
         Ok(new_inode_id)
     }
 
-    async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+    async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
         // Validate name
         if name.is_empty() || name == "." || name == ".." {
             return Err(MetaError::InvalidName(format!("invalid name: {}", name)));
@@ -807,10 +864,16 @@ impl MetaStore for MemStore {
         inner.inodes.remove(&child_inode_id);
 
         // Remove any slices associated with this inode (for files)
-        inner.slices.remove(&child_inode_id);
+        let candidates = inner
+            .slices
+            .remove(&child_inode_id)
+            .map(|chunks| {
+                slice_block_keys(chunks.values().flat_map(|slices| slices.iter()))
+            })
+            .unwrap_or_default();
         inner.symlink_targets.remove(&child_inode_id);
 
-        Ok(())
+        Ok(confirmed_garbage_keys(&inner, candidates))
     }
 
     async fn rename(
@@ -819,7 +882,7 @@ impl MetaStore for MemStore {
         old_name: &str,
         new_parent: u64,
         new_name: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         // Validate names
         if old_name.is_empty() || old_name == "." || old_name == ".." {
             return Err(MetaError::InvalidName(format!("invalid old_name: {}", old_name)));
@@ -848,6 +911,10 @@ impl MetaStore for MemStore {
             .get(&old_parent)
             .and_then(|entries| entries.get(old_name).copied())
             .ok_or(MetaError::NotFound)?;
+
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(Vec::new());
+        }
 
         let source_inode = inner
             .inodes
@@ -889,6 +956,7 @@ impl MetaStore for MemStore {
             .get(&new_parent)
             .and_then(|entries| entries.get(new_name).copied());
 
+        let mut candidates = HashSet::new();
         if let Some(target_inode_id) = target_exists {
             let target_inode = inner.inodes.get(&target_inode_id).ok_or(MetaError::NotFound)?;
 
@@ -906,7 +974,11 @@ impl MetaStore for MemStore {
             } else {
                 // Replace regular file: remove old target
                 inner.inodes.remove(&target_inode_id);
-                inner.slices.remove(&target_inode_id);
+                if let Some(chunks) = inner.slices.remove(&target_inode_id) {
+                    candidates.extend(slice_block_keys(
+                        chunks.values().flat_map(|slices| slices.iter()),
+                    ));
+                }
                 inner.symlink_targets.remove(&target_inode_id);
             }
         }
@@ -938,7 +1010,7 @@ impl MetaStore for MemStore {
             }
         }
 
-        Ok(())
+        Ok(confirmed_garbage_keys(&inner, candidates))
     }
 }
 
@@ -977,6 +1049,35 @@ mod tests {
             store.readlink(REMOTE_TXT_INODE).await,
             Err(MetaError::NotASymlink)
         ));
+    }
+
+    #[tokio::test]
+    async fn unlink_reports_shared_block_only_after_last_reference_is_removed() {
+        let store = MemStore::new();
+        let first = store
+            .create(ROOT_INODE, "shared-first", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let second = store
+            .create(ROOT_INODE, "shared-second", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let shared = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 64,
+            written_at: current_unix_time(),
+        };
+        let key = shared.block_key(0);
+        store.append_slice(first, shared.clone()).await.unwrap();
+        store.append_slice(second, shared).await.unwrap();
+
+        assert!(store.unlink(ROOT_INODE, "shared-first").await.unwrap().is_empty());
+        assert_eq!(
+            store.unlink(ROOT_INODE, "shared-second").await.unwrap(),
+            vec![key]
+        );
     }
 
     #[tokio::test]

@@ -129,7 +129,7 @@ phase beyond what's marked "done" below is implemented.**
 |---|---|---|
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
-| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, symlink/readlink, READ/WRITE via bounce buffer, truncate, local JSON + local-FS persistence (ABI v11 / Steps 1–14). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
+| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic LOOKUP/CREATE/MKDIR/UNLINK/RENAME/READDIR, symlink/readlink, READ/WRITE via bounce buffer, truncate, unreferenced-block GC, local JSON + local-FS persistence (ABI v11 / Steps 1–15). Redis metadata + S3 objects still ahead. | 🚧 In progress — local closed loop usable; distributed backends not started |
 | **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits DMA back to the VFS caller, bypassing the Rust daemon. | ⏳ Not started |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
@@ -409,7 +409,8 @@ read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
 255-byte names (ABI v11). Remaining gaps include:
 
 - **No hard link** yet; symlink targets currently require UTF-8 and are capped at 4095 bytes.
-- **unlink does not GC ObjectStore blocks** (orphan objects may remain on disk).
+- **GC delete failures can leak objects**: namespace metadata commits first for safety;
+  failed best-effort deletes are logged, but there is not yet a durable retry queue.
 - **Data/name IPC is globally serialized** by one mutex (correct but limits
   concurrency).
 - **Distributed backends** (Redis MetaStore, S3 ObjectStore) and **Phase 4

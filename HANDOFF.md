@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 3 Step 14（ABI v11）symlink 已由 Cursor 验收并纳入本提交。
+> **最后更新**：Phase 3 Step 15 ObjectStore 孤儿块 GC 已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
@@ -124,15 +124,11 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 12** | **借 bounce buffer 放大 rename 名字** | **9** | **✅ 已验收** |
 | **Step 13** | **统一长名字数据面 + 批量 READDIR** | **10** | **✅ 已验收** |
 | **Step 14** | **符号链接（MetaStore 持有 target，VFS symlink/get_link）** | **11** | **✅ 已验收** |
+| **Step 15** | **unlink / rename 覆盖 / truncate 的无引用 ObjectStore block GC** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码与测试确认 Step 10–14 已验收（Step 14：124 tests；人类手工可按 §7.8 补跑）。
+Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认 Step 15 已验收。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（所有活跃名字/数据/symlink 路径均使用 bounce buffer）
-
-
-Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests + 人类手工）。
-
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（所有活跃名字/数据/symlink 路径均使用 bounce buffer）
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -196,7 +192,7 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 | 层 | 内存模式 (`--memory`) | 持久化模式 (`--data-dir <path>`) |
 |---|---|---|
 | 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（包装 MemStore，每次写操作后全量序列化到 `{data_dir}/meta.json`，原子 tmp+fsync+rename） |
-| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，重启丢失） | `LocalFsObjectStore`（每个 block 存为 `{data_dir}/{slice_uuid}/{block_idx}` 文件，原子 tmp+rename） |
+| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（每个 block 存为 `{data_dir}/{slice_uuid}/{block_idx}` 文件，原子 tmp+rename；GC 真删文件及空 UUID 目录） |
 
 **CLI 参数**（`daemon/src/main.rs`）：
 - `--data-dir <PATH>`：持久化目录（默认 `./.kestrelfs-data`），meta.json 和块数据均存于此
@@ -211,7 +207,7 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 | 1 | **旧 CHUNK opcode 仍受小 payload 限制** | `WRITE_CHUNK` 仍最多 12 字节、`READ_CHUNK` 仍最多 32 字节，仅为兼容既有测试保留；普通文件内核路径已切换到 16 KiB bounce buffer 的 `WRITE_DATA` / `READ_DATA`，单次 read/write 会在内核内循环完成。 | `kestrelfs_ipc.h`、`kestrelfs/file.c` |
 | 2 | **旧 RENAME 仍为每名 ≤7 字节** | opcode 10 仅为兼容既有测试保留；普通 VFS rename 已切到 opcode 13 `RENAME_DATA`，单名上限 255 字节，两个名字依次位于 bounce buffer。 | `kestrelfs_ipc.h` RENAME / RENAME_DATA 布局 |
 | 3 | **旧名字 opcode 仍有短 payload 上限** | opcode 1/6/7/8/9 仅为兼容既有测试保留；普通 VFS 的 lookup/create/readdir/mkdir/unlink 已切换到 ABI v10 DATA opcode，统一支持 255 字节名字。 | `kestrelfs_ipc.h` 各 legacy / DATA opcode 布局 |
-| 4 | **unlink 不 GC 对象块** | 删除文件时移除 dirent + inode + slices 元数据，但不删除 ObjectStore 中的物理 block。允许孤儿块存在。 | `daemon/src/meta.rs` `unlink()` |
+| 4 | **GC 为安全的提交后 best-effort** | unlink、rename 覆盖和 truncate 先提交/持久化元数据，再删除经全局 slice 引用扫描确认无引用的 block。delete 失败只记录日志并保留泄漏，不把已经生效的命名空间操作伪装成失败；当前没有持久化重试队列。 | `daemon/src/meta.rs`、`daemon/src/main.rs` `delete_garbage_objects()` |
 | 5 | **new_inode() 而非 iget5_locked()** | 曾尝试 `iget5_locked()` 做严格 inode 缓存，导致 umount 时内核死循环（commit `7787a6a`）。已回退为 `new_inode()` + `insert_inode_hash()`。**不要轻易重试 iget5_locked 方案**，除非彻底解决 I_FREEING 竞态。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
 | 6 | **同一 ino 可能有多实例 inode** | 使用 `new_inode()` 意味着每次 lookup 都创建新 inode 对象（而非复用哈希表中已有实例）。dentry cache 保证路径唯一性，但同一文件通过不同路径访问时内核中可能有多个 inode 对象。 | 同上 |
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
@@ -223,6 +219,8 @@ Cursor 对照代码与测试确认 Step 10–13 已验收（Step 13：119 tests 
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
 | 14 | **create() 忽略 kernel 传入的 mode** | `MemStore::create()` 内部用 `Inode::new_file()` 的默认 mode（`S_IFREG | 0o644`），忽略 kernel 传入的 mode 参数。 | `daemon/src/meta.rs` `create()` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
+| 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 很多时成本较高；未来 Redis/S3 后端需要引用计数或持久化 GC 队列。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` |
+| 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -246,7 +244,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（当前 124 个）
+cargo test                    # 单元测试 + 集成测试（当前 130 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -297,6 +295,8 @@ vng --network user -r --pwd
 # 进入 VM 后直接 insmod / mount / 测试
 echo b > /proc/sysrq-trigger  # 退出 VM
 ```
+
+当前 vng 1.41 在此环境需显式传 `--run`；guest 根目录是只读 9p，因此专用脚本使用 guest `/tmp` 作为挂载点，并用 BusyBox mount。
 
 ### 7.5 Step 11 大数据手工验证（需 sudo）
 
@@ -420,6 +420,18 @@ wait "$daemon_pid" || true
 sudo rmmod kestrelfs
 ```
 
+### 7.9 Step 15 ObjectStore GC vng 自动验证
+
+脚本覆盖写入后 unlink、rename 覆盖目标、COW 两 slice truncate、零填充扩展及 `<1s` umount：
+
+```bash
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+```
+
+成功标记为 `VNG_GC_PASS`；guest 脚本任一断言失败均以非零状态退出。
+
 ---
 
 ## 8. 路线图（未做）
@@ -428,7 +440,10 @@ sudo rmmod kestrelfs
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 15 提示词** | 候选：ObjectStore 孤儿 GC，或 RedisMetaStore 原型 |
+| 1 | **等待 Cursor 的 Step 16 提示词** | 候选：RedisMetaStore 原型；S3 ObjectStore 可其后 |
+| 2 | Redis MetaStore + S3 ObjectStore | 分布式控制面 |
+| 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe |
+
 | 2 | Redis MetaStore + S3 ObjectStore | 本地 POSIX 子集已较完整后启动 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
@@ -454,17 +469,18 @@ sudo rmmod kestrelfs
 6. **ABI 版本**：新增 opcode 或改变 payload 布局时，必须同时更新 `kestrelfs/kestrelfs_ipc.h` 和 `daemon/src/abi.rs`，并 bump `KESTRELFS_ABI_VERSION` / `ABI_VERSION`。两处必须一致。
 7. **内核编码**：不能有编译警告（`-Werror` 级别要求）。`make -C kestrelfs` 输出必须零 warning。
 8. **Rust 编码**：`cargo clippy --all-targets -- -D warnings` 必须通过。
+9. **vng 站立规则**：凡改动 `kestrelfs/*.c` 或依赖 mount 的行为，必须用 `vng --exec`（当前环境加 `--run`）或演进后的仓库脚本完成自动验证；人类 sudo 只作补充。
 
 ---
 
 ## 10. 交接检查清单
 
-- [x] Step 14 symlink 已由 Cursor 验收并提交（ABI v11，124 tests）
+- [x] Step 15 ObjectStore GC 已由 Cursor 验收并提交（130 tests + vng）
 - [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–14 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 15 提示词
+- [x] Step 8–15 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 16 提示词
 - [x] 已知限制与坑已列出（第 6 节）
-- [x] README/HANDOFF 进度已同步
+- [x] `test-step15-gc-vng.sh` 已入库；vng 站立规则见 §9
 ---
 
 ## 11. 文档债务

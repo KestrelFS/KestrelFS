@@ -379,11 +379,15 @@ async fn build_response_with_data(
     match event.opcode {
         abi::OP_WRITE_DATA => handle_write_data(event, store, object_store, data_buffer).await,
         abi::OP_READ_DATA => handle_read_data(event, store, object_store, data_buffer).await,
-        abi::OP_RENAME_DATA => handle_rename_data(event, store, data_buffer).await,
+        abi::OP_RENAME_DATA => {
+            handle_rename_data(event, store, object_store, data_buffer).await
+        }
         abi::OP_LOOKUP_DATA => handle_lookup_data(event, store, data_buffer).await,
         abi::OP_CREATE_DATA => handle_create_data(event, store, data_buffer).await,
         abi::OP_MKDIR_DATA => handle_mkdir_data(event, store, data_buffer).await,
-        abi::OP_UNLINK_DATA => handle_unlink_data(event, store, data_buffer).await,
+        abi::OP_UNLINK_DATA => {
+            handle_unlink_data(event, store, object_store, data_buffer).await
+        }
         abi::OP_READDIR_DATA => handle_readdir_data(event, store, data_buffer).await,
         abi::OP_SYMLINK_DATA => handle_symlink_data(event, store, data_buffer).await,
         abi::OP_READLINK_DATA => handle_readlink_data(event, store, data_buffer).await,
@@ -413,12 +417,12 @@ async fn build_response(
         abi::OP_GETATTR => handle_getattr(event, store).await,
         abi::OP_READ_CHUNK => handle_read_chunk(event, store, object_store).await,
         abi::OP_WRITE_CHUNK => handle_write_chunk(event, store, object_store).await,
-        abi::OP_TRUNCATE => handle_truncate(event, store).await,
+        abi::OP_TRUNCATE => handle_truncate(event, store, object_store).await,
         abi::OP_CREATE => handle_create(event, store).await,
         abi::OP_READDIR => handle_readdir(event, store).await,
         abi::OP_MKDIR => handle_mkdir(event, store).await,
-        abi::OP_UNLINK => handle_unlink(event, store).await,
-        abi::OP_RENAME => handle_rename(event, store).await,
+        abi::OP_UNLINK => handle_unlink(event, store, object_store).await,
+        abi::OP_RENAME => handle_rename(event, store, object_store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -814,7 +818,11 @@ async fn handle_mkdir_request(
     }
 }
 
-async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+async fn handle_unlink(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
     let mut parent_inode_bytes = [0u8; 8];
     let mut name_bytes = [0u8; 24];
 
@@ -839,12 +847,21 @@ async fn handle_unlink(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
-    handle_unlink_request(event.req_id, "OP_UNLINK", parent_inode, name, store).await
+    handle_unlink_request(
+        event.req_id,
+        "OP_UNLINK",
+        parent_inode,
+        name,
+        store,
+        object_store,
+    )
+    .await
 }
 
 async fn handle_unlink_data(
     event: &KestrelfsEvent,
     store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
     data_buffer: *const u8,
 ) -> KestrelfsEvent {
     let req = match decode_name_data(event, data_buffer, "OP_UNLINK_DATA") {
@@ -857,6 +874,7 @@ async fn handle_unlink_data(
         req.parent_inode,
         &req.name,
         store,
+        object_store,
     )
     .await
 }
@@ -867,12 +885,14 @@ async fn handle_unlink_request(
     parent_inode: u64,
     name: &str,
     store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     println!("kestrelfs-daemon:    {operation} parent={parent_inode} name=\"{name}\"");
 
     // Call MetaStore::unlink
     match store.unlink(parent_inode, name).await {
-        Ok(()) => {
+        Ok(garbage_keys) => {
+            delete_garbage_objects(operation, garbage_keys, object_store).await;
             println!(
                 "kestrelfs-daemon:    OP_UNLINK removed \"{}\" from parent={}",
                 name, parent_inode
@@ -889,7 +909,11 @@ async fn handle_unlink_request(
     }
 }
 
-async fn handle_rename(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> KestrelfsEvent {
+async fn handle_rename(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
     let req = match event.decode_rename_req() {
         Ok(r) => r,
         Err(e) => {
@@ -898,12 +922,13 @@ async fn handle_rename(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> Ke
         }
     };
 
-    handle_rename_request(event.req_id, "OP_RENAME", req, store).await
+    handle_rename_request(event.req_id, "OP_RENAME", req, store, object_store).await
 }
 
 async fn handle_rename_data(
     event: &KestrelfsEvent,
     store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
     data_buffer: *const u8,
 ) -> KestrelfsEvent {
     // SAFETY: the event loop receives the pointer from the live shared mapping.
@@ -931,7 +956,14 @@ async fn handle_rename_data(
         }
     };
 
-    handle_rename_request(event.req_id, "OP_RENAME_DATA", req, store).await
+    handle_rename_request(
+        event.req_id,
+        "OP_RENAME_DATA",
+        req,
+        store,
+        object_store,
+    )
+    .await
 }
 
 async fn handle_rename_request(
@@ -939,6 +971,7 @@ async fn handle_rename_request(
     operation: &str,
     req: abi::RenameReq,
     store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     println!(
         "kestrelfs-daemon:    {operation} old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\"",
@@ -949,7 +982,8 @@ async fn handle_rename_request(
         .rename(req.old_parent, &req.old_name, req.new_parent, &req.new_name)
         .await
     {
-        Ok(()) => {
+        Ok(garbage_keys) => {
+            delete_garbage_objects(operation, garbage_keys, object_store).await;
             println!(
                 "kestrelfs-daemon:    {operation} success: \"{}\" -> \"{}\"",
                 req.old_name, req.new_name
@@ -959,6 +993,28 @@ async fn handle_rename_request(
         Err(e) => {
             println!("kestrelfs-daemon:    {operation} error: {e:?}");
             KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
+        }
+    }
+}
+
+/// Deletes keys only after MetaStore has committed the mutation that made them
+/// unreachable. GC failures are logged but do not turn a completed namespace
+/// mutation into a false VFS failure; leaking an object is safer than deleting
+/// before commit or reporting an error that cannot be retried by pathname.
+/// The event loop is sequential and normal writes allocate fresh UUIDs, so a
+/// confirmed-dead key cannot gain a new reference between confirmation and
+/// this delete step.
+async fn delete_garbage_objects(
+    operation: &str,
+    garbage_keys: Vec<String>,
+    object_store: &Arc<dyn ObjectStore>,
+) {
+    for key in garbage_keys {
+        match object_store.delete(&key).await {
+            Ok(()) => println!("kestrelfs-daemon:    {operation} GC deleted {key}"),
+            Err(error) => eprintln!(
+                "kestrelfs-daemon:    {operation} GC leaked {key}: {error}"
+            ),
         }
     }
 }
@@ -1412,12 +1468,13 @@ async fn handle_read_data(
 /// 3. Call MetaStore::truncate to update size and mtime
 /// 4. Return success response
 ///
-/// The MetaStore implementation updates the inode's size field (can shrink
-/// or grow) and mtime. Historical slices beyond new_size are retained (lazy
-/// GC), but the read path respects the new size limit.
+/// The MetaStore implementation updates size/mtime, drops slices wholly past
+/// retained EOF, and shortens crossing slices. Confirmed-unreferenced block
+/// keys are then deleted from ObjectStore after the metadata commit.
 async fn handle_truncate(
     event: &KestrelfsEvent,
     store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     let req = event.decode_truncate_req();
 
@@ -1431,13 +1488,17 @@ async fn handle_truncate(
     }
 
     // Step 2: Truncate the file
-    if let Err(e) = store.truncate(req.inode_id, req.new_size).await {
-        eprintln!(
-            "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> EIO (MetaStore::truncate failed: {:?})",
-            req.inode_id, req.new_size, e
-        );
-        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
-    }
+    let garbage_keys = match store.truncate(req.inode_id, req.new_size).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> EIO (MetaStore::truncate failed: {:?})",
+                req.inode_id, req.new_size, e
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+        }
+    };
+    delete_garbage_objects("OP_TRUNCATE", garbage_keys, object_store).await;
 
     println!(
         "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> success",
@@ -2995,6 +3056,8 @@ mod tests {
         let metadata_path = temp_dir.path().join("meta.json");
         let store: Arc<dyn MetaStore> =
             Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
         let source_inode = store
             .create(fs_model::ROOT_INODE, "before", fs_model::S_IFREG | 0o644)
             .await
@@ -3010,7 +3073,8 @@ mod tests {
             &mut data_buffer,
         );
 
-        let response = handle_rename_data(&request, &store, data_buffer.as_ptr()).await;
+        let response =
+            handle_rename_data(&request, &store, &object_store, data_buffer.as_ptr()).await;
         assert_eq!(response.opcode, abi::OP_RESULT_OK);
         drop(store);
 
@@ -3238,5 +3302,144 @@ mod tests {
             inode
         );
         assert_eq!(restored.readlink(inode).await.unwrap(), target);
+    }
+
+    #[tokio::test]
+    async fn localfs_write_then_unlink_deletes_object_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let local_store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(local_store.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "gc-unlink", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+
+        let response = handle_write_bytes(
+            1000,
+            inode,
+            0,
+            b"garbage collected payload".to_vec(),
+            "TEST_WRITE",
+            &store,
+            &object_store,
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        let slice = store.read_slices(inode, 0).await.unwrap().pop().unwrap();
+        let key = slice.block_key(0);
+        assert!(temp_dir.path().join(&key).is_file());
+
+        let unlink = raw_unlink_req(1001, fs_model::ROOT_INODE, "gc-unlink");
+        let response = build_response(&unlink, &store, &object_store).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert!(matches!(
+            local_store.get(&key).await,
+            Err(object_store::ObjectStoreError::NotFound(_))
+        ));
+        assert!(!temp_dir.path().join(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn rename_overwrite_deletes_replaced_files_objects() {
+        let mem_objects = object_store::MemObjectStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(mem_objects.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        store
+            .create(fs_model::ROOT_INODE, "source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let replaced = store
+            .create(fs_model::ROOT_INODE, "target", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        handle_write_bytes(
+            1010,
+            replaced,
+            0,
+            b"replaced data".to_vec(),
+            "TEST_WRITE",
+            &store,
+            &object_store,
+        )
+        .await;
+        let key = store
+            .read_slices(replaced, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .block_key(0);
+
+        let rename = raw_rename_req(
+            1011,
+            fs_model::ROOT_INODE,
+            "source",
+            fs_model::ROOT_INODE,
+            "target",
+        );
+        let response = build_response(&rename, &store, &object_store).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert!(matches!(
+            mem_objects.get(&key).await,
+            Err(object_store::ObjectStoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncate_cow_deletes_only_blocks_with_no_remaining_reference() {
+        let mem_objects = object_store::MemObjectStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(mem_objects.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "gc-cow", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+
+        handle_write_bytes(
+            1020,
+            inode,
+            0,
+            vec![b'A'; 100],
+            "TEST_WRITE",
+            &store,
+            &object_store,
+        )
+        .await;
+        handle_write_bytes(
+            1021,
+            inode,
+            80,
+            vec![b'B'; 20],
+            "TEST_WRITE",
+            &store,
+            &object_store,
+        )
+        .await;
+        let slices = store.read_slices(inode, 0).await.unwrap();
+        let older_key = slices[0].block_key(0);
+        let newer_key = slices[1].block_key(0);
+
+        let mut truncate = KestrelfsEvent::zeroed(abi::OP_TRUNCATE, 1022);
+        truncate.payload[0..8].copy_from_slice(&inode.to_le_bytes());
+        truncate.payload[8..16].copy_from_slice(&80u64.to_le_bytes());
+        let response = build_response(&truncate, &store, &object_store).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert!(mem_objects.get(&older_key).await.is_ok());
+        assert!(matches!(
+            mem_objects.get(&newer_key).await,
+            Err(object_store::ObjectStoreError::NotFound(_))
+        ));
+        let remaining = store.read_slices(inode, 0).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].length, 80);
+
+        // Extending again exposes zeros rather than bytes discarded at EOF.
+        store.truncate(inode, 100).await.unwrap();
+        let data = read_from_slices(inode, 75, 25, &store, &object_store)
+            .await
+            .unwrap();
+        assert_eq!(&data[..5], &[b'A'; 5]);
+        assert_eq!(&data[5..], &[0; 20]);
     }
 }

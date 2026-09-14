@@ -166,12 +166,12 @@ impl MetaStore for FileMetaStore {
         Ok(())
     }
 
-    async fn truncate(&self, inode: u64, new_size: u64) -> Result<()> {
-        self.mem.truncate(inode, new_size).await?;
+    async fn truncate(&self, inode: u64, new_size: u64) -> Result<Vec<String>> {
+        let garbage = self.mem.truncate(inode, new_size).await?;
         self.sync_to_disk()
             .await
             .map_err(|_| MetaError::Io)?;
-        Ok(())
+        Ok(garbage)
     }
 
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
@@ -186,12 +186,12 @@ impl MetaStore for FileMetaStore {
         Ok(inode_id)
     }
 
-    async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
-        self.mem.unlink(parent, name).await?;
+    async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
+        let garbage = self.mem.unlink(parent, name).await?;
         self.sync_to_disk()
             .await
             .map_err(|_| MetaError::Io)?;
-        Ok(())
+        Ok(garbage)
     }
 
     async fn rename(
@@ -200,12 +200,12 @@ impl MetaStore for FileMetaStore {
         old_name: &str,
         new_parent: u64,
         new_name: &str,
-    ) -> Result<()> {
-        self.mem.rename(old_parent, old_name, new_parent, new_name).await?;
+    ) -> Result<Vec<String>> {
+        let garbage = self.mem.rename(old_parent, old_name, new_parent, new_name).await?;
         self.sync_to_disk()
             .await
             .map_err(|_| MetaError::Io)?;
-        Ok(())
+        Ok(garbage)
     }
 }
 

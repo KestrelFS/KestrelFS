@@ -68,8 +68,9 @@ pub type Result<T> = std::result::Result<T, ObjectStoreError>;
 /// - `get()` and `put()` for *different* keys can safely run
 ///   concurrently (no ordering guarantee between them).
 /// - `put()` for the *same* key is last-write-wins (no compare-and-swap
-///   or MVCC yet - a later Phase 4 concern once we add garbage
-///   collection and need to track object reference counts).
+///   or MVCC yet. Step 15 GC confirms references in MetaStore before calling
+///   `delete`; distributed backends may later replace that scan with durable
+///   reference counts.
 /// - `get()` after `put()` of the same key sees the new value (no
 ///   stale-read window), modulo the usual async/.await interleaving
 ///   caveats: if two tasks both `put(k, ...)` concurrently, a
@@ -101,6 +102,10 @@ pub trait ObjectStore: Send + Sync {
     /// `MemObjectStore`: held in RAM; for Redis: ACKed by the server;
     /// for S3: PUT request returned 200).
     async fn put(&self, key: String, value: Vec<u8>) -> Result<()>;
+
+    /// Deletes `key`. Deletion is idempotent: an already-absent object is a
+    /// successful outcome, which makes post-metadata-commit GC safe to retry.
+    async fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// In-memory, `HashMap`-backed [`ObjectStore`] for Phase 3
@@ -159,6 +164,11 @@ impl ObjectStore for MemObjectStore {
         map.insert(key, value);
         Ok(())
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.write().unwrap().remove(key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +204,19 @@ mod tests {
 
         let retrieved = store.get(&key).await.unwrap();
         assert_eq!(retrieved, b"new");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_value_and_is_idempotent() {
+        let store = MemObjectStore::new();
+        let key = "delete_test";
+        store.put(key.to_string(), b"value".to_vec()).await.unwrap();
+        store.delete(key).await.unwrap();
+        assert!(matches!(
+            store.get(key).await,
+            Err(ObjectStoreError::NotFound(_))
+        ));
+        store.delete(key).await.unwrap();
     }
 
     #[tokio::test]
@@ -354,6 +377,31 @@ impl ObjectStore for LocalFsObjectStore {
 
         Ok(())
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = self.sanitize_key(key)?;
+        match fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ObjectStoreError::Io(format!(
+                    "Failed to delete {}: {}",
+                    path.display(),
+                    error
+                )))
+            }
+        }
+
+        // Block keys currently use <slice UUID>/<block index>. Removing the
+        // now-empty UUID directory prevents directory-only garbage. A nonempty
+        // or concurrently reused parent is intentionally left untouched.
+        if let Some(parent) = path.parent() {
+            if parent != self.root.as_path() {
+                let _ = fs::remove_dir(parent).await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +462,21 @@ mod localfs_tests {
 
         let retrieved = store.get("key/0").await.unwrap();
         assert_eq!(retrieved, b"new");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_file_and_is_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+        let key = "delete-me/0";
+        store.put(key.to_string(), b"data".to_vec()).await.unwrap();
+        store.delete(key).await.unwrap();
+        assert!(matches!(
+            store.get(key).await,
+            Err(ObjectStoreError::NotFound(_))
+        ));
+        assert!(!temp_dir.path().join("delete-me").exists());
+        store.delete(key).await.unwrap();
     }
 
     #[tokio::test]
