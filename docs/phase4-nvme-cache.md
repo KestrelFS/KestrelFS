@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–22）
+## 当前边界（Step 18–23）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -24,6 +24,12 @@ LBA 连续的 4 KiB block，会合并为最多 128 KiB 的同步 BIO，直接写
 `copy_to_user()`。非对齐 head/tail、用户地址不满足 logical/DMA alignment，或
 pin/BIO 构造失败时，按 block 回退到 Step 20 buffered-copy 路径。miss/fill 和
 daemon 路径没有变化。
+
+Step 23 在 cache 满时按 4 KiB block 回收内存 LRU 头部，而不再停止 fill。运行期
+成功 hit 或命中已有 entry 的 fill 会把 entry 移到 LRU 尾部；模块重载后用 v2
+index 已有的 generation 恢复插入顺序，避免在热 hit 上增加持久化写。驱逐先清零
+并 flush 旧盘上 index，随后才移除内存 key、覆写 data slot、发布新 index，保证
+被回收 key 不会指向复用后的错误数据。
 
 ## 缓存设备
 
@@ -79,11 +85,12 @@ filesystem 在重启时必须使用同一 digest；修改 MetaStore namespace �
 dataset 时必须使用不同 digest。
 
 `cache_direct_io` 默认为 1。设为 0 只关闭 Step 22 用户页直达，保留 Step 20
-同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。三个只读
+同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。四个只读
 观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks` 和
-`cache_direct_fallbacks` 可从 sysfs 读取；它们不是稳定用户 ABI。
+`cache_direct_fallbacks`、`cache_evictions` 可从 sysfs 读取；它们不是稳定用户
+ABI。
 
-## Step 19–22 磁盘格式
+## Step 19–23 磁盘格式
 
 所有多字节字段采用 little-endian，LBA 固定表示 512 字节 sector。磁盘头占
 第一个 4 KiB：
@@ -155,7 +162,9 @@ closed；不会猜测或覆盖可疑格式。
 
 generation 在当前版本中用于持久化条目版本和恢复后继续单调分配；同一模块
 生命周期内另有全局 mutation epoch 防止 miss 与并发 mutation 竞态发布旧 fill。
-它还不是跨主机一致性协议或数据校验码。
+Step 23 还用 generation 在重载时把 LRU list 排成最老插入在前；hit 只更新内存
+list，不同步写 generation，因此重启会丢失精确访问热度并退化为 insertion-order
+近似。generation 仍不是跨主机一致性协议或数据校验码。
 
 ## 填充、失效与顺序
 
@@ -163,7 +172,10 @@ miss 时 daemon 仍通过 `READ_DATA` 把远端数据放入 bounce。Step 20 在
 给调用者后同步填充：先写并 flush 4 KiB data block，再写并 flush 32-byte 索引
 所在的 4 KiB metadata page，保证索引不会先于数据发布。非对齐 read 的首个
 partial block 不填充；EOF 尾块补零后可填充。填充失败不影响已经成功的远端
-读取，cache 满时也只退化为后续 miss，当前尚无 eviction。
+读取。cache 满时 Step 23 回收 LRU 头部：先把 victim 的盘上 index 清零并 flush，
+成功后从 rhashtable/list/bitmap 移除，再写入并 flush 新 data，最后发布并 flush
+新 index。清旧 index 失败则不覆写 slot；后续步骤失败最多留下未索引空槽或 miss，
+不会恢复旧 key 后读取新 key 的字节。
 
 所有可能改变或删除文件字节的操作都在 daemon mutation 之前同步清空该 inode
 的全部索引（保守失效，尚未缩小到范围）：
@@ -180,11 +192,11 @@ metadata BIO 失败都会让相应 VFS mutation 失败，避免权威数据已�
 期间发生，返回数据不会再被发布为 cache fill。普通 rename 不改变源 inode
 内容，因此只在覆盖已存在目标时失效目标 inode。
 
-`kestrelfs_cache_lock` 覆盖 index 检查、用户页 pin、整个同步 BIO 和 unpin。
-invalidate 必须取得同一把锁，所以正在进行的 hit 要么在 mutation 前完整读到旧
-版本，要么在失效完成后看不到条目；slot 不会在 DMA 期间被释放/复用。这个模型
-牺牲了 cache hit 间的并发度，但避免了 page pin 生命周期与 index generation 的
-复杂竞态。
+`kestrelfs_cache_lock` 覆盖 index 检查、LRU touch/evict、用户页 pin、整个同步
+BIO 和 unpin。invalidate/fill/evict 必须取得同一把锁，所以正在进行的 hit 要么
+在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot 不会在 DMA
+期间被驱逐、释放或复用。这个模型牺牲了 cache hit 间的并发度，但避免了 page
+pin 生命周期、index generation 和 slot reuse 的复杂竞态。
 
 ## 故障与安全原则
 
@@ -193,7 +205,9 @@ invalidate 必须取得同一把锁，所以正在进行的 hit 要么在 mutati
 - hit data BIO 失败退化为远端 miss；fill 失败忽略。初始化时 superblock/index
   恢复不确定则 fail closed，不让该设备以可疑索引继续加载。
 - 失效写失败会拒绝 mutation；这是“宁可写失败、不可脏命中”的选择。
-- 当前没有 eviction/LRU、数据 checksum、索引 journal/镜像或 torn-write 检测。
+- Step 23 是 block 粒度、单锁内存 LRU；重启后只恢复 generation insertion order，
+  不持久化精确 hit recency，也没有分区配额、热点保护或批量 metadata 回收。
+- 当前没有数据 checksum、索引 journal/镜像或 torn-write 检测。
 - Step 22 是 read hit 的受限少拷贝路径：完整、对齐、连续块可以直达用户页；
   partial block 和不能 pin/对齐的 buffer 仍有一次 `copy_to_user()`。它不是异步
   DMA、`read_iter`/page-cache/splice 全覆盖，也没有并行 BIO pipeline。
@@ -221,3 +235,15 @@ copy 3.88 s（16.51 MiB/s），pinned-page direct 0.54 s（117.65 MiB/s），约
 这是 loop + TCG 下的路径级对比，不代表真实 NVMe 性能；辅助程序的数据校验成本
 也包含在两组数字中。验收看明确 PASS、命中计数和数据一致性，不把固定倍数作为
 门槛。
+
+## Step 23 vng 满盘回收验证
+
+`test-step23-eviction-vng.sh` 在 vng guest 内用 `cache_size_mib=3` 创建只有 256 个
+data slot 的 loop cache。它先用 1 MiB 文件 A 填满全部 slot，再命中 A[0] 将其提升
+为 MRU，随后以 128 KiB 文件 B 触发恰好 32 次回收。停 daemon 后验证 B、A[0] 和
+A 尾块仍命中，而被驱逐的 A[1] 必须读取失败；rmmod/insmod 后重复边界断言，并
+确认恢复 256 个 entry。
+
+2026-09-14 自检输出 `cache_evictions=32`、`restored 256 cache index entries`、
+`STEP23_EVICTION_PASS`，最终复跑 umount 67 ms。脚本自身包含 `insmod`、合法 64-hex
+namespace、PID 隔离的 data-dir 和 daemon.log；只允许通过 vng+loop 执行。

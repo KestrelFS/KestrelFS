@@ -4,8 +4,9 @@
  *
  * Step 21 binds Step 20's persistent 4 KiB cache to one metadata namespace.
  * Step 22 sends aligned, contiguous cache hits straight into pinned user pages;
- * unaligned head/tail blocks retain the buffered fallback.  Cache failures
- * never replace the authoritative daemon/ObjectStore path.
+ * unaligned head/tail blocks retain the buffered fallback.  Step 23 adds an
+ * in-memory block LRU so a full cache can recycle slots.  Cache failures never
+ * replace the authoritative daemon/ObjectStore path.
  */
 
 #include <linux/bio.h>
@@ -18,6 +19,7 @@
 #include <linux/highmem.h>
 #include <linux/hex.h>
 #include <linux/list.h>
+#include <linux/list_sort.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -135,6 +137,11 @@ module_param_named(cache_direct_fallbacks,
 MODULE_PARM_DESC(cache_direct_fallbacks,
 		 "direct user-page attempts that fell back to buffered cache IO");
 
+static unsigned long kestrelfs_cache_evictions;
+module_param_named(cache_evictions, kestrelfs_cache_evictions, ulong, 0444);
+MODULE_PARM_DESC(cache_evictions,
+		 "cache blocks retired for slot reuse since module load");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
@@ -150,6 +157,26 @@ static u32 kestrelfs_cache_slot_count;
 static u32 kestrelfs_cache_logical_size;
 static u32 kestrelfs_cache_physical_size;
 static u8 kestrelfs_cache_namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
+
+static int kestrelfs_cache_lru_compare(void *priv,
+				       const struct list_head *left,
+				       const struct list_head *right)
+{
+	const struct kestrelfs_cache_index_entry *left_entry;
+	const struct kestrelfs_cache_index_entry *right_entry;
+
+	left_entry = list_entry(left, struct kestrelfs_cache_index_entry, list);
+	right_entry = list_entry(right, struct kestrelfs_cache_index_entry, list);
+	if (left_entry->generation < right_entry->generation)
+		return -1;
+	if (left_entry->generation > right_entry->generation)
+		return 1;
+	if (left_entry->slot < right_entry->slot)
+		return -1;
+	if (left_entry->slot > right_entry->slot)
+		return 1;
+	return 0;
+}
 
 static int kestrelfs_cache_parse_namespace(void)
 {
@@ -662,6 +689,9 @@ static int kestrelfs_cache_restore_index(void)
 		}
 	}
 
+	/* Persisted generations recover insertion order, not runtime hit recency. */
+	list_sort(NULL, &kestrelfs_cache_entries,
+		  kestrelfs_cache_lru_compare);
 	kfree(block);
 	pr_info("kestrelfs: restored %llu cache index entries\n",
 		(unsigned long long)restored);
@@ -688,6 +718,42 @@ kestrelfs_cache_find(u64 inode_id, u64 file_offset)
 				      kestrelfs_cache_index_params);
 }
 
+/*
+ * Retire the least-recently-used entry before its data slot is overwritten.
+ * Clearing and flushing the persistent index first is the key invariant: a
+ * crash can lose the replacement, but can never restore the evicted key after
+ * its data block has been reused.
+ */
+static int kestrelfs_cache_evict_lru(unsigned long *reclaimed_slot)
+{
+	struct kestrelfs_cache_disk_index_entry disk = { 0 };
+	struct kestrelfs_cache_index_entry *victim;
+	int ret;
+
+	if (list_empty(&kestrelfs_cache_entries))
+		return -ENOSPC;
+	victim = list_first_entry(&kestrelfs_cache_entries,
+				  struct kestrelfs_cache_index_entry, list);
+
+	ret = kestrelfs_cache_rw_index_entry(victim->slot, &disk, true);
+	if (ret)
+		return ret;
+	ret = rhashtable_remove_fast(&kestrelfs_cache_index, &victim->node,
+				     kestrelfs_cache_index_params);
+	if (ret) {
+		pr_err("kestrelfs: failed to remove evicted cache key: %d\n",
+		       ret);
+		return ret;
+	}
+	victim->hashed = false;
+	*reclaimed_slot = victim->slot;
+	__clear_bit(victim->slot, kestrelfs_cache_slots);
+	list_del(&victim->list);
+	kfree(victim);
+	kestrelfs_cache_evictions++;
+	return 0;
+}
+
 static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 				      const u8 *data, size_t length)
 {
@@ -697,18 +763,24 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 	void *block;
 	int ret;
 
-	if (kestrelfs_cache_find(inode_id, file_offset))
+	entry = kestrelfs_cache_find(inode_id, file_offset);
+	if (entry) {
+		list_move_tail(&entry->list, &kestrelfs_cache_entries);
 		return 0;
-	slot = find_first_zero_bit(kestrelfs_cache_slots,
-				   kestrelfs_cache_slot_count);
-	if (slot >= kestrelfs_cache_slot_count)
-		return -ENOSPC;
+	}
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	block = kzalloc(KESTRELFS_CACHE_BLOCK_SIZE, GFP_KERNEL);
 	if (!entry || !block) {
 		ret = -ENOMEM;
 		goto out;
+	}
+	slot = find_first_zero_bit(kestrelfs_cache_slots,
+				   kestrelfs_cache_slot_count);
+	if (slot >= kestrelfs_cache_slot_count) {
+		ret = kestrelfs_cache_evict_lru(&slot);
+		if (ret)
+			goto out;
 	}
 	memcpy(block, data, length);
 	entry->key.inode_id = inode_id;
@@ -827,6 +899,17 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 			if (!kestrelfs_cache_read_user_blocks(entry->lba,
 							   buf + copied,
 							   direct_bytes)) {
+				u64 touch_offset;
+
+				for (touch_offset = block_offset;
+				     touch_offset < block_offset + direct_bytes;
+				     touch_offset += KESTRELFS_CACHE_BLOCK_SIZE) {
+					entry = kestrelfs_cache_find(inode_id,
+							 touch_offset);
+					if (entry)
+						list_move_tail(&entry->list,
+							       &kestrelfs_cache_entries);
+				}
 				kestrelfs_cache_direct_hit_blocks +=
 					direct_bytes / KESTRELFS_CACHE_BLOCK_SIZE;
 				copied += direct_bytes;
@@ -854,6 +937,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		copied += bytes;
 		offset += bytes;
 		block_offset += KESTRELFS_CACHE_BLOCK_SIZE;
+		list_move_tail(&entry->list, &kestrelfs_cache_entries);
 		kestrelfs_cache_copy_hit_blocks++;
 	}
 
@@ -951,6 +1035,7 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_direct_hit_blocks = 0;
 	kestrelfs_cache_copy_hit_blocks = 0;
 	kestrelfs_cache_direct_fallbacks = 0;
+	kestrelfs_cache_evictions = 0;
 	ret = kestrelfs_cache_parse_namespace();
 	if (ret)
 		return ret;
@@ -990,10 +1075,11 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	mutex_lock(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache hit stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
-		kestrelfs_cache_direct_fallbacks);
+		kestrelfs_cache_direct_fallbacks,
+		kestrelfs_cache_evictions);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);
