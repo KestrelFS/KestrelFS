@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4 Step 24（data/index CRC32，format v3）已由 Cursor 验收并纳入本提交（IPC ABI v11）。下一步规划与 Codex 提示词见 `docs/remaining-capabilities.md`。
+> **最后更新**：Phase 4 Step 25（v4 intent journal）已由 Cursor 验收并纳入本提交（IPC ABI v11）。README 已改为全中文。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 4 Step 24 已验收（v3 CRC32）；下一步 Step 25 = CACHE-TXN（见 remaining-capabilities §8） |
+| 当前阶段 | Phase 4 Step 25 已验收（v4 journal）；下一步 Step 26 = CACHE-ASYNC（见 remaining-capabilities §8） |
 
 ---
 
@@ -52,7 +52,7 @@
                     │                                  │
                     │  VFS (super/inode/dir/file ops)  │
                     │  /dev/kestrel_ctl char device     │
-                    │ 本地 NVMe 缓存 (Step 24 checksums) │
+                    │ 本地 NVMe 缓存 (Step 25 journal)   │
                     └──────────────────────────────────┘
 ```
 
@@ -60,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；当前 v3 superblock 持久化 32-byte namespace SHA-256 identity，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22 将完整、对齐且 LBA 连续的 hit 合并成最多 128 KiB BIO，直接写入 pinned user pages；partial/unaligned 情形保留 Step 20 buffered-copy fallback。Step 23 以运行期 block-LRU 回收满盘 slot。Step 24 给每个 4 KiB data block 和 32-byte index entry 持久化 CRC32：data 损坏只退休对应 entry 并 miss，index CRC 损坏在加载时拒绝整个设备。持久化索引、READ_DATA fill 和四类失效不变。尚无 journal/双 superblock、异步 DMA pipeline 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；工作树 v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22 将完整、对齐且 LBA 连续的 hit 合并成最多 128 KiB BIO，直接写入 pinned user pages；partial/unaligned 情形保留 Step 20 buffered-copy fallback。Step 23 以运行期 block-LRU 回收满盘 slot。Step 24 给每个 4 KiB data block 和 32-byte index entry 持久化 CRC32。Step 25 在 superblock 后增加单页 intent journal，fill/invalidate/evict/坏块退休先写 PREPARED，提交后清零；恢复合法半提交事务时清空受影响 slot 并安全 miss，torn journal 则拒绝加载。尚无双 superblock、异步 DMA pipeline 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -76,7 +76,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │   ├── file.c                   # file_operations (read/write/setattr) + IPC sync call helper
 │   ├── chardev.c                # /dev/kestrel_ctl: mmap/poll/ioctl
 │   ├── ipc_ring.c               # ring buffer push/pop primitives
-│   ├── cache.c                  # Phase 4 v3 cache + checksum/pinned hit/block-LRU/失效
+│   ├── cache.c                  # Phase 4 v4 cache + journal/checksum/pinned hit/LRU/失效
 │   ├── kestrelfs.h              # 内部跨文件声明
 │   └── kestrelfs_ipc.h          # ★ ABI 合约（C/Rust 共享，opcode/payload/struct 定义）
 │
@@ -107,6 +107,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step22-cache-io.c       # Step 22 对齐 IO 校验/粗测辅助程序
 ├── test-step23-eviction-vng.sh  # Step 23 小 cache 满盘/LRU/reload 回归
 ├── test-step24-checksum-vng.sh  # Step 24 data/index 破坏与 v2 拒绝回归
+├── test-step25-cache-txn-vng.sh # Step 25 半提交/journal/superblock fail-closed 回归
+├── test-step25-cache-txn.c      # Step 25 v4 磁盘状态故障注入辅助程序
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -146,10 +148,11 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 22** | **对齐连续 cache hit 合并 BIO 直达 pinned user pages；partial/unaligned 安全回退** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 23** | **满盘 block-LRU：安全清旧 index、复用 slot、持久化 replacement** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 24** | **v3 data/index CRC32：坏 data 局部退休并 miss，坏 index 加载失败** | **11（未变）** | **✅ 已验收** |
+| **Phase 4 Step 25** | **v4 单页 intent journal + superblock CRC：半提交恢复为安全 miss** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码、137 tests、`STEP24_CHECKSUM_PASS` 及 Step 23/22/21/20/19/15 vng 回归确认 Step 24 已验收。
-cache format = **v3**；IPC ABI = **v11**。测试仅在 vng+loop；daemon 使用独立 `data_dir` + `"$data_dir/daemon.log"`。
-下一步：**Step 25 CACHE-TXN**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、137 tests、`STEP25_CACHE_TXN_PASS` 及 Step 24/23/22/21/20/19/15 vng 回归确认 Step 25 已验收。
+cache format = **v4**；IPC ABI = **v11**。测试仅在 vng+loop；daemon 使用独立 `data_dir` + `"$data_dir/daemon.log"`。
+下一步：**Step 26 CACHE-ASYNC**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
@@ -256,8 +259,8 @@ cache format = **v3**；IPC ABI = **v11**。测试仅在 vng+loop；daemon 使�
 | 22 | **S3 delete 仍是提交后 best-effort** | Step 15 在 metadata 提交后调用 S3 DeleteObject；成功会真删对象，缺失对象视为成功。网络/权限失败只记录泄漏，不回滚已生效的 unlink/rename/truncate，也没有持久化重试队列。 | `daemon/src/object_store_s3.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 | 24 | **NVMe cache hit 仍是同步、受限少拷贝原型** | Step 22 把完整、用户地址满足 logical/DMA alignment 且 cache LBA 连续的 4 KiB blocks 合并为最多 128 KiB BIO，直接写入 pinned user pages；partial/unaligned 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_user`。没有异步 pipeline、`read_iter`/splice 全覆盖或 readahead。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
-| 25 | **cache v3 有 CRC32、仍无 journal/镜像** | 每个完整 4 KiB data block 和 32-byte index entry 已有 CRC32；坏 data 局部退休并 miss，坏 index 在恢复时拒绝整个设备。坏 data 的索引清零若失败，会在本次加载期间保留该 slot 不复用。CRC32 非密码学保护且有碰撞概率，superblock/reserved 区仍无 checksum，当前也没有 journal、双 superblock 或镜像。失效索引写失败仍会拒绝对应 mutation。 | `kestrelfs/cache.c` |
-| 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前 v3 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2 不自动迁移，也没有 wipe 参数。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。它依赖全局 cache lock 保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
+| 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前工作树 v4 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2/v3 不自动迁移，也没有 wipe 参数。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 27 | **多节点失效仍未闭环** | namespace identity 只防止不同 logical filesystem 混用 cache，不处理同 namespace 的远端 mutation。当前只观察本机 VFS mutation，其他节点或直接 Redis mutation 不会通知本内核失效。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 28 | **block-LRU 热度只在内存** | Step 23 的成功 hit/fill 会更新内存 LRU；满盘时逐 block 同步清旧 index 后复用。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后按现有 generation 恢复 insertion-order 近似。没有分区配额、批量 victim metadata IO 或热点隔离。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 
@@ -770,6 +773,36 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 `STEP20_CACHE_PASS` / `STEP21_NAMESPACE_PASS`（73 ms）、
 `STEP19_CACHE_PASS`（format mount 90 ms）及 `VNG_GC_PASS`（91 ms）。
 
+### 7.19 Phase 4 Step 25 CACHE-TXN 验证
+
+`test-step25-cache-txn-vng.sh` 在 guest loop 上格式化 v4 并填充两个独立 entry，
+再用 `test-step25-cache-txn.c` 离线构造合法 `PREPARED` journal，模拟 fill 在 index
+落盘后、invalidate 在 index 清零前、evict 在 index 清零后的 crash point。重载
+必须把目标 slot 恢复为 miss，未涉及 entry 仍命中；另外破坏 journal CRC、回退
+version=v3、破坏 superblock CRC，均须 fail closed。
+
+```bash
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step23-eviction-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step22-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+```
+
+2026-09-14 工作树自检输出 `STEP25_FILL_RECOVERY_PASS`、
+`STEP25_INVALIDATE_RECOVERY_PASS`、`STEP25_EVICT_RECOVERY_PASS`、
+`STEP25_TORN_FAIL_CLOSED_PASS`、`STEP25_V3_REJECT_PASS`、
+`STEP25_SUPER_CHECKSUM_PASS`、`STEP25_CACHE_TXN_PASS`（最终复跑 umount 62 ms）。同期回归
+`STEP24_CHECKSUM_PASS`（53 ms）、`STEP23_EVICTION_PASS`（32 次 evict，71 ms）、
+`STEP22_CACHE_HIT_PASS`（direct 89.28 MiB/s vs copy 16.96 MiB/s，66 ms）、
+`STEP20_CACHE_PASS` / `STEP21_NAMESPACE_PASS`（63 ms）、`STEP19_CACHE_PASS` 及
+`VNG_GC_PASS`（100 ms）全过。首次 Step 20 VM 在执行 guest 脚本前以 255 退出，
+立即重跑通过；没有在物理机执行 insmod/mount/cache 测试。
+
 ---
 
 ## 8. 路线图（未做）
@@ -778,8 +811,8 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 25 CACHE-TXN** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | Phase 4 后续 | ASYNC → OPS-RECOVERY → VFS…（见 remaining-capabilities §2） |
+| 1 | **Step 26 CACHE-ASYNC** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | Phase 4 后续 | OPS-RECOVERY → VFS → EVICT…（见 remaining-capabilities §2） |
 | 3 | 分布式 / POSIX | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -834,10 +867,11 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 24 data/index CRC32 已由 Cursor 验收并提交（format v3）
-- [x] IPC ABI = 11；cache format = v3
-- [x] Step 8–23 + Phase 4 Step 24 已验收状态已写清
-- [x] 下一步明确：Step 25 CACHE-TXN（`docs/remaining-capabilities.md` §8）
+- [x] Step 25 CACHE-TXN 已由 Cursor 验收并提交（format v4）
+- [x] IPC ABI = 11；cache format = v4
+- [x] Step 8–24 + Phase 4 Step 25 已验收状态已写清
+- [x] 下一步明确：Step 26 CACHE-ASYNC（`docs/remaining-capabilities.md` §8）
+- [x] README 已改为全中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 
 ---
@@ -848,5 +882,4 @@ mkdir -p "$data_dir"
 
 | 文件 | 问题 | 代码实际值 |
 |---|---|---|
-| `README.md` Usage 示例 | 部分段落仍偏 Phase 1 只读演示（hello.txt / Permission denied） | 动态可写 VFS 已可用；以 Roadmap + HANDOFF 为准 |
 | `README.md` 细节 | 未逐一列举全部 DATA opcode | 完整 opcode 表见 `HANDOFF.md` / `kestrelfs_ipc.h` |

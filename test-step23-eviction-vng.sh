@@ -110,7 +110,7 @@ echo "STEP23_CACHE: daemon-stopped LRU hit/miss boundary passed"
 busybox umount "$mnt"
 rmmod kestrelfs
 
-# Reuse the v2 device: cleared victims and replacement entries must persist.
+# Reuse the current-format device: cleared victims and replacements persist.
 load_cache
 start_daemon
 busybox mount -t kestrelfs none "$mnt"

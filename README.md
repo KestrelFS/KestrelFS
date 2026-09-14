@@ -16,263 +16,231 @@
 
 ---
 
-**A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
+**高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **Project status: early development (Phase 4 Step 24; ABI v11).**
-> Phase 1–3 are done. Phase 3 provides a working control-plane prototype
-> (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore`, an
-> optional Redis metadata prototype, `LocalFsObjectStore`, and an optional
-> S3/MinIO object prototype). Phase 4 now persists/restores a 4 KiB block index,
-> fills successful READ_DATA misses, serves synchronous kernel BIO cache hits,
-> invalidates rewrite/truncate/unlink/rename-overwrite mutations, and binds the
-> cache format to an explicit namespace SHA-256 identity. Step 22 sends aligned,
-> contiguous read hits directly into pinned user pages, while partial/unaligned
-> ranges safely retain the buffered fallback. Step 23 adds block-LRU slot
-> recycling when the cache is full. Step 24's v3 cache format validates every
-> 4 KiB data block and index entry with CRC32 before accepting a hit. Journaling,
-> asynchronous DMA, and multi-node invalidation are not implemented. See
-> [Roadmap](#roadmap) and `HANDOFF.md`.
+> ⚠️ **项目状态：早期开发（Phase 4 Step 25 已验收；IPC ABI v11；cache format v4）。**
+>
+> Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
+> 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据原型、`LocalFsObjectStore`、
+> 可选 S3/MinIO 对象原型）。Phase 4 已实现：4 KiB 块索引持久化/恢复、READ_DATA
+> miss 填充、同步内核 BIO 命中、rewrite/truncate/unlink/rename-overwrite 失效、
+> namespace SHA-256 绑定、对齐连续 hit 直达 pinned user pages、满盘 block-LRU、
+> data/index CRC32，以及 v4 单页 intent journal（半提交恢复为安全 miss）。
+> 异步 DMA 流水线与多节点失效尚未实现。详见[路线图](#路线图)、`HANDOFF.md` 与
+> `docs/remaining-capabilities.md`。
 
 ---
 
-## Table of Contents
+## 目录
 
-- [Vision](#vision)
-- [Architecture](#architecture)
-- [Roadmap](#roadmap)
-- [Repository Layout](#repository-layout)
-- [Requirements](#requirements)
-- [Building](#building)
-- [Usage](#usage)
-- [Verifying the Build](#verifying-the-build)
-- [Design Notes](#design-notes)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## Vision
-
-KestrelFS aims to be a distributed, POSIX-compatible cloud filesystem that
-combines:
-
-- **Kernel-level zero-copy I/O** for local NVMe cache hits — no context
-  switch to userspace on the hot path.
-- **Object-storage-backed durability** (S3-compatible backends) for cold
-  data, with chunk/block-level deduplication and streaming upload/download.
-- **Strongly consistent POSIX metadata**, backed by Redis/TiKV, served from
-  a userspace control plane that can scale independently of the kernel data
-  plane.
-
-The explicit design goal is to **beat JuiceFS on cache-hit latency and
-throughput** by moving the fast path (local cache read) entirely into the
-kernel, while keeping all the complex, rapidly-iterating business logic
-(metadata, chunking, S3 I/O) in a safe, memory-safe userspace daemon written
-in Rust.
+- [愿景](#愿景)
+- [架构](#架构)
+- [路线图](#路线图)
+- [仓库布局](#仓库布局)
+- [环境要求](#环境要求)
+- [编译](#编译)
+- [使用](#使用)
+- [构建验证](#构建验证)
+- [设计说明](#设计说明)
+- [贡献](#贡献)
+- [许可证](#许可证)
 
 ---
 
-## Architecture
+## 愿景
 
-KestrelFS deliberately separates **control plane** and **data plane** across
-a language and privilege boundary:
+KestrelFS 目标是成为分布式、POSIX 兼容的云文件系统，并同时具备：
+
+- **内核级少拷贝 / 零上下文切换热路径**：本地 NVMe 缓存命中不进入用户态 daemon。
+- **对象存储耐久性**：冷数据落 S3 兼容后端；块级切片与流式上下行。
+- **强一致 POSIX 元数据**：由 Redis/TiKV 等支撑，控制面在用户态独立扩展。
+
+明确产品目标：**在缓存命中延迟与吞吐上击败 JuiceFS**——把本地缓存读热路径放进内核，
+把易变的业务逻辑（元数据、切片、S3 I/O）留在内存安全的 Rust daemon 中。
+
+---
+
+## 架构
+
+KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边界：
 
 ```
                          ┌─────────────────────────────┐
-                         │      Userspace (Rust)        │
+                         │      用户态 (Rust)            │
                          │                               │
-                         │   KestrelFS Control-Plane     │
-                         │   Daemon (Tokio async)        │
+                         │   KestrelFS 控制面 Daemon     │
+                         │   （Tokio 异步）               │
                          │                               │
-                         │  • POSIX metadata (Redis/TiKV)│
-                         │  • Chunk/Block slicing         │
-                         │  • S3 SDK (object storage I/O) │
+                         │  • POSIX 元数据 (Redis/TiKV)  │
+                         │  • Chunk/Block 切片            │
+                         │  • S3 SDK（对象存储 I/O）      │
                          └───────────────▲───────────────┘
-                                         │ mmap() shared ring buffers
-                                         │ + ioctl()/poll() signalling
+                                         │ mmap() 共享双环
+                                         │ + ioctl()/poll()
                          ┌───────────────▼───────────────┐
-                         │      Kernel space (C)          │
+                         │      内核态 (C)                │
                          │                                 │
-                         │   KestrelFS Kernel Module       │
+                         │   KestrelFS 内核模块            │
                          │                                 │
-                         │  • VFS registration (super/inode/file) │
-                         │  • /dev/kestrel_ctl char device  │
-                         │  • Persistent local NVMe cache    │
-                         │  • Pinned-page cache reads         │
+                         │  • VFS（super/inode/file）      │
+                         │  • /dev/kestrel_ctl             │
+                         │  • 本地 NVMe 持久缓存           │
+                         │  • pinned-page 缓存读           │
                          └─────────────────────────────────┘
 ```
 
-**Data plane (kernel, C).** An out-of-tree Linux kernel module that:
-- Registers a VFS filesystem type and implements the inode/dentry/file
-  operations needed to mount and serve files.
-- Owns the local NVMe SSD cache boundary. Steps 20–24 restore/persist its fixed
-  block index, fill READ_DATA misses, reject namespace identity mismatches, and
-  send eligible aligned cache hits directly into pinned user pages; full caches
-  recycle block slots with an in-memory LRU, while v3 data/index CRCs reject
-  corrupt hits — see
-  [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md).
-- Talks to the Rust daemon only when necessary (cache miss, metadata
-  lookup) via a lock-free shared-memory IPC bridge.
+**数据面（内核，C）。** 树外 Linux 内核模块：
 
-**Control plane (userspace, Rust).** An async daemon (Tokio) that:
-- Owns all POSIX metadata semantics, backed by Redis/TiKV.
-- Performs chunk/block slicing of file data.
-- Talks to S3-compatible object storage via the AWS SDK for Rust.
-- Never blocks the kernel — all slow I/O (network, disk) happens off the
-  VFS call path.
+- 注册 VFS 文件系统类型，实现挂载与文件服务所需的 inode/dentry/file 操作。
+- 拥有本地 NVMe SSD 缓存边界。Step 20–25：索引持久化、miss 填充、namespace
+  校验、对齐 hit 直达用户页、LRU 回收、CRC 校验、v4 intent journal。详见
+  [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
+- 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
 
-**The bridge.** Kernel and Rust communicate through a `/dev/kestrel_ctl`
-character device: the kernel allocates a single `mmap()`-able shared memory
-region containing **two independent lock-free SPSC ring buffers** (request
-and response), avoiding any data copy through the socket/Netlink layer. Every
-cross-language structure is defined once, in a dual-purpose C header
-(`kestrelfs_ipc.h`) consumable by both the kernel module and `bindgen` on the
-Rust side, so the ABI can never silently drift between the two
-implementations. See [Design Notes](#design-notes) for the full memory
-layout and synchronization model.
+**控制面（用户态，Rust）。** Tokio 异步 daemon：
+
+- 拥有全部 POSIX 元数据语义（可接 Redis/TiKV）。
+- 执行文件数据的 chunk/block 切片。
+- 经 AWS SDK for Rust 访问 S3 兼容对象存储。
+- 不阻塞内核：慢 I/O（网络、磁盘）离开 VFS 调用路径。
+
+**桥接。** 内核与 Rust 通过 `/dev/kestrel_ctl` 字符设备通信：内核分配一块可
+`mmap()` 的共享内存，内含**两个独立无锁 SPSC 环形队列**（请求/响应），避免经
+socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供内核与 Rust
+`bindgen` 共用，防止 ABI 静默漂移。详见[设计说明](#设计说明)。
 
 ---
 
-## Roadmap
+## 路线图
 
-Development proceeds in four strictly sequential phases. **Do not assume any
-phase beyond what's marked "done" below is implemented.**
+开发按四个阶段严格推进。**请勿假设下表未标「已完成」的阶段已经实现。**
 
-| Phase | Goal | Status |
+| 阶段 | 目标 | 状态 |
 |---|---|---|
-| **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
-| **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
-| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic VFS operations, bounce-buffer I/O, symlink, truncate, GC, local persistence, optional RedisMetaStore and S3ObjectStore prototypes (ABI v11 / Steps 1–17). | ✅ Prototype complete |
-| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 24 — data/index CRC32 prototype (v3 format) |
+| **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
+| **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
+| **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 25 已验收（format v4）；下一步见 `docs/remaining-capabilities.md` |
 
-See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
+步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
+`docs/remaining-capabilities.md`。
 
 ---
 
-## Repository Layout
+## 仓库布局
 
 ```
-KestrelFS/   # local checkout directory may historically be named FerroFS
+KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── LICENSE / README.md / HANDOFF.md
-├── kestrelfs/                 # kernel module (C) — out-of-tree build
+├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v11)
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v11）
 │   └── chardev_test.c
-├── docs/phase4-nvme-cache.md # Phase 4 ownership/index/invalidation design
-├── test-step19-cache-vng.sh # loop format/reuse/fail-closed regression
-├── test-step20-cache-vng.sh # loop fill/reload/hit/invalidation regression
-├── test-step22-cache-vng.sh # pinned-page hit/copy fallback/A-B regression
-├── test-step22-cache-io.c   # aligned read verifier used by Step 22 vng test
-├── test-step23-eviction-vng.sh # small-cache LRU/reload regression
-├── test-step24-checksum-vng.sh # data/index corruption and v2 rejection regression
-└── daemon/                    # Rust control-plane daemon
+├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
+├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
+├── test-step19-cache-vng.sh … test-step25-cache-txn-vng.sh
+└── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
 ```
 
 ---
 
-## Requirements
+## 环境要求
 
-- **Linux kernel 5.x/6.x** with matching headers installed for your running
-  kernel (`/lib/modules/$(uname -r)/build` must exist).
-  - Debian/Ubuntu: `sudo apt install linux-headers-$(uname -r)`
-- **GCC** and standard kernel build tooling (`make`, `bc`, `flex`, `bison` —
-  usually already present if headers are installed).
-- **Root privileges** for `insmod`/`rmmod`/`mount` (module loading is a
-  privileged operation on any stock kernel).
-- (Later phases) **Rust toolchain** (stable, via `rustup`) and `bindgen` for
-  the control-plane daemon.
+- **Linux 内核 5.x/6.x**，且已安装与当前运行内核匹配的 headers
+  （`/lib/modules/$(uname -r)/build` 必须存在）。
+  - Debian/Ubuntu：`sudo apt install linux-headers-$(uname -r)`
+- **GCC** 与常规内核构建工具（`make`、`bc`、`flex`、`bison` 等）。
+- **root 权限** 用于 `insmod`/`rmmod`/`mount`。
+- （Phase 3+）**Rust 工具链**（stable，`rustup`）及 `bindgen`。
 
-> KestrelFS never builds against a full kernel source tree and never runs a
-> whole-kernel `make -j`. All builds are strictly out-of-tree, driven by
-> `make -C $(KDIR) M=$(PWD) modules`.
+> KestrelFS **从不**对着完整内核源码树整树编译，也**从不**跑整内核
+> `make -j`。一律树外：`make -C $(KDIR) M=$(PWD) modules`。
 
 ---
 
-## Building
+## 编译
 
 ```bash
 cd kestrelfs
 make
 ```
 
-This produces `kestrelfs.ko` by invoking kbuild against your currently
-running kernel's headers:
+产出 `kestrelfs.ko`，实际调用当前运行内核的 headers：
 
 ```
 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 ```
 
-To build against a different kernel's headers, override `KDIR`:
+指定其他内核 headers：
 
 ```bash
 make KDIR=/lib/modules/<other-version>/build
 ```
 
-Clean build artifacts:
+清理：
 
 ```bash
 make clean
 ```
 
----
-
-## Usage
-
-### Load the module and mount
+编译 daemon：
 
 ```bash
-cd kestrelfs
-make
-sudo insmod kestrelfs.ko
+cargo build --release --manifest-path daemon/Cargo.toml
+```
+
+---
+
+## 使用
+
+### 加载模块并挂载（开发机示例）
+
+> **注意**：带 `cache_device` 的正确性/回归测试当前约定只在 **vng guest + loop**
+> 中执行；不要在宿主机对物理 zvol 做自动化验收，除非人类明确授权。
+
+```bash
+make -C kestrelfs
+sudo insmod kestrelfs/kestrelfs.ko
 sudo mkdir -p /mnt/kestrelfs
+# 另开终端启动 daemon（日志写入 data-dir，勿 >/dev/null）
+data_dir=/tmp/kestrelfs-demo
+mkdir -p "$data_dir"
+sudo ./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 sudo mount -t kestrelfs none /mnt/kestrelfs
 ```
 
-### Read the sample file
+启用内核缓存时（需合法 64-hex `cache_namespace`，且 `cache_device` 必须是块设备）：
 
 ```bash
-cat /mnt/kestrelfs/hello.txt
-# Hello from KestrelFS Kernel Module (Phase 1)!
+cache_namespace=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
+  "$data_dir" "$data_dir" | sha256sum | awk '{print $1}')
+sudo insmod kestrelfs/kestrelfs.ko \
+  cache_device=/dev/loop0 cache_size_mib=64 \
+  cache_namespace="$cache_namespace"
 ```
 
-The mount is intentionally **read-only** in Phase 1 — write attempts fail
-with `EROFS`/`EACCES` by design; there is no on-disk or object-storage
-backing yet.
+当前挂载已是**可写动态 VFS**（create/mkdir/rename/symlink/read/write 等），
+不是 Phase 1 的只读演示。
 
-### Unmount and unload
+### 卸载
 
 ```bash
 sudo umount /mnt/kestrelfs
 sudo rmmod kestrelfs
 ```
 
-### Inspect the IPC char device
-
-Loading the module also registers `/dev/kestrel_ctl`, the Phase 2 IPC bridge
-to the (not-yet-implemented) Rust daemon:
+### 检查 IPC 字符设备
 
 ```bash
 ls -l /dev/kestrel_ctl
-```
-
-A standalone smoke test exercises the chardev's `open`/`ioctl`/`mmap`/`poll`
-surface without requiring the Rust daemon:
-
-```bash
 gcc -O2 -Wall -I kestrelfs -o kestrelfs/chardev_test kestrelfs/chardev_test.c
 sudo kestrelfs/chardev_test
 ```
 
-Expected output includes ABI version / shared-region-size confirmation and a
-successful `mmap()` of the ring-buffer region — see
-[Verifying the Build](#verifying-the-build) for the full expected transcript.
-
-### Start the control-plane daemon (Phase 3+)
-
-Starting from Phase 3, the daemon handles block storage and metadata operations.
-Build and run the daemon:
+### 控制面 daemon 参数（Phase 3+）
 
 ```bash
 cd daemon
@@ -280,38 +248,20 @@ cargo build --release
 sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
 ```
 
-**Command-line options:**
+常用选项：
 
-- `--data-dir <PATH>` — Directory for persistent metadata (`meta.json`) and block
-  objects (default: `./.kestrelfs-data`)
-  - Blocks and metadata persist across daemon restarts
-  - Must be writable by the daemon process (requires `sudo` if using system paths)
+- `--data-dir <PATH>` — 持久化 `meta.json` 与本地对象目录（默认 `./.kestrelfs-data`）
+- `--memory` — 内存 MetaStore + ObjectStore（重启丢失；仅测试）
+- `--meta <REDIS_URL>` — 例如 `redis://127.0.0.1:6379/0`；对象仍可用 `--data-dir`
+- `--redis-prefix <PREFIX>` — Redis 快照键前缀（默认 `kestrelfs`；完整键
+  `<PREFIX>:meta:v1`）；需同时使用 `--meta`
+- `--objects <S3_URL>` — 例如 `s3://bucket/kestrelfs-data`；不可与 `--memory` 同用
+- `--s3-endpoint <URL>` — MinIO 等自定义 endpoint（path-style）；也可读 `S3_ENDPOINT`
 
-- `--memory` — Use in-memory MetaStore + ObjectStore (data lost on restart; tests only)
+S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 CLI 参数或打印到日志。
+目标 bucket 须预先存在。
 
-- `--meta <REDIS_URL>` — Use Redis metadata instead of `meta.json`, for example
-  `redis://127.0.0.1:6379/0`. Block objects still use `--data-dir`.
-
-- `--redis-prefix <PREFIX>` — Namespace for the Redis snapshot key (default:
-  `kestrelfs`; actual key: `<PREFIX>:meta:v1`). This option requires `--meta`.
-
-- `--objects <S3_URL>` — Use S3-compatible object storage instead of
-  `--data-dir`, for example `s3://bucket/kestrelfs-data`. This conflicts with
-  `--memory` and can be combined with either FileMetaStore or RedisMetaStore.
-
-- `--s3-endpoint <URL>` — Custom endpoint for MinIO or another compatible
-  service. Custom endpoints automatically use path-style addressing. If this
-  flag is omitted, `S3_ENDPOINT` is checked before the normal AWS endpoint.
-
-S3 credentials and region use the standard AWS SDK provider chain, including
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, and
-`AWS_REGION`. Credentials are never accepted as CLI flags or printed by the
-daemon. The target bucket must already exist during normal daemon startup.
-
-The Redis backend stores one JSON metadata snapshot and atomically replaces it
-with a Lua compare-and-swap. This preserves cross-structure rename/truncate/GC
-semantics, but transfers the full snapshot on each operation and is intended as
-a correctness prototype. A real-Redis integration test is opt-in:
+Redis 后端当前是**单 key 全量 JSON 快照 + Lua CAS** 原型。可选集成测试：
 
 ```bash
 cd daemon
@@ -319,7 +269,7 @@ REDIS_URL=redis://127.0.0.1:6379/15 \
   cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
 ```
 
-The S3 integration tests are likewise opt-in and use a random object prefix:
+S3 门控测试示例：
 
 ```bash
 S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=kestrelfs-test \
@@ -327,189 +277,125 @@ AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
 AWS_REGION=us-east-1 cargo test s3_environment_gated -- --nocapture
 ```
 
-**Verifying persistence:**
+**验证持久化：**
 
-1. Start daemon with a data directory:
-   ```bash
-   sudo ./target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-data
-   ```
+1. 启动 daemon（指定 `--data-dir`）并 mount。
+2. 写入文件后读回。
+3. 重启同一 `--data-dir` 的 daemon，确认数据仍在。
 
-2. Write data to the filesystem:
-   ```bash
-   echo "persistent data" > /mnt/kestrelfs/writable.dat
-   cat /mnt/kestrelfs/writable.dat  # Should show: persistent data
-   ```
-
-3. Stop the daemon (Ctrl+C) and restart it with the same `--data-dir`:
-   ```bash
-   sudo ./target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-data
-   ```
-
-4. Verify data persists:
-   ```bash
-   cat /mnt/kestrelfs/writable.dat  # Should still show: persistent data
-   ```
-
-The daemon must be running before accessing files that require IPC operations
-(`remote.txt`, `writable.dat`). Static files like `hello.txt` work without the daemon.
+需要 IPC 的路径依赖 daemon 在线；缓存命中路径在填充完成后可在 daemon 停止时仍命中
+（见 Phase 4 vng 测试）。
 
 ---
 
-## Verifying the Build
+## 构建验证
 
-A full manual verification pass, useful after any change to `kestrelfs/`:
+改动 `kestrelfs/` 后的常用手工检查：
 
 ```bash
-# 1. Build
-cd kestrelfs && make
+# 1. 编译
+make -C kestrelfs
+cargo test --manifest-path daemon/Cargo.toml
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 
-# 2. Load
-sudo insmod kestrelfs.ko
+# 2. 加载
+sudo insmod kestrelfs/kestrelfs.ko
 lsmod | grep kestrelfs
-cat /proc/filesystems | grep kestrelfs
-dmesg | tail -5      # expect: "filesystem + chardev registered"
+grep kestrelfs /proc/filesystems
+dmesg | tail -5
 
-# 3. Mount and read
+# 3. 挂载读写（需先启动 daemon）
 sudo mkdir -p /mnt/kestrelfs
 sudo mount -t kestrelfs none /mnt/kestrelfs
-ls -la /mnt/kestrelfs
-cat /mnt/kestrelfs/hello.txt
 
-# 4. Confirm read-only enforcement
-echo test > /mnt/kestrelfs/hello.txt   # expect: Permission denied
-touch /mnt/kestrelfs/new_file           # expect: Read-only file system
+# 4. 字符设备冒烟
+gcc -O2 -Wall -I kestrelfs -o kestrelfs/chardev_test kestrelfs/chardev_test.c
+sudo kestrelfs/chardev_test
 
-# 5. Exercise the chardev bridge
-gcc -O2 -Wall -I . -o chardev_test chardev_test.c
-sudo ./chardev_test                     # expect "[PASS] all chardev infrastructure checks succeeded"
-dmesg | tail -5                          # expect: shared region allocated (~147648 bytes, 1024 slots/ring + 16 KiB bounce)
-
-# 6. Unmount and unload cleanly
+# 5. 干净卸载
 sudo umount /mnt/kestrelfs
 sudo rmmod kestrelfs
-dmesg | tail -5      # expect: "unloaded, filesystem + chardev unregistered", no WARNING/Oops/BUG
-lsmod | grep kestrelfs   # expect: no output
 ```
 
-Any `WARNING:`, `Oops:`, or `BUG:` line in `dmesg` at any point indicates a
-regression and should block a change from landing.
+任何 `dmesg` 中的 `WARNING:` / `Oops:` / `BUG:` 都应阻断合入。
+
+**缓存回归（仅 vng guest + loop）：**
+
+```bash
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
+# … Step 23/22/20/19/15 等脚本见 HANDOFF.md §7
+```
 
 ---
 
-## Design Notes
+## 设计说明
 
-### Kernel↔Rust IPC contract
+### 内核↔Rust IPC 契约
 
-The shared memory region (`struct kestrelfs_shared_region` in
-`kestrelfs_ipc.h`) is laid out as:
+共享区（`struct kestrelfs_shared_region`，见 `kestrelfs_ipc.h`）布局：
 
 ```
-offset 0       : header (magic, abi_version, padding)      — 64 B
-offset 64      : req_ctrl  (head/tail/capacity)            — 64 B (own cacheline)
-offset 128     : resp_ctrl (head/tail/capacity)            — 64 B (own cacheline)
-offset 192     : req_slots[1024]   (kernel -> Rust)        — 64 KiB
-offset 65728   : resp_slots[1024]  (Rust -> kernel)        — 64 KiB
-offset 131264  : data_buffer (ABI v8+ bounce for bulk I/O  — 16 KiB
-                 and long names)
-                                         total: 147648 B (~144 KiB)
+offset 0       : header（magic、abi_version、padding）     — 64 B
+offset 64      : req_ctrl  (head/tail/capacity)            — 64 B
+offset 128     : resp_ctrl (head/tail/capacity)            — 64 B
+offset 192     : req_slots[1024]   (内核 → Rust)           — 64 KiB
+offset 65728   : resp_slots[1024]  (Rust → 内核)           — 64 KiB
+offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 KiB
+                                         合计: 147648 B（约 144 KiB）
 ```
-Exact sizes are asserted in `kestrelfs_ipc.h` / `daemon/src/abi.rs`
-(`KESTRELFS_SHM_REGION_SIZE` / `SHM_REGION_SIZE`).
 
-Each event slot is exactly 64 bytes (one cacheline): a sequence number,
-opcode, flags, request ID (echoed back on the matching response), an error
-code, and a 32-byte opcode-specific payload. Ring control blocks are
-cacheline-aligned and physically separated from each other to avoid false
-sharing between producer and consumer indices.
+精确大小由 `KESTRELFS_SHM_REGION_SIZE` / `SHM_REGION_SIZE` 在 C/Rust 两侧断言。
 
-All fields use fixed-width types (`__u32`/`__u64`/...) from
-`<linux/types.h>`, with explicit padding and natural alignment (no packed
-structs) so the Rust side's `#[repr(C)]` mirror is byte-identical without
-needing `#[repr(packed)]`. Every structural invariant is enforced at compile
-time via `_Static_assert`, checked under both kernel-C and plain userspace
-GCC.
+每个事件槽 64 字节（一条 cacheline）：序号、opcode、flags、req_id、error_code、
+以及 32 字节 opcode 载荷。环控制块按 cacheline 对齐并物理分离，避免伪共享。
 
-**Wakeup model** (no busy-spinning):
-- **Kernel → Rust**: after pushing into the request ring, the kernel calls
-  `wake_up_interruptible()` on an internal wait queue, waking any Rust
-  thread parked in `poll()`/`epoll_wait()` on `/dev/kestrel_ctl`.
-- **Rust → Kernel**: after pushing into the response ring, Rust issues the
-  `KESTRELFS_IOC_NOTIFY_RESP` ioctl, which the kernel driver turns into
-  `wake_up_all()` on the wait queue backing any kernel thread blocked on a
-  pending response.
+字段使用 `<linux/types.h>` 定宽类型，显式填充与自然对齐（不 packed）。结构不变量
+用 `_Static_assert` / Rust 侧断言在编译期检查。
 
-See the extensive comments at the top of `kestrelfs/kestrelfs_ipc.h` for the
-full protocol rationale, and `kestrelfs/chardev.c` for the allocation
-(`vmalloc_user()`) and mapping (`remap_vmalloc_range()`) strategy.
+**唤醒模型**（无忙等）：
 
-### Opcode payload layouts (metadata operations)
+- **内核 → Rust**：推入请求环后 `wake_up_interruptible()`，唤醒在
+  `/dev/kestrel_ctl` 上 `poll`/`epoll_wait` 的 Rust 线程。
+- **Rust → 内核**：推入响应环后发 `KESTRELFS_IOC_NOTIFY_RESP` ioctl，内核
+  `wake_up_all()` 等待中的内核线程。
 
-`KESTRELFS_OP_LOOKUP` and `KESTRELFS_OP_GETATTR` each define a fixed,
-little-endian byte layout within the 32-byte payload (see
-`kestrelfs_ipc.h` for the authoritative, byte-offset-by-byte-offset
-documentation and matching `_Static_assert`s): `LOOKUP` requests carry
-`parent_inode(u64)` + `name_len(u8)` + up to 23 bytes of `name`;
-`LOOKUP`/`GETATTR` success responses each pack a different, fully
-payload-filling set of attribute fields (`child_inode_id`/`size`/`mode`/
-`uid`/`gid`/`nlink` for `LOOKUP`; `size`/`mode`/`uid`/`gid`/`nlink`/`mtime`
-for `GETATTR`, trading the repeated inode id for an `mtime` field since the
-requester already supplied that id and matches the response via `req_id`).
-Failures never use the payload - they are always carried in the event
-header's `error_code` field. This did not require an `KESTRELFS_ABI_VERSION`
-bump: it only adds interpretation rules for previously-reserved payload
-bytes of two opcodes that had no producer/consumer code on either side yet,
-without changing any existing struct's size, alignment, or field offsets.
+更多协议说明见 `kestrelfs/kestrelfs_ipc.h` 与 `kestrelfs/chardev.c`
+（`vmalloc_user()` / `remap_vmalloc_range()`）。
 
-### Known Limitations
+### 已知限制
 
-The Phase 3 stack supports create/mkdir/unlink/rmdir/rename/symlink,
-read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
-255-byte names (ABI v11). Remaining gaps include:
+Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
+truncate/`O_TRUNC`、批量 readdir、255 字节文件名（ABI v11）。仍缺：
 
-- **No hard link** yet; symlink targets currently require UTF-8 and are capped at 4095 bytes.
-- **GC delete failures can leak objects**: namespace metadata commits first for safety;
-  failed best-effort deletes are logged, but there is not yet a durable retry queue.
-- **Data/name IPC is globally serialized** by one mutex (correct but limits
-  concurrency).
-- **Redis metadata is currently a single-key/full-snapshot prototype**, not a
-  scalable per-inode schema. S3 delete failures can still leak objects because
-  GC has no durable retry queue.
-- **Phase 4 remains a single-node prototype**: v3 binds a persistent 4 KiB
-  block index to one namespace; miss/fill and mutation invalidation work, and
-  Step 22 can BIO aligned contiguous hits into pinned user pages, while Step 23
-  recycles full-cache slots using a block LRU. Step 24 validates full 4 KiB data
-  blocks and index entries using CRC32; corrupt data is retired as a local miss,
-  while corrupt index identity fails device loading closed. Partial or
-  unaligned ranges still use a temporary kernel block plus `copy_to_user()`.
-  Runtime access recency is not persisted across reload; CRC32 is not
-  cryptographic, and there is no journal/superblock mirror, asynchronous DMA
-  pipeline, or remote multi-node invalidation.
+- 尚无 hard link；symlink 目标目前要求 UTF-8，最长 4095 字节。
+- GC delete 失败可能泄漏对象（meta 先提交；尚无持久重试队列）。
+- 数据/名字 IPC 由一把全局 mutex 串行化。
+- Redis 元数据仍是单 key 全量快照原型；S3 delete 失败同样可泄漏。
+- Phase 4 仍是单节点原型：v4 绑定 namespace；CRC32 非密码学；半提交可安全
+  miss，但无双 superblock/metadata 镜像；hit 仍同步 BIO；无多节点远端失效；
+  journal 为每次 index 变更增加 prepare/clear flush 成本。
 
-Authoritative detail lives in `HANDOFF.md` §6.
+权威细节见 `HANDOFF.md` §6；后续排期见 `docs/remaining-capabilities.md`。
 
-### Coding standards
+### 编码规范
 
-- Kernel C code strictly follows the Linux kernel coding style and is built
-  exclusively out-of-tree — the kernel source tree itself is never modified
-  or rebuilt.
-- Kernel code is kept deliberately minimal, with defensive null/bounds
-  checks everywhere a fault could otherwise panic the kernel; all non-trivial
-  business logic is pushed to the Rust control plane.
-- Any structure shared across the C/Rust boundary is defined once in a
-  dual-purpose header and validated with compile-time layout assertions on
-  both sides — cross-language memory layout is never taken on faith.
+- 内核 C 遵循 Linux 内核编码风格，**仅树外构建**，不修改/重编整棵内核树。
+- 内核代码刻意精简，故障路径防御性检查；复杂业务逻辑下沉到 Rust。
+- 跨 C/Rust 结构只在双用途头文件中定义一次，两侧编译期断言布局。
 
 ---
 
-## Contributing
+## 贡献
 
-This project is under active, phase-gated development. Please open an issue
-before starting work on anything beyond the current phase in the
-[Roadmap](#roadmap) — out-of-order contributions are unlikely to be merged
-until their prerequisite phase lands.
+项目按阶段门控开发。请在动手实现**当前路线图阶段以外**的工作前先开 issue；
+乱序贡献在前置阶段落地前通常不会合并。
+
+协作约定：Cursor 验收与提示词写入 `docs/remaining-capabilities.md` §8；
+实现方读取该节执行，汇报写入 §9；已验收事实写入 `HANDOFF.md`。
 
 ---
 
-## License
+## 许可证
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+采用 [Apache License, Version 2.0](LICENSE)。

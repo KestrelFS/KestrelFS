@@ -6,8 +6,10 @@
  * Step 22 sends aligned, contiguous cache hits straight into pinned user pages;
  * unaligned head/tail blocks retain the buffered fallback.  Step 23 adds an
  * in-memory block LRU so a full cache can recycle slots.  Step 24 verifies a
- * persisted checksum before returning any hit.  Cache failures never replace
- * the authoritative daemon/ObjectStore path.
+ * persisted checksum before returning any hit.  Step 25 adds one persistent
+ * intent-journal page: an interrupted index transaction is recovered to a
+ * safe miss before the index is restored.  Cache failures never replace the
+ * authoritative daemon/ObjectStore path.
  */
 
 #include <linux/bio.h>
@@ -33,9 +35,18 @@
 #include "kestrelfs.h"
 
 #define KESTRELFS_CACHE_MAGIC		0x454843414353464bULL /* "KFSCACHE" LE */
-#define KESTRELFS_CACHE_FORMAT_VERSION	3U
+#define KESTRELFS_CACHE_FORMAT_VERSION	4U
 #define KESTRELFS_CACHE_SUPERBLOCK_SIZE	4096U
 #define KESTRELFS_CACHE_BLOCK_SIZE	4096U
+#define KESTRELFS_CACHE_JOURNAL_MAGIC	0x4e52554f4a53464bULL /* "KFSJOURN" LE */
+#define KESTRELFS_CACHE_JOURNAL_VERSION	1U
+#define KESTRELFS_CACHE_JOURNAL_PREPARED	1U
+#define KESTRELFS_CACHE_JOURNAL_START_LBA \
+	(KESTRELFS_CACHE_SUPERBLOCK_SIZE >> SECTOR_SHIFT)
+#define KESTRELFS_CACHE_INDEX_START_BYTES \
+	(KESTRELFS_CACHE_SUPERBLOCK_SIZE + KESTRELFS_CACHE_BLOCK_SIZE)
+#define KESTRELFS_CACHE_INDEX_START_LBA \
+	(KESTRELFS_CACHE_INDEX_START_BYTES >> SECTOR_SHIFT)
 #define KESTRELFS_CACHE_NAMESPACE_SIZE	32U
 #define KESTRELFS_CACHE_NAMESPACE_HEX_LEN \
 	(2U * KESTRELFS_CACHE_NAMESPACE_SIZE)
@@ -69,7 +80,31 @@ struct kestrelfs_cache_disk_superblock {
 	__le64 data_start_lba;
 	__le64 format_generation;
 	u8 namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
-	u8 reserved[KESTRELFS_CACHE_SUPERBLOCK_SIZE - 104];
+	__le64 journal_start_lba;
+	__le32 journal_size;
+	__le32 feature_flags;
+	u8 reserved[KESTRELFS_CACHE_SUPERBLOCK_SIZE - 124];
+	__le32 super_checksum;
+};
+
+enum kestrelfs_cache_journal_operation {
+	KESTRELFS_CACHE_JOURNAL_FILL = 1,
+	KESTRELFS_CACHE_JOURNAL_INVALIDATE = 2,
+	KESTRELFS_CACHE_JOURNAL_EVICT = 3,
+	KESTRELFS_CACHE_JOURNAL_RETIRE_CORRUPT = 4,
+};
+
+struct kestrelfs_cache_disk_journal {
+	__le64 magic;
+	__le32 version;
+	__le32 state;
+	__le64 sequence;
+	__le32 operation;
+	__le32 slot;
+	struct kestrelfs_cache_disk_index_entry old_entry;
+	struct kestrelfs_cache_disk_index_entry new_entry;
+	u8 reserved[KESTRELFS_CACHE_BLOCK_SIZE - 100];
+	__le32 checksum;
 };
 
 static_assert(sizeof(struct kestrelfs_cache_disk_index_entry) == 32);
@@ -79,6 +114,15 @@ static_assert(sizeof(struct kestrelfs_cache_disk_superblock) ==
 	      KESTRELFS_CACHE_SUPERBLOCK_SIZE);
 static_assert(offsetof(struct kestrelfs_cache_disk_superblock, namespace_id) ==
 	      72);
+static_assert(offsetof(struct kestrelfs_cache_disk_superblock,
+		       journal_start_lba) == 104);
+static_assert(offsetof(struct kestrelfs_cache_disk_superblock,
+		       super_checksum) == 4092);
+static_assert(sizeof(struct kestrelfs_cache_disk_journal) ==
+	      KESTRELFS_CACHE_BLOCK_SIZE);
+static_assert(offsetof(struct kestrelfs_cache_disk_journal, old_entry) == 32);
+static_assert(offsetof(struct kestrelfs_cache_disk_journal, new_entry) == 64);
+static_assert(offsetof(struct kestrelfs_cache_disk_journal, checksum) == 4092);
 static_assert(KESTRELFS_CACHE_SUPERBLOCK_SIZE <= PAGE_SIZE);
 
 struct kestrelfs_cache_index_key {
@@ -154,6 +198,12 @@ module_param_named(cache_checksum_failures,
 MODULE_PARM_DESC(cache_checksum_failures,
 		 "data blocks rejected because their checksum did not match");
 
+static unsigned long kestrelfs_cache_journal_recoveries;
+module_param_named(cache_journal_recoveries,
+		   kestrelfs_cache_journal_recoveries, ulong, 0444);
+MODULE_PARM_DESC(cache_journal_recoveries,
+		 "incomplete index transactions recovered to cache misses");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
@@ -165,10 +215,12 @@ static bool kestrelfs_cache_index_ready;
 static u64 kestrelfs_cache_usable_bytes;
 static u64 kestrelfs_cache_mutation_epoch = 1;
 static u64 kestrelfs_cache_entry_generation;
+static u64 kestrelfs_cache_journal_sequence;
 static u32 kestrelfs_cache_slot_count;
 static u32 kestrelfs_cache_logical_size;
 static u32 kestrelfs_cache_physical_size;
 static u8 kestrelfs_cache_namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
+static bool kestrelfs_cache_journal_active;
 
 static u32 kestrelfs_cache_checksum(const void *data, size_t length)
 {
@@ -181,6 +233,21 @@ static u32 kestrelfs_cache_disk_entry_checksum(
 	return kestrelfs_cache_checksum(disk,
 		offsetof(struct kestrelfs_cache_disk_index_entry,
 			 entry_checksum));
+}
+
+static u32 kestrelfs_cache_super_checksum(
+	const struct kestrelfs_cache_disk_superblock *super)
+{
+	return kestrelfs_cache_checksum(super,
+		offsetof(struct kestrelfs_cache_disk_superblock,
+			 super_checksum));
+}
+
+static u32 kestrelfs_cache_journal_checksum(
+	const struct kestrelfs_cache_disk_journal *journal)
+{
+	return kestrelfs_cache_checksum(journal,
+		offsetof(struct kestrelfs_cache_disk_journal, checksum));
 }
 
 static u32 kestrelfs_cache_pinned_checksum(struct page **pages,
@@ -249,7 +316,7 @@ static int kestrelfs_cache_parse_namespace(void)
 static u64 kestrelfs_cache_index_capacity(void)
 {
 	return (KESTRELFS_CACHE_METADATA_BYTES -
-		KESTRELFS_CACHE_SUPERBLOCK_SIZE) /
+		KESTRELFS_CACHE_INDEX_START_BYTES) /
 	       sizeof(struct kestrelfs_cache_disk_index_entry);
 }
 
@@ -506,6 +573,8 @@ static bool kestrelfs_cache_superblock_matches(
 {
 	return le64_to_cpu(super->magic) == KESTRELFS_CACHE_MAGIC &&
 	       le32_to_cpu(super->version) == KESTRELFS_CACHE_FORMAT_VERSION &&
+	       le32_to_cpu(super->super_checksum) ==
+			kestrelfs_cache_super_checksum(super) &&
 	       le32_to_cpu(super->header_size) ==
 			KESTRELFS_CACHE_SUPERBLOCK_SIZE &&
 	       le32_to_cpu(super->logical_block_size) ==
@@ -519,12 +588,18 @@ static bool kestrelfs_cache_superblock_matches(
 	       le64_to_cpu(super->usable_sectors) ==
 			(kestrelfs_cache_usable_bytes >> SECTOR_SHIFT) &&
 	       le64_to_cpu(super->index_start_lba) ==
-			(KESTRELFS_CACHE_SUPERBLOCK_SIZE >> SECTOR_SHIFT) &&
+			KESTRELFS_CACHE_INDEX_START_LBA &&
 	       le64_to_cpu(super->index_capacity) ==
 			kestrelfs_cache_index_capacity() &&
 	       le64_to_cpu(super->data_start_lba) ==
 			(KESTRELFS_CACHE_METADATA_BYTES >> SECTOR_SHIFT) &&
-	       le64_to_cpu(super->format_generation) != 0;
+	       le64_to_cpu(super->format_generation) != 0 &&
+	       le64_to_cpu(super->journal_start_lba) ==
+			KESTRELFS_CACHE_JOURNAL_START_LBA &&
+	       le32_to_cpu(super->journal_size) ==
+			KESTRELFS_CACHE_BLOCK_SIZE &&
+	       !le32_to_cpu(super->feature_flags) &&
+	       !memchr_inv(super->reserved, 0, sizeof(super->reserved));
 }
 
 static int kestrelfs_cache_load_or_format(void)
@@ -569,7 +644,7 @@ static int kestrelfs_cache_load_or_format(void)
 		super->usable_sectors = cpu_to_le64(
 			kestrelfs_cache_usable_bytes >> SECTOR_SHIFT);
 		super->index_start_lba = cpu_to_le64(
-			KESTRELFS_CACHE_SUPERBLOCK_SIZE >> SECTOR_SHIFT);
+			KESTRELFS_CACHE_INDEX_START_LBA);
 		super->index_capacity =
 			cpu_to_le64(kestrelfs_cache_index_capacity());
 		super->data_start_lba = cpu_to_le64(
@@ -577,6 +652,11 @@ static int kestrelfs_cache_load_or_format(void)
 		super->format_generation = cpu_to_le64(generation);
 		memcpy(super->namespace_id, kestrelfs_cache_namespace_id,
 		       sizeof(super->namespace_id));
+		super->journal_start_lba = cpu_to_le64(
+			KESTRELFS_CACHE_JOURNAL_START_LBA);
+		super->journal_size = cpu_to_le32(KESTRELFS_CACHE_BLOCK_SIZE);
+		super->super_checksum = cpu_to_le32(
+			kestrelfs_cache_super_checksum(super));
 
 		ret = kestrelfs_cache_rw_block(super, 0, true);
 		if (ret)
@@ -613,7 +693,7 @@ out:
 static int kestrelfs_cache_rw_index_entry(
 	u32 slot, struct kestrelfs_cache_disk_index_entry *disk, bool write)
 {
-	u64 byte_offset = KESTRELFS_CACHE_SUPERBLOCK_SIZE +
+	u64 byte_offset = KESTRELFS_CACHE_INDEX_START_BYTES +
 			  (u64)slot * sizeof(*disk);
 	sector_t sector = round_down(byte_offset,
 				     (u64)KESTRELFS_CACHE_BLOCK_SIZE) >>
@@ -639,6 +719,195 @@ static int kestrelfs_cache_rw_index_entry(
 	}
 out:
 	kfree(block);
+	return ret;
+}
+
+static bool kestrelfs_cache_disk_entry_empty(
+	const struct kestrelfs_cache_disk_index_entry *disk)
+{
+	return !memchr_inv(disk, 0, sizeof(*disk));
+}
+
+static bool kestrelfs_cache_disk_entry_valid(
+	const struct kestrelfs_cache_disk_index_entry *disk)
+{
+	return le64_to_cpu(disk->inode_id) &&
+	       !(le64_to_cpu(disk->file_offset) % KESTRELFS_CACHE_BLOCK_SIZE) &&
+	       le64_to_cpu(disk->generation) &&
+	       le32_to_cpu(disk->entry_checksum) ==
+			kestrelfs_cache_disk_entry_checksum(disk);
+}
+
+static void kestrelfs_cache_entry_to_disk(
+	const struct kestrelfs_cache_index_entry *entry,
+	struct kestrelfs_cache_disk_index_entry *disk)
+{
+	memset(disk, 0, sizeof(*disk));
+	disk->inode_id = cpu_to_le64(entry->key.inode_id);
+	disk->file_offset = cpu_to_le64(entry->key.file_offset);
+	disk->generation = cpu_to_le64(entry->generation);
+	disk->data_checksum = cpu_to_le32(entry->data_checksum);
+	disk->entry_checksum = cpu_to_le32(
+		kestrelfs_cache_disk_entry_checksum(disk));
+}
+
+static const char *kestrelfs_cache_journal_operation_name(u32 operation)
+{
+	switch (operation) {
+	case KESTRELFS_CACHE_JOURNAL_FILL:
+		return "fill";
+	case KESTRELFS_CACHE_JOURNAL_INVALIDATE:
+		return "invalidate";
+	case KESTRELFS_CACHE_JOURNAL_EVICT:
+		return "evict";
+	case KESTRELFS_CACHE_JOURNAL_RETIRE_CORRUPT:
+		return "retire-corrupt";
+	default:
+		return "invalid";
+	}
+}
+
+static bool kestrelfs_cache_journal_valid(
+	const struct kestrelfs_cache_disk_journal *journal)
+{
+	u32 operation = le32_to_cpu(journal->operation);
+	bool fill = operation == KESTRELFS_CACHE_JOURNAL_FILL;
+	bool removal = operation == KESTRELFS_CACHE_JOURNAL_INVALIDATE ||
+		       operation == KESTRELFS_CACHE_JOURNAL_EVICT ||
+		       operation == KESTRELFS_CACHE_JOURNAL_RETIRE_CORRUPT;
+
+	return le64_to_cpu(journal->magic) == KESTRELFS_CACHE_JOURNAL_MAGIC &&
+	       le32_to_cpu(journal->version) ==
+			KESTRELFS_CACHE_JOURNAL_VERSION &&
+	       le32_to_cpu(journal->state) ==
+			KESTRELFS_CACHE_JOURNAL_PREPARED &&
+	       le64_to_cpu(journal->sequence) &&
+	       le32_to_cpu(journal->slot) < kestrelfs_cache_slot_count &&
+	       (fill || removal) &&
+	       le32_to_cpu(journal->checksum) ==
+			kestrelfs_cache_journal_checksum(journal) &&
+	       ((fill &&
+		 kestrelfs_cache_disk_entry_empty(&journal->old_entry) &&
+		 kestrelfs_cache_disk_entry_valid(&journal->new_entry)) ||
+		(removal &&
+		 kestrelfs_cache_disk_entry_valid(&journal->old_entry) &&
+		 kestrelfs_cache_disk_entry_empty(&journal->new_entry)));
+}
+
+static int kestrelfs_cache_journal_begin(
+	enum kestrelfs_cache_journal_operation operation, u32 slot,
+	const struct kestrelfs_cache_disk_index_entry *old_entry,
+	const struct kestrelfs_cache_disk_index_entry *new_entry)
+{
+	struct kestrelfs_cache_disk_journal *journal;
+	int ret;
+
+	if (kestrelfs_cache_journal_active)
+		return -EIO;
+	journal = kzalloc(sizeof(*journal), GFP_KERNEL);
+	if (!journal)
+		return -ENOMEM;
+	if (!++kestrelfs_cache_journal_sequence)
+		kestrelfs_cache_journal_sequence = 1;
+	journal->magic = cpu_to_le64(KESTRELFS_CACHE_JOURNAL_MAGIC);
+	journal->version = cpu_to_le32(KESTRELFS_CACHE_JOURNAL_VERSION);
+	journal->state = cpu_to_le32(KESTRELFS_CACHE_JOURNAL_PREPARED);
+	journal->sequence = cpu_to_le64(kestrelfs_cache_journal_sequence);
+	journal->operation = cpu_to_le32(operation);
+	journal->slot = cpu_to_le32(slot);
+	journal->old_entry = *old_entry;
+	journal->new_entry = *new_entry;
+	journal->checksum = cpu_to_le32(
+		kestrelfs_cache_journal_checksum(journal));
+
+	/* A failed write may still be partial; block later transactions. */
+	kestrelfs_cache_journal_active = true;
+	ret = kestrelfs_cache_rw_block(journal,
+				       KESTRELFS_CACHE_JOURNAL_START_LBA, true);
+	kfree(journal);
+	return ret;
+}
+
+static int kestrelfs_cache_journal_clear(void)
+{
+	void *empty;
+	int ret;
+
+	empty = kzalloc(KESTRELFS_CACHE_BLOCK_SIZE, GFP_KERNEL);
+	if (!empty)
+		return -ENOMEM;
+	ret = kestrelfs_cache_rw_block(empty,
+				       KESTRELFS_CACHE_JOURNAL_START_LBA, true);
+	kfree(empty);
+	if (!ret)
+		kestrelfs_cache_journal_active = false;
+	return ret;
+}
+
+static int kestrelfs_cache_journal_replace(
+	enum kestrelfs_cache_journal_operation operation, u32 slot,
+	const struct kestrelfs_cache_disk_index_entry *old_entry,
+	struct kestrelfs_cache_disk_index_entry *new_entry)
+{
+	int ret;
+
+	ret = kestrelfs_cache_journal_begin(operation, slot, old_entry,
+					    new_entry);
+	if (ret)
+		return ret;
+	ret = kestrelfs_cache_rw_index_entry(slot, new_entry, true);
+	if (ret)
+		return ret;
+	return kestrelfs_cache_journal_clear();
+}
+
+static int kestrelfs_cache_recover_journal(void)
+{
+	struct kestrelfs_cache_disk_journal *journal;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
+	u64 sequence;
+	u32 operation;
+	u32 slot;
+	int ret;
+
+	journal = kzalloc(sizeof(*journal), GFP_KERNEL);
+	if (!journal)
+		return -ENOMEM;
+	ret = kestrelfs_cache_rw_block(journal,
+				       KESTRELFS_CACHE_JOURNAL_START_LBA, false);
+	if (ret)
+		goto out;
+	if (!memchr_inv(journal, 0, sizeof(*journal))) {
+		kestrelfs_cache_journal_active = false;
+		ret = 0;
+		goto out;
+	}
+	if (!kestrelfs_cache_journal_valid(journal)) {
+		pr_err("kestrelfs: invalid or torn cache journal\n");
+		ret = -EILSEQ;
+		goto out;
+	}
+
+	sequence = le64_to_cpu(journal->sequence);
+	operation = le32_to_cpu(journal->operation);
+	slot = le32_to_cpu(journal->slot);
+	kestrelfs_cache_journal_sequence =
+		max(kestrelfs_cache_journal_sequence, sequence);
+	kestrelfs_cache_journal_active = true;
+
+	/* PREPARED is intentionally recovered to an empty slot, never replayed. */
+	ret = kestrelfs_cache_rw_index_entry(slot, &empty, true);
+	if (ret)
+		goto out;
+	ret = kestrelfs_cache_journal_clear();
+	if (ret)
+		goto out;
+	kestrelfs_cache_journal_recoveries++;
+	pr_info("kestrelfs: recovered incomplete cache %s transaction sequence=%llu slot=%u to miss\n",
+		kestrelfs_cache_journal_operation_name(operation),
+		(unsigned long long)sequence, slot);
+out:
+	kfree(journal);
 	return ret;
 }
 
@@ -697,7 +966,7 @@ static int kestrelfs_cache_restore_index(void)
 
 	for (slot = 0; slot < kestrelfs_cache_index_capacity();
 	     slot += entries_per_block) {
-		sector = (KESTRELFS_CACHE_SUPERBLOCK_SIZE >> SECTOR_SHIFT) +
+		sector = KESTRELFS_CACHE_INDEX_START_LBA +
 			 (sector_t)(slot / entries_per_block) *
 			 KESTRELFS_CACHE_SECTORS_PER_BLOCK;
 		ret = kestrelfs_cache_rw_block(block, sector, false);
@@ -800,13 +1069,17 @@ kestrelfs_cache_find(u64 inode_id, u64 file_offset)
 static void kestrelfs_cache_discard_corrupt(
 	struct kestrelfs_cache_index_entry *entry)
 {
-	struct kestrelfs_cache_disk_index_entry disk = { 0 };
+	struct kestrelfs_cache_disk_index_entry old_entry;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
 	int ret;
 
 	pr_warn_ratelimited("kestrelfs: cache data checksum mismatch inode=%llu offset=%llu slot=%u\n",
 		(unsigned long long)entry->key.inode_id,
 		(unsigned long long)entry->key.file_offset, entry->slot);
-	ret = kestrelfs_cache_rw_index_entry(entry->slot, &disk, true);
+	kestrelfs_cache_entry_to_disk(entry, &old_entry);
+	ret = kestrelfs_cache_journal_replace(
+		KESTRELFS_CACHE_JOURNAL_RETIRE_CORRUPT, entry->slot,
+		&old_entry, &empty);
 	if (ret) {
 		pr_warn("kestrelfs: failed to persist corrupt cache entry removal: %d\n",
 			ret);
@@ -829,7 +1102,8 @@ static void kestrelfs_cache_discard_corrupt(
  */
 static int kestrelfs_cache_evict_lru(unsigned long *reclaimed_slot)
 {
-	struct kestrelfs_cache_disk_index_entry disk = { 0 };
+	struct kestrelfs_cache_disk_index_entry old_entry;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
 	struct kestrelfs_cache_index_entry *victim;
 	int ret;
 
@@ -838,7 +1112,9 @@ static int kestrelfs_cache_evict_lru(unsigned long *reclaimed_slot)
 	victim = list_first_entry(&kestrelfs_cache_entries,
 				  struct kestrelfs_cache_index_entry, list);
 
-	ret = kestrelfs_cache_rw_index_entry(victim->slot, &disk, true);
+	kestrelfs_cache_entry_to_disk(victim, &old_entry);
+	ret = kestrelfs_cache_journal_replace(
+		KESTRELFS_CACHE_JOURNAL_EVICT, victim->slot, &old_entry, &empty);
 	if (ret)
 		return ret;
 	ret = rhashtable_remove_fast(&kestrelfs_cache_index, &victim->node,
@@ -860,6 +1136,7 @@ static int kestrelfs_cache_evict_lru(unsigned long *reclaimed_slot)
 static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 				      const u8 *data, size_t length)
 {
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
 	struct kestrelfs_cache_disk_index_entry disk = { 0 };
 	struct kestrelfs_cache_index_entry *entry;
 	unsigned long slot;
@@ -896,9 +1173,6 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 	entry->generation = kestrelfs_cache_entry_generation;
 	entry->slot = slot;
 
-	ret = kestrelfs_cache_rw_block(block, entry->lba, true);
-	if (ret)
-		goto out;
 	/*
 	 * Reserve the in-memory key while the cache mutex still hides it from
 	 * lookup.  This prevents publishing a persistent entry that cannot be
@@ -910,23 +1184,29 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 		goto out;
 	entry->hashed = true;
 
-	disk.inode_id = cpu_to_le64(inode_id);
-	disk.file_offset = cpu_to_le64(file_offset);
-	disk.generation = cpu_to_le64(entry->generation);
-	disk.data_checksum = cpu_to_le32(entry->data_checksum);
-	disk.entry_checksum = cpu_to_le32(
-		kestrelfs_cache_disk_entry_checksum(&disk));
+	kestrelfs_cache_entry_to_disk(entry, &disk);
+	ret = kestrelfs_cache_journal_begin(KESTRELFS_CACHE_JOURNAL_FILL,
+					    slot, &empty, &disk);
+	if (ret)
+		goto remove_hash;
+	ret = kestrelfs_cache_rw_block(block, entry->lba, true);
+	if (ret)
+		goto remove_hash;
 	ret = kestrelfs_cache_rw_index_entry(slot, &disk, true);
-	if (ret) {
-		rhashtable_remove_fast(&kestrelfs_cache_index, &entry->node,
-				       kestrelfs_cache_index_params);
-		entry->hashed = false;
-		goto out;
-	}
+	if (ret)
+		goto remove_hash;
+	ret = kestrelfs_cache_journal_clear();
+	if (ret)
+		goto remove_hash;
 
 	__set_bit(slot, kestrelfs_cache_slots);
 	list_add_tail(&entry->list, &kestrelfs_cache_entries);
 	entry = NULL;
+	goto out;
+remove_hash:
+	rhashtable_remove_fast(&kestrelfs_cache_index, &entry->node,
+			       kestrelfs_cache_index_params);
+	entry->hashed = false;
 out:
 	kfree(block);
 	kfree(entry);
@@ -1127,7 +1407,8 @@ out:
 
 int kestrelfs_cache_invalidate_inode(u64 inode_id)
 {
-	struct kestrelfs_cache_disk_index_entry disk = { 0 };
+	struct kestrelfs_cache_disk_index_entry old_entry;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
 	struct kestrelfs_cache_index_entry *entry, *tmp;
 	int ret = 0;
 
@@ -1141,7 +1422,10 @@ int kestrelfs_cache_invalidate_inode(u64 inode_id)
 	list_for_each_entry_safe(entry, tmp, &kestrelfs_cache_entries, list) {
 		if (entry->key.inode_id != inode_id)
 			continue;
-		ret = kestrelfs_cache_rw_index_entry(entry->slot, &disk, true);
+		kestrelfs_cache_entry_to_disk(entry, &old_entry);
+		ret = kestrelfs_cache_journal_replace(
+			KESTRELFS_CACHE_JOURNAL_INVALIDATE, entry->slot,
+			&old_entry, &empty);
 		if (ret)
 			break;
 		if (entry->hashed)
@@ -1171,6 +1455,9 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_direct_fallbacks = 0;
 	kestrelfs_cache_evictions = 0;
 	kestrelfs_cache_checksum_failures = 0;
+	kestrelfs_cache_journal_recoveries = 0;
+	kestrelfs_cache_journal_sequence = 0;
+	kestrelfs_cache_journal_active = false;
 	ret = kestrelfs_cache_parse_namespace();
 	if (ret)
 		return ret;
@@ -1193,6 +1480,9 @@ int kestrelfs_cache_init(void)
 	ret = kestrelfs_cache_load_or_format();
 	if (ret)
 		goto err_release;
+	ret = kestrelfs_cache_recover_journal();
+	if (ret)
+		goto err_release;
 	ret = kestrelfs_cache_restore_index();
 	if (ret)
 		goto err_release;
@@ -1210,12 +1500,13 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	mutex_lock(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu journal_recoveries=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
 		kestrelfs_cache_evictions,
-		kestrelfs_cache_checksum_failures);
+		kestrelfs_cache_checksum_failures,
+		kestrelfs_cache_journal_recoveries);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);

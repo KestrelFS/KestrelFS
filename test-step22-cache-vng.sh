@@ -92,7 +92,7 @@ stop_daemon
 echo "STEP22_CACHE: daemon-stopped direct hit passed"
 unmount_and_unload
 
-# Reload the same v2 device and time the Step 20 buffered-copy path.
+# Reload the same current-format device and time the Step 20 buffered-copy path.
 load_cache 0
 start_daemon
 busybox mount -t kestrelfs none "$mnt"

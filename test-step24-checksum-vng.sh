@@ -7,9 +7,9 @@ image=/tmp/kestrel-step24-cache-$test_id.img
 mnt=/tmp/mnt-kestrelfs-step24-$test_id
 data_dir=/tmp/kestrelfs-step24-$test_id
 helper=/tmp/kestrel-step24-cache-io-$test_id
-metadata_backup=$data_dir/metadata-v3-good.bin
+metadata_backup=$data_dir/metadata-v4-good.bin
 data_start=$((2 * 1024 * 1024))
-index_start=4096
+index_start=8192
 loopdev=
 daemon_pid=
 last_umount_ms=0
@@ -157,7 +157,7 @@ stop_daemon
 echo "STEP24_CACHE: buffered corruption retired and refilled"
 unmount_and_unload
 
-# Save valid v3 metadata, then corrupt a slot-0 key byte without updating CRC.
+# Save valid v4 metadata, then corrupt a slot-0 key byte without updating CRC.
 dd if="$loopdev" of="$metadata_backup" bs=1M count=2 status=none
 printf '\377' | dd of="$loopdev" bs=1 \
 	seek=$((index_start + 8)) conv=notrunc status=none
