@@ -716,8 +716,8 @@ Codex 策略：
 - [x] ABI 版本核对无误（内核 = Rust = 11）
 - [x] Step 8–18 + Phase 4 Step 19 已验收状态已写清
 - [x] 下一步明确：等待 Cursor 的 Step 20 提示词
-- [x] 开发 zvol 路径：`/dev/zvol/nvraid1tank1/kestrel-cache`
-- [x] Codex 默认用 vng+loop；宿主机 zvol 需人类配置 NOPASSWD sudo（见 §8）
+- [x] 开发 zvol 路径：`/dev/zvol/nvraid1tank1/kestrel-cache`（4K volblocksize）
+- [x] NOPASSWD 已配置；Codex：vng+loop 必测，宿主机 zvol 在 `sudo -n insmod` 可用时必测（见 §8）
 
 ---
 
