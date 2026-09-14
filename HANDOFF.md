@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 3 Step 16 RedisMetaStore 原型已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
+> **最后更新**：Phase 3 Step 17 S3ObjectStore 原型已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
@@ -43,7 +43,8 @@
                     │    └─ RedisMetaStore (可选原型)   │
                     │  ObjectStore (块数据)             │
                     │    ├─ MemObjectStore (内存)       │
-                    │    └─ LocalFsObjectStore (磁盘)   │
+                    │    ├─ LocalFsObjectStore (磁盘)   │
+                    │    └─ S3ObjectStore (S3/MinIO)    │
                     └───────────▲──────────────────────┘
                                 │ mmap() 共享内存双环 + ioctl/poll
                     ┌───────────▼──────────────────────┐
@@ -88,6 +89,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       ├── meta_persist.rs      # FileMetaStore（JSON 持久化）
 │       ├── meta_redis.rs        # RedisMetaStore（单 key 快照 + Lua CAS）
 │       ├── object_store.rs      # ObjectStore trait + MemObjectStore + LocalFsObjectStore
+│       ├── object_store_s3.rs   # S3ObjectStore（AWS SDK、MinIO path-style）
 │       ├── fs_model.rs          # Inode / Slice / Block 数据模型
 │       ├── device.rs            # /dev/kestrel_ctl 打开/mmap/ABI校验
 │       ├── ring.rs              # Rust 侧 ring buffer 读写
@@ -128,8 +130,9 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 14** | **符号链接（MetaStore 持有 target，VFS symlink/get_link）** | **11** | **✅ 已验收** |
 | **Step 15** | **unlink / rename 覆盖 / truncate 的无引用 ObjectStore block GC** | **11（未变）** | **✅ 已验收** |
 | **Step 16** | **可切换 RedisMetaStore 原型（单 key 快照 + Lua CAS）** | **11（未变）** | **✅ 已验收** |
+| **Step 17** | **可切换 S3ObjectStore 原型（AWS S3 / MinIO）** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认 Step 15 已验收。
+Cursor 对照代码、137 tests 与实现方 MinIO 门控测确认 Step 17 已验收。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
@@ -192,16 +195,19 @@ Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认
 
 ### 5.5 存储现状
 
-| 层 | 内存模式 (`--memory`) | 默认持久化模式 | Redis metadata 模式 (`--meta redis://...`) |
+| 层 | 内存模式 (`--memory`) | 默认持久化模式 | 可选远端后端 |
 |---|---|---|---|
-| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`{prefix}:meta:v1` 单 key JSON；Lua CAS 原子提交） |
-| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | 仍为 `LocalFsObjectStore`；本步未实现 S3 |
+| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；`{prefix}:meta:v1` 单 key JSON + Lua CAS） |
+| 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | `S3ObjectStore`（`--objects s3://bucket/prefix`；AWS S3 或 MinIO） |
 
 **CLI 参数**（`daemon/src/main.rs`）：
 - `--data-dir <PATH>`：持久化目录（默认 `./.kestrelfs-data`），meta.json 和块数据均存于此
 - `--memory`：纯内存模式（元数据 + 块数据均不持久化）
 - `--meta <REDIS_URL>`：将 metadata 切到 Redis，例如 `redis://127.0.0.1:6379/0`；与 `--memory` 冲突
 - `--redis-prefix <PREFIX>`：Redis key 命名空间，默认 `kestrelfs`，实际 key 为 `<PREFIX>:meta:v1`
+- `--objects <S3_URL>`：将对象数据切到 S3，例如 `s3://bucket/kestrelfs-data`；与 `--memory` 冲突，可与 FileMetaStore 或 RedisMetaStore 任意组合
+- `--s3-endpoint <URL>`：可选 S3 兼容 endpoint；设置后强制 path-style，适配 MinIO。未传时读取 `S3_ENDPOINT`，再回退到 AWS SDK 默认 endpoint
+- S3 凭据/region：走 AWS SDK provider chain；常用环境变量为 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、可选 `AWS_SESSION_TOKEN` 与 `AWS_REGION`
 
 ---
 
@@ -227,9 +233,11 @@ Cursor 对照代码、130 tests 与 vng（`VNG_GC_PASS`，umount≈92ms）确认
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 很多时成本较高；未来 Redis/S3 后端需要引用计数或持久化 GC 队列。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` |
 | 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
 | 18 | **RedisMetaStore 是全量快照原型** | 每次读 GET/反序列化整份 JSON；每次写还要全量序列化并 Lua CAS，冲突最多重试 64 次。优点是 rename、inode 分配、slice 裁剪和 GC keys 与元数据在单 key 上线性化；大规模部署需拆 key/索引或采用服务端 Lua 数据模型。 | `daemon/src/meta_redis.rs` |
-| 19 | **Redis metadata + LocalFs objects 不是共享数据面** | 多 daemon 可共享 Redis metadata，但本步 ObjectStore 仍是节点本地目录；节点使用不同 `--data-dir` 时可能看见 slice metadata 却缺少对象。S3ObjectStore 接入前只适合单 daemon 或共享同一对象目录的原型验证。 | `daemon/src/main.rs` 存储选择 |
+| 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
 | 20 | **Redis 快照损坏/丢失时 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，Redis key 已存在但 JSON 非法时 daemon 启动失败；运行中 key 被外部删除时 metadata 操作返回 EIO，避免静默创建新文件系统。 | `daemon/src/meta_redis.rs` |
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
+| 22 | **S3 delete 仍是提交后 best-effort** | Step 15 在 metadata 提交后调用 S3 DeleteObject；成功会真删对象，缺失对象视为成功。网络/权限失败只记录泄漏，不回滚已生效的 unlink/rename/truncate，也没有持久化重试队列。 | `daemon/src/object_store_s3.rs`、`daemon/src/main.rs` |
+| 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -253,7 +261,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（当前 133 个）
+cargo test                    # 单元测试 + 集成测试（当前 137 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -492,6 +500,54 @@ kill "$daemon_pid"; wait "$daemon_pid" || true
 sudo rmmod kestrelfs
 ```
 
+### 7.11 Step 17 S3ObjectStore / MinIO 集成测试
+
+默认 `cargo test` 不访问 S3；以下环境变量齐全时执行真实 S3/MinIO 测试。
+`S3_CREATE_BUCKET=1` 只用于测试，可在 bucket 不存在时创建专用测试 bucket：
+
+```bash
+export S3_ENDPOINT=http://192.168.18.253:9000
+export S3_BUCKET=kestrelfs-test
+export S3_CREATE_BUCKET=1
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+export AWS_REGION=us-east-1
+cd daemon
+cargo test s3_environment_gated -- --nocapture
+```
+
+2026-09-14 已对上述 MinIO 执行：`2 passed; 0 failed`。一项覆盖
+put/get/覆盖/幂等 delete，另一项覆盖 handle_write_bytes → unlink → Step 15 GC
+→ S3 DeleteObject → GET NotFound。对象使用随机 prefix，测试结束后对象已删除。
+
+人类补充 Redis + S3 挂载/重启烟测时，沿用固定模块和 data-dir 约定：
+
+```bash
+: "${KESTRELFS_REDIS_PASSWORD:?请先 export KESTRELFS_REDIS_PASSWORD}"
+export REDIS_URL="redis://:${KESTRELFS_REDIS_PASSWORD}@192.168.18.253:8379/15"
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
+sudo insmod kestrelfs/kestrelfs.ko
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 --s3-endpoint http://192.168.18.253:9000 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mkdir -p /mnt/kestrelfs
+sudo mount -t kestrelfs none /mnt/kestrelfs
+sudo rm -f /mnt/kestrelfs/step17-s3-file
+printf 'redis plus s3 survives restart\n' | sudo tee /mnt/kestrelfs/step17-s3-file >/dev/null
+sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 --s3-endpoint http://192.168.18.253:9000 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mount -t kestrelfs none /mnt/kestrelfs
+test "$(sudo cat /mnt/kestrelfs/step17-s3-file)" = "redis plus s3 survives restart"
+sudo rm /mnt/kestrelfs/step17-s3-file
+time sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+sudo rmmod kestrelfs
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -500,8 +556,8 @@ sudo rmmod kestrelfs
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 17 提示词** | 默认候选：S3ObjectStore 原型 |
-| 2 | S3 ObjectStore | 补齐 Redis metadata 对应的共享对象数据面 |
+| 1 | **等待 Cursor 的 Step 18 提示词** | 候选：Phase 4 NVMe 缓存启动，或分布式后端生产化 |
+| 2 | 分布式后端生产化 | Redis 拆 key、持久 GC 重试、连接恢复与配置治理 |
 | 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
 
 > **⚠️ 明确**：在 Cursor 新提示词下达前，Codex **不要**自行开始 Redis/S3/Phase 4 等任何方向。只做 Cursor 提示词范围内的事。
@@ -532,12 +588,12 @@ sudo rmmod kestrelfs
 
 ## 10. 交接检查清单
 
-- [x] Step 16 RedisMetaStore 已由 Cursor 验收并提交（133 tests；真实 Redis 门控测由实现方跑通）
+- [x] Step 17 S3ObjectStore 已由 Cursor 验收并提交（137 tests；MinIO 门控测由实现方跑通）
 - [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–16 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 17 提示词（S3ObjectStore）
+- [x] Step 8–17 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 18 提示词
 - [x] 已知限制与坑已列出（第 6 节）
-- [x] `test-step15-gc-vng.sh` 已入库；vng 站立规则见 §9
+- [x] vng 站立规则见 §9
 ---
 
 ## 11. 文档债务

@@ -4,7 +4,8 @@
 //! # Status
 //!
 //! This binary is an early control-plane daemon: it now has local and Redis
-//! metadata backends, while S3 and the Phase 4 data plane remain unimplemented.
+//! metadata backends plus local and S3-compatible object backends, while the
+//! Phase 4 data plane remains unimplemented.
 //! Its original bootstrap established two things
 //! end-to-end:
 //!
@@ -55,6 +56,7 @@ mod meta;
 mod meta_persist;
 mod meta_redis;
 mod object_store;
+mod object_store_s3;
 mod ring;
 
 // Keep the storage model's validation limit pinned to the wire contract.
@@ -109,6 +111,19 @@ struct Args {
         conflicts_with = "memory"
     )]
     redis_prefix: String,
+
+    /// S3 object location, for example s3://bucket/optional/prefix.
+    ///
+    /// When omitted, persistent object data remains in `data_dir`.
+    #[arg(long, value_name = "S3_URL", conflicts_with = "memory")]
+    objects: Option<String>,
+
+    /// Custom S3-compatible endpoint, for example http://127.0.0.1:9000.
+    ///
+    /// Primarily intended for MinIO. If omitted, `S3_ENDPOINT` is consulted,
+    /// then the AWS SDK's normal S3 endpoint is used.
+    #[arg(long, value_name = "URL", requires = "objects", conflicts_with = "memory")]
+    s3_endpoint: Option<String>,
 }
 
 /// Seeds the single block backing `remote.txt`'s initial content.
@@ -181,8 +196,8 @@ fn main() -> io::Result<()> {
     // implementation uses Tokio-aware network I/O through this same runtime.
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Initialize ObjectStore and MetaStore based on CLI flags. Redis changes
-    // only the metadata backend; block objects deliberately remain LocalFs.
+    // Initialize ObjectStore and MetaStore independently so File/Redis metadata
+    // can be paired with LocalFs/S3 objects.
     let (object_store, store): (Arc<dyn ObjectStore>, Arc<dyn MetaStore>) = if args.memory {
         println!("kestrelfs-daemon: using in-memory storage (data will not persist)");
         (
@@ -194,11 +209,27 @@ fn main() -> io::Result<()> {
             "kestrelfs-daemon: using local filesystem storage at {}",
             args.data_dir.display()
         );
-        let obj_store = Arc::new(
-            runtime
-                .block_on(object_store::LocalFsObjectStore::new(&args.data_dir))
-                .map_err(|e| io::Error::other(e.to_string()))?,
-        );
+        let obj_store: Arc<dyn ObjectStore> = if let Some(location) = args.objects.as_deref() {
+            let endpoint = args
+                .s3_endpoint
+                .clone()
+                .or_else(|| std::env::var("S3_ENDPOINT").ok());
+            println!("kestrelfs-daemon: using S3-compatible object storage");
+            Arc::new(
+                runtime
+                    .block_on(object_store_s3::S3ObjectStore::new(
+                        location,
+                        endpoint.as_deref(),
+                    ))
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            )
+        } else {
+            Arc::new(
+                runtime
+                    .block_on(object_store::LocalFsObjectStore::new(&args.data_dir))
+                    .map_err(|e| io::Error::other(e.to_string()))?,
+            )
+        };
         let meta_store: Arc<dyn MetaStore> = if let Some(redis_url) = args.meta.as_deref() {
             // Do not print the URL: it may contain Redis credentials.
             println!(
@@ -1254,8 +1285,8 @@ async fn handle_getattr(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> K
 ///   file's size, return `-ENOENT`.
 ///
 /// For this Phase 3 step, only `remote.txt` (inode 3) has any slices
-/// seeded (one Slice covering 0..512), and only MemObjectStore is wired
-/// up (no Redis/S3 yet). A future Phase 4 will generalize this to
+/// seeded (one Slice covering 0..512), with the selected ObjectStore serving
+/// its bytes. A future Phase 4 will generalize this to
 /// arbitrary files, multi-block slices, and network-backed stores.
 async fn handle_read_chunk(
     event: &KestrelfsEvent,
@@ -1653,35 +1684,65 @@ mod tests {
     use super::*;
     use crate::meta_persist::FileMetaStore;
     use crate::object_store::LocalFsObjectStore;
+    use crate::object_store_s3::S3ObjectStore;
     use meta::{MemStore, REMOTE_TXT_INODE};
     use tempfile::TempDir;
 
     #[test]
-    fn cli_selects_file_memory_or_redis_metadata_exclusively() {
+    fn cli_selects_metadata_and_object_backends() {
         let default_args = Args::try_parse_from(["kestrelfs-daemon"]).unwrap();
         assert!(!default_args.memory);
         assert!(default_args.meta.is_none());
+        assert!(default_args.objects.is_none());
 
         let memory_args = Args::try_parse_from(["kestrelfs-daemon", "--memory"]).unwrap();
         assert!(memory_args.memory);
         assert!(memory_args.meta.is_none());
 
-        let redis_args = Args::try_parse_from([
+        let distributed_args = Args::try_parse_from([
             "kestrelfs-daemon",
             "--meta",
             "redis://127.0.0.1:6379/0",
             "--redis-prefix",
             "test-fs",
+            "--objects",
+            "s3://test-bucket/test-prefix",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
         ])
         .unwrap();
-        assert_eq!(redis_args.meta.as_deref(), Some("redis://127.0.0.1:6379/0"));
-        assert_eq!(redis_args.redis_prefix, "test-fs");
+        assert_eq!(
+            distributed_args.meta.as_deref(),
+            Some("redis://127.0.0.1:6379/0")
+        );
+        assert_eq!(distributed_args.redis_prefix, "test-fs");
+        assert_eq!(
+            distributed_args.objects.as_deref(),
+            Some("s3://test-bucket/test-prefix")
+        );
+        assert_eq!(
+            distributed_args.s3_endpoint.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
 
         assert!(Args::try_parse_from([
             "kestrelfs-daemon",
             "--memory",
             "--meta",
             "redis://127.0.0.1:6379/0",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--memory",
+            "--objects",
+            "s3://test-bucket/prefix",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
         ])
         .is_err());
     }
@@ -3400,6 +3461,58 @@ mod tests {
             Err(object_store::ObjectStoreError::NotFound(_))
         ));
         assert!(!temp_dir.path().join(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn s3_environment_gated_unlink_gc_deletes_object() {
+        let (Ok(endpoint), Ok(bucket), Ok(_access_key), Ok(_secret_key)) = (
+            std::env::var("S3_ENDPOINT"),
+            std::env::var("S3_BUCKET"),
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) else {
+            eprintln!("S3 integration environment not set; skipping S3 GC assertions");
+            return;
+        };
+        let prefix = format!("kestrelfs-gc-tests/{}", uuid::Uuid::new_v4());
+        let s3 = S3ObjectStore::new(&format!("s3://{bucket}/{prefix}"), Some(&endpoint))
+            .await
+            .unwrap();
+        s3.ensure_bucket_for_test().await;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(s3.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "s3-gc", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+
+        let response = handle_write_bytes(
+            1002,
+            inode,
+            0,
+            b"S3 garbage collected payload".to_vec(),
+            "TEST_S3_WRITE",
+            &store,
+            &object_store,
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        let key = store
+            .read_slices(inode, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .block_key(0);
+        assert_eq!(s3.get(&key).await.unwrap(), b"S3 garbage collected payload");
+
+        let unlink = raw_unlink_req(1003, fs_model::ROOT_INODE, "s3-gc");
+        let response = build_response(&unlink, &store, &object_store).await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert!(matches!(
+            s3.get(&key).await,
+            Err(object_store::ObjectStoreError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

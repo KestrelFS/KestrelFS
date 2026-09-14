@@ -2,10 +2,10 @@
 //! Block/chunk storage abstraction for KestrelFS Phase 3 step 3.
 //!
 //! This module defines [`ObjectStore`], the trait every storage backend
-//! must implement (whether in-memory [`MemObjectStore`], Redis, S3, or
-//! a future NVMe-cached hybrid), and the first concrete implementation:
-//! a pure-memory `HashMap` that holds blocks keyed by content-addressed
-//! (or at least stable, caller-chosen) string keys.
+//! must implement (whether in-memory [`MemObjectStore`], local filesystem,
+//! S3, or a future NVMe-cached hybrid), plus the memory/local implementations.
+//! The S3 implementation lives in `object_store_s3.rs`. Objects are keyed by
+//! content-addressed (or at least stable, caller-chosen) string keys.
 //!
 //! # Why "ObjectStore" instead of "BlockStore"
 //!
@@ -109,7 +109,7 @@ pub trait ObjectStore: Send + Sync {
 }
 
 /// In-memory, `HashMap`-backed [`ObjectStore`] for Phase 3
-/// bootstrapping (no Redis/S3 dependency yet).
+/// bootstrapping and tests.
 ///
 /// Internally `Arc<RwLock<HashMap<String, Vec<u8>>>>` so it can be
 /// cheaply cloned and shared across async tasks without Arc-wrapping at
@@ -128,8 +128,7 @@ pub trait ObjectStore: Send + Sync {
 ///
 /// This is purely a Phase 3 step 3 scaffolding piece, exercised by
 /// reading `/mnt/kestrelfs/remote.txt` after the daemon seeds a single
-/// block at startup. Real deployments will use `RedisObjectStore` or
-/// `S3CachedObjectStore` (future Phase 4+ work).
+/// block at startup. Persistent deployments can select LocalFs or S3.
 #[derive(Clone)]
 pub struct MemObjectStore {
     inner: Arc<RwLock<HashMap<String, Vec<u8>>>>,
