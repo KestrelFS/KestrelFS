@@ -18,7 +18,7 @@
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
-> ⚠️ **Project status: early development (Phase 4 Step 23; ABI v11).**
+> ⚠️ **Project status: early development (Phase 4 Step 24; ABI v11).**
 > Phase 1–3 are done. Phase 3 provides a working control-plane prototype
 > (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore`, an
 > optional Redis metadata prototype, `LocalFsObjectStore`, and an optional
@@ -28,8 +28,9 @@
 > cache format to an explicit namespace SHA-256 identity. Step 22 sends aligned,
 > contiguous read hits directly into pinned user pages, while partial/unaligned
 > ranges safely retain the buffered fallback. Step 23 adds block-LRU slot
-> recycling when the cache is full. Checksums, asynchronous DMA, and multi-node
-> invalidation are not implemented. See
+> recycling when the cache is full. Step 24's v3 cache format validates every
+> 4 KiB data block and index entry with CRC32 before accepting a hit. Journaling,
+> asynchronous DMA, and multi-node invalidation are not implemented. See
 > [Roadmap](#roadmap) and `HANDOFF.md`.
 
 ---
@@ -104,10 +105,11 @@ a language and privilege boundary:
 **Data plane (kernel, C).** An out-of-tree Linux kernel module that:
 - Registers a VFS filesystem type and implements the inode/dentry/file
   operations needed to mount and serve files.
-- Owns the local NVMe SSD cache boundary. Steps 20–23 restore/persist its fixed
+- Owns the local NVMe SSD cache boundary. Steps 20–24 restore/persist its fixed
   block index, fill READ_DATA misses, reject namespace identity mismatches, and
   send eligible aligned cache hits directly into pinned user pages; full caches
-  recycle block slots with an in-memory LRU — see
+  recycle block slots with an in-memory LRU, while v3 data/index CRCs reject
+  corrupt hits — see
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md).
 - Talks to the Rust daemon only when necessary (cache miss, metadata
   lookup) via a lock-free shared-memory IPC bridge.
@@ -141,7 +143,7 @@ phase beyond what's marked "done" below is implemented.**
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
 | **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic VFS operations, bounce-buffer I/O, symlink, truncate, GC, local persistence, optional RedisMetaStore and S3ObjectStore prototypes (ABI v11 / Steps 1–17). | ✅ Prototype complete |
-| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 23 — block-LRU eviction prototype (v2 format) |
+| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 24 — data/index CRC32 prototype (v3 format) |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
 
@@ -163,6 +165,7 @@ KestrelFS/   # local checkout directory may historically be named FerroFS
 ├── test-step22-cache-vng.sh # pinned-page hit/copy fallback/A-B regression
 ├── test-step22-cache-io.c   # aligned read verifier used by Step 22 vng test
 ├── test-step23-eviction-vng.sh # small-cache LRU/reload regression
+├── test-step24-checksum-vng.sh # data/index corruption and v2 rejection regression
 └── daemon/                    # Rust control-plane daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
 ```
@@ -471,13 +474,16 @@ read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
 - **Redis metadata is currently a single-key/full-snapshot prototype**, not a
   scalable per-inode schema. S3 delete failures can still leak objects because
   GC has no durable retry queue.
-- **Phase 4 remains a single-node prototype**: v2 binds a persistent 4 KiB
+- **Phase 4 remains a single-node prototype**: v3 binds a persistent 4 KiB
   block index to one namespace; miss/fill and mutation invalidation work, and
   Step 22 can BIO aligned contiguous hits into pinned user pages, while Step 23
-  recycles full-cache slots using a block LRU. Partial or
+  recycles full-cache slots using a block LRU. Step 24 validates full 4 KiB data
+  blocks and index entries using CRC32; corrupt data is retired as a local miss,
+  while corrupt index identity fails device loading closed. Partial or
   unaligned ranges still use a temporary kernel block plus `copy_to_user()`.
-  Runtime access recency is not persisted across reload; there is no
-  checksum/journal, asynchronous DMA pipeline, or remote multi-node invalidation.
+  Runtime access recency is not persisted across reload; CRC32 is not
+  cryptographic, and there is no journal/superblock mirror, asynchronous DMA
+  pipeline, or remote multi-node invalidation.
 
 Authoritative detail lives in `HANDOFF.md` §6.
 

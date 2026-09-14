@@ -5,14 +5,16 @@
  * Step 21 binds Step 20's persistent 4 KiB cache to one metadata namespace.
  * Step 22 sends aligned, contiguous cache hits straight into pinned user pages;
  * unaligned head/tail blocks retain the buffered fallback.  Step 23 adds an
- * in-memory block LRU so a full cache can recycle slots.  Cache failures never
- * replace the authoritative daemon/ObjectStore path.
+ * in-memory block LRU so a full cache can recycle slots.  Step 24 verifies a
+ * persisted checksum before returning any hit.  Cache failures never replace
+ * the authoritative daemon/ObjectStore path.
  */
 
 #include <linux/bio.h>
 #include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/build_bug.h>
+#include <linux/crc32.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
@@ -31,7 +33,7 @@
 #include "kestrelfs.h"
 
 #define KESTRELFS_CACHE_MAGIC		0x454843414353464bULL /* "KFSCACHE" LE */
-#define KESTRELFS_CACHE_FORMAT_VERSION	2U
+#define KESTRELFS_CACHE_FORMAT_VERSION	3U
 #define KESTRELFS_CACHE_SUPERBLOCK_SIZE	4096U
 #define KESTRELFS_CACHE_BLOCK_SIZE	4096U
 #define KESTRELFS_CACHE_NAMESPACE_SIZE	32U
@@ -48,8 +50,9 @@
 struct kestrelfs_cache_disk_index_entry {
 	__le64 inode_id;
 	__le64 file_offset;
-	__le64 lba;
 	__le64 generation;
+	__le32 data_checksum;
+	__le32 entry_checksum;
 };
 
 struct kestrelfs_cache_disk_superblock {
@@ -70,6 +73,8 @@ struct kestrelfs_cache_disk_superblock {
 };
 
 static_assert(sizeof(struct kestrelfs_cache_disk_index_entry) == 32);
+static_assert(offsetof(struct kestrelfs_cache_disk_index_entry,
+		       entry_checksum) == 28);
 static_assert(sizeof(struct kestrelfs_cache_disk_superblock) ==
 	      KESTRELFS_CACHE_SUPERBLOCK_SIZE);
 static_assert(offsetof(struct kestrelfs_cache_disk_superblock, namespace_id) ==
@@ -87,6 +92,7 @@ struct kestrelfs_cache_index_entry {
 	struct kestrelfs_cache_index_key key;
 	sector_t lba;
 	u64 generation;
+	u32 data_checksum;
 	u32 slot;
 	bool hashed;
 };
@@ -142,6 +148,12 @@ module_param_named(cache_evictions, kestrelfs_cache_evictions, ulong, 0444);
 MODULE_PARM_DESC(cache_evictions,
 		 "cache blocks retired for slot reuse since module load");
 
+static unsigned long kestrelfs_cache_checksum_failures;
+module_param_named(cache_checksum_failures,
+		   kestrelfs_cache_checksum_failures, ulong, 0444);
+MODULE_PARM_DESC(cache_checksum_failures,
+		 "data blocks rejected because their checksum did not match");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
@@ -157,6 +169,42 @@ static u32 kestrelfs_cache_slot_count;
 static u32 kestrelfs_cache_logical_size;
 static u32 kestrelfs_cache_physical_size;
 static u8 kestrelfs_cache_namespace_id[KESTRELFS_CACHE_NAMESPACE_SIZE];
+
+static u32 kestrelfs_cache_checksum(const void *data, size_t length)
+{
+	return crc32_le(~0U, data, length) ^ ~0U;
+}
+
+static u32 kestrelfs_cache_disk_entry_checksum(
+	const struct kestrelfs_cache_disk_index_entry *disk)
+{
+	return kestrelfs_cache_checksum(disk,
+		offsetof(struct kestrelfs_cache_disk_index_entry,
+			 entry_checksum));
+}
+
+static u32 kestrelfs_cache_pinned_checksum(struct page **pages,
+					    unsigned int first_offset,
+					    size_t start, size_t length)
+{
+	size_t absolute = first_offset + start;
+	size_t remaining = length;
+	u32 checksum = ~0U;
+
+	while (remaining) {
+		unsigned int page_index = absolute / PAGE_SIZE;
+		unsigned int offset = absolute % PAGE_SIZE;
+		unsigned int bytes = min_t(size_t, PAGE_SIZE - offset,
+					       remaining);
+		void *mapped = kmap_local_page(pages[page_index]);
+
+		checksum = crc32_le(checksum, (u8 *)mapped + offset, bytes);
+		kunmap_local(mapped);
+		absolute += bytes;
+		remaining -= bytes;
+	}
+	return checksum ^ ~0U;
+}
 
 static int kestrelfs_cache_lru_compare(void *priv,
 				       const struct list_head *left,
@@ -274,7 +322,9 @@ out_page:
  * modified a prefix before reporting the error.
  */
 static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
-					     size_t length)
+					     size_t length,
+					     const u32 *checksums,
+					     unsigned int *bad_block)
 {
 	struct page **pages;
 	struct bio *bio;
@@ -283,6 +333,7 @@ static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
 	unsigned int page_offset = offset_in_page(address);
 	unsigned int dma_alignment;
 	unsigned int nr_pages;
+	unsigned int nr_blocks;
 	unsigned int i;
 	long pinned;
 	size_t remaining;
@@ -292,6 +343,7 @@ static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
 	if (!length || length > KESTRELFS_CACHE_DIRECT_MAX_BYTES ||
 	    length % KESTRELFS_CACHE_BLOCK_SIZE)
 		return -EINVAL;
+	nr_blocks = length / KESTRELFS_CACHE_BLOCK_SIZE;
 
 	dma_alignment = bdev_dma_alignment(kestrelfs_cache_bdev);
 	if ((address & dma_alignment) ||
@@ -336,6 +388,20 @@ static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
 
 	submitted = true;
 	ret = submit_bio_wait(bio);
+	if (!ret) {
+		for (i = 0; i < nr_blocks; i++) {
+			u32 actual = kestrelfs_cache_pinned_checksum(
+				pages, page_offset,
+				i * KESTRELFS_CACHE_BLOCK_SIZE,
+				KESTRELFS_CACHE_BLOCK_SIZE);
+
+			if (actual != checksums[i]) {
+				*bad_block = i;
+				ret = -EILSEQ;
+				break;
+			}
+		}
+	}
 out_bio:
 	bio_put(bio);
 out_unpin:
@@ -602,7 +668,8 @@ static int kestrelfs_cache_restore_index(void)
 {
 	struct kestrelfs_cache_disk_index_entry *disk;
 	struct kestrelfs_cache_index_entry *entry;
-	u64 inode_id, file_offset, lba, generation;
+	u64 inode_id, file_offset, generation;
+	u32 data_checksum;
 	u64 restored = 0;
 	void *block = NULL;
 	sector_t sector;
@@ -645,19 +712,23 @@ static int kestrelfs_cache_restore_index(void)
 			       in_block;
 			inode_id = le64_to_cpu(disk->inode_id);
 			file_offset = le64_to_cpu(disk->file_offset);
-			lba = le64_to_cpu(disk->lba);
 			generation = le64_to_cpu(disk->generation);
 
 			if (!inode_id) {
-				if (file_offset || lba || generation) {
+				if (memchr_inv(disk, 0, sizeof(*disk))) {
 					ret = -EINVAL;
 					goto corrupt;
 				}
 				continue;
 			}
+			if (le32_to_cpu(disk->entry_checksum) !=
+			    kestrelfs_cache_disk_entry_checksum(disk)) {
+				ret = -EILSEQ;
+				goto corrupt;
+			}
+			data_checksum = le32_to_cpu(disk->data_checksum);
 			if (slot + in_block >= kestrelfs_cache_slot_count ||
 			    file_offset % KESTRELFS_CACHE_BLOCK_SIZE ||
-			    lba != kestrelfs_cache_slot_lba(slot + in_block) ||
 			    !generation) {
 				ret = -EINVAL;
 				goto corrupt;
@@ -670,8 +741,9 @@ static int kestrelfs_cache_restore_index(void)
 			}
 			entry->key.inode_id = inode_id;
 			entry->key.file_offset = file_offset;
-			entry->lba = lba;
+			entry->lba = kestrelfs_cache_slot_lba(slot + in_block);
 			entry->generation = generation;
+			entry->data_checksum = data_checksum;
 			entry->slot = slot + in_block;
 			ret = rhashtable_insert_fast(&kestrelfs_cache_index,
 						     &entry->node,
@@ -716,6 +788,37 @@ kestrelfs_cache_find(u64 inode_id, u64 file_offset)
 
 	return rhashtable_lookup_fast(&kestrelfs_cache_index, &key,
 				      kestrelfs_cache_index_params);
+}
+
+/*
+ * A corrupt data block must stop being a hit even if persisting the cleared
+ * entry fails.  Keep that slot reserved for this module lifetime when the
+ * clear fails: reusing it could leave an old key on disk pointing at another
+ * key's identical data after a crash.  Reload may restore the old entry, but
+ * its data checksum will reject it again before any bytes are returned.
+ */
+static void kestrelfs_cache_discard_corrupt(
+	struct kestrelfs_cache_index_entry *entry)
+{
+	struct kestrelfs_cache_disk_index_entry disk = { 0 };
+	int ret;
+
+	pr_warn_ratelimited("kestrelfs: cache data checksum mismatch inode=%llu offset=%llu slot=%u\n",
+		(unsigned long long)entry->key.inode_id,
+		(unsigned long long)entry->key.file_offset, entry->slot);
+	ret = kestrelfs_cache_rw_index_entry(entry->slot, &disk, true);
+	if (ret) {
+		pr_warn("kestrelfs: failed to persist corrupt cache entry removal: %d\n",
+			ret);
+	} else {
+		__clear_bit(entry->slot, kestrelfs_cache_slots);
+	}
+	if (entry->hashed)
+		rhashtable_remove_fast(&kestrelfs_cache_index, &entry->node,
+				       kestrelfs_cache_index_params);
+	list_del(&entry->list);
+	kfree(entry);
+	kestrelfs_cache_checksum_failures++;
 }
 
 /*
@@ -786,6 +889,8 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 	entry->key.inode_id = inode_id;
 	entry->key.file_offset = file_offset;
 	entry->lba = kestrelfs_cache_slot_lba(slot);
+	entry->data_checksum = kestrelfs_cache_checksum(
+		block, KESTRELFS_CACHE_BLOCK_SIZE);
 	if (!++kestrelfs_cache_entry_generation)
 		kestrelfs_cache_entry_generation = 1;
 	entry->generation = kestrelfs_cache_entry_generation;
@@ -807,8 +912,10 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 
 	disk.inode_id = cpu_to_le64(inode_id);
 	disk.file_offset = cpu_to_le64(file_offset);
-	disk.lba = cpu_to_le64(entry->lba);
 	disk.generation = cpu_to_le64(entry->generation);
+	disk.data_checksum = cpu_to_le32(entry->data_checksum);
+	disk.entry_checksum = cpu_to_le32(
+		kestrelfs_cache_disk_entry_checksum(&disk));
 	ret = kestrelfs_cache_rw_index_entry(slot, &disk, true);
 	if (ret) {
 		rhashtable_remove_fast(&kestrelfs_cache_index, &entry->node,
@@ -837,6 +944,8 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 	u64 block_offset;
 	size_t wanted;
 	size_t copied = 0;
+	u32 direct_checksums[KESTRELFS_CACHE_DIRECT_MAX_BYTES /
+			     KESTRELFS_CACHE_BLOCK_SIZE];
 	void *block = NULL;
 	ssize_t ret = -ENODATA;
 
@@ -883,6 +992,10 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		 */
 		if (cache_direct_io && !within &&
 		    bytes == KESTRELFS_CACHE_BLOCK_SIZE) {
+			unsigned int bad_block = 0;
+			int io_ret;
+
+			direct_checksums[0] = entry->data_checksum;
 			while (direct_bytes < KESTRELFS_CACHE_DIRECT_MAX_BYTES &&
 			       block_offset + direct_bytes +
 				       KESTRELFS_CACHE_BLOCK_SIZE <= end) {
@@ -893,12 +1006,16 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 				if (!next || next->lba != entry->lba +
 						(direct_bytes >> SECTOR_SHIFT))
 					break;
+				direct_checksums[direct_bytes /
+						 KESTRELFS_CACHE_BLOCK_SIZE] =
+					next->data_checksum;
 				direct_bytes += KESTRELFS_CACHE_BLOCK_SIZE;
 			}
 
-			if (!kestrelfs_cache_read_user_blocks(entry->lba,
-							   buf + copied,
-							   direct_bytes)) {
+			io_ret = kestrelfs_cache_read_user_blocks(
+				entry->lba, buf + copied, direct_bytes,
+				direct_checksums, &bad_block);
+			if (!io_ret) {
 				u64 touch_offset;
 
 				for (touch_offset = block_offset;
@@ -917,6 +1034,16 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 				block_offset += direct_bytes;
 				continue;
 			}
+			if (io_ret == -EILSEQ) {
+				entry = kestrelfs_cache_find(
+					inode_id, block_offset +
+						  bad_block *
+						  KESTRELFS_CACHE_BLOCK_SIZE);
+				if (entry)
+					kestrelfs_cache_discard_corrupt(entry);
+				ret = -ENODATA;
+				goto out;
+			}
 			kestrelfs_cache_direct_fallbacks++;
 		}
 
@@ -927,6 +1054,13 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 			goto out;
 		}
 		if (kestrelfs_cache_rw_block(block, entry->lba, false)) {
+			ret = -ENODATA;
+			goto out;
+		}
+		if (kestrelfs_cache_checksum(block,
+					     KESTRELFS_CACHE_BLOCK_SIZE) !=
+		    entry->data_checksum) {
+			kestrelfs_cache_discard_corrupt(entry);
 			ret = -ENODATA;
 			goto out;
 		}
@@ -1036,6 +1170,7 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_copy_hit_blocks = 0;
 	kestrelfs_cache_direct_fallbacks = 0;
 	kestrelfs_cache_evictions = 0;
+	kestrelfs_cache_checksum_failures = 0;
 	ret = kestrelfs_cache_parse_namespace();
 	if (ret)
 		return ret;
@@ -1075,11 +1210,12 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	mutex_lock(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
-		kestrelfs_cache_evictions);
+		kestrelfs_cache_evictions,
+		kestrelfs_cache_checksum_failures);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);

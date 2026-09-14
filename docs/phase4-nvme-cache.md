@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–23）
+## 当前边界（Step 18–24）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -10,8 +10,8 @@ KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接�
 Step 18 落地模块参数和 read hook；Step 19 使用独占读写模式真正 claim 专用
 块设备，校验 geometry，并格式化/复用最小 cache superblock。Step 20 在不改变
 cache format v1 和 IPC ABI v11 的前提下启用盘上索引恢复、READ_DATA miss 后同步
-fill、同步块读 hit，以及 rewrite/truncate/unlink/rename-overwrite 失效。当前 hit 是
-普通 BIO 加 `copy_to_user()`，不是 DMA/零拷贝最终路径。
+fill、同步块读 hit，以及 rewrite/truncate/unlink/rename-overwrite 失效。该步的 hit
+是普通 BIO 加 `copy_to_user()`；Step 22 在满足约束时绕过这次复制。
 
 Step 21 要求每个 cache device 显式绑定一个 logical filesystem namespace。
 namespace 不匹配时在恢复任何 index entry 前 fail closed，从而阻止 inode id 在
@@ -26,10 +26,18 @@ pin/BIO 构造失败时，按 block 回退到 Step 20 buffered-copy 路径。mis
 daemon 路径没有变化。
 
 Step 23 在 cache 满时按 4 KiB block 回收内存 LRU 头部，而不再停止 fill。运行期
-成功 hit 或命中已有 entry 的 fill 会把 entry 移到 LRU 尾部；模块重载后用 v2
+成功 hit 或命中已有 entry 的 fill 会把 entry 移到 LRU 尾部；模块重载后用盘上
 index 已有的 generation 恢复插入顺序，避免在热 hit 上增加持久化写。驱逐先清零
 并 flush 旧盘上 index，随后才移除内存 key、覆写 data slot、发布新 index，保证
 被回收 key 不会指向复用后的错误数据。
+
+Step 24 把 cache format bump 到 v3，为每个完整 4 KiB data block 持久化 IEEE
+CRC32，同时为每个非空 index entry 持久化独立 CRC32。buffered 和 pinned-page
+两条 hit 路径都在返回成功前校验完整 data block。data CRC 不匹配时只退休对应
+entry 并回退远端 miss，其他 entry 继续可用；加载时 index CRC 不匹配则拒绝整个
+cache device，因为损坏的 key/slot 身份不能安全地局部猜测。IPC ABI 仍为 v11。
+若退休坏 entry 的持久化清零失败，内存中立即停止命中，但该 slot 在本次模块加载
+期间保持占用且不复用；这是用容量降级换取 crash/reload 后不会发生 key 别名。
 
 ## 缓存设备
 
@@ -85,12 +93,12 @@ filesystem 在重启时必须使用同一 digest；修改 MetaStore namespace �
 dataset 时必须使用不同 digest。
 
 `cache_direct_io` 默认为 1。设为 0 只关闭 Step 22 用户页直达，保留 Step 20
-同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。四个只读
-观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks` 和
-`cache_direct_fallbacks`、`cache_evictions` 可从 sysfs 读取；它们不是稳定用户
-ABI。
+同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。五个只读
+观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks`、
+`cache_direct_fallbacks`、`cache_evictions` 和 `cache_checksum_failures` 可从
+sysfs 读取；它们不是稳定用户 ABI。
 
-## Step 19–23 磁盘格式
+## Step 19–24 磁盘格式
 
 所有多字节字段采用 little-endian，LBA 固定表示 512 字节 sector。磁盘头占
 第一个 4 KiB：
@@ -98,7 +106,7 @@ ABI。
 | Offset | 字段 | 类型/含义 |
 |---:|---|---|
 | 0 | magic | u64，字节串 `KFSCACHE` |
-| 8 | version | u32，当前为 2 |
+| 8 | version | u32，当前为 3 |
 | 12 | header_size | u32，4096 |
 | 16 | logical_block_size | u32，格式化时设备值 |
 | 20 | physical_block_size | u32，格式化时设备值 |
@@ -112,11 +120,13 @@ ABI。
 | 72 | namespace_id | 32 字节 SHA-256 digest |
 | 104 | reserved | 补齐至 4096 字节 |
 
-LBA 8 到 4095 是预留的盘上索引区。每个 32 字节条目由
-`inode_id + file_offset + lba + generation` 组成；全零条目表示空闲。数据区从
-LBA 4096 开始。Step 20 将索引 slot 与 data LBA 固定一一映射：
-`lba = data_start_lba + slot * 8`。有效 slot 数是索引容量与实际 4 KiB data block
-数量的较小者，因此小设备不会产生越界 LBA。
+LBA 8 到 4095 是预留的盘上索引区。v3 每个 32 字节条目由
+`inode_id:u64 + file_offset:u64 + generation:u64 + data_crc32:u32 +
+entry_crc32:u32` 组成；entry CRC 覆盖其前 28 字节，全零条目表示空闲。没有重复
+持久化 LBA：索引 slot 与 data LBA 固定一一映射，
+`lba = data_start_lba + slot * 8`。这样在增加两个 checksum 后仍保持 32 字节条目
+和 65408 个索引容量。有效 slot 数是索引容量与实际 4 KiB data block 数量的
+较小者，因此小设备不会产生越界 LBA。
 
 Step 21 将 cache format 从 v1 bump 到 v2；v1 设备不会自动迁移或清空。自动格式化
 只发生在整个 2 MiB 保留元数据区全零时，并只写入 4 KiB
@@ -125,14 +135,15 @@ closed，模块加载返回错误，不覆盖已有内容。用不同 `cache_siz
 已格式化设备也视为 geometry mismatch；v2 namespace digest 不匹配会输出独立的
 `cache namespace identity mismatch` 并拒绝加载。当前没有 `wipe` 模块参数，重用
 旧 v1 或其他 namespace 的设备必须由运维显式清空后再加载，避免误操作。
+Step 24 再从 v2 bump 到 v3；v1/v2 都默认拒绝，不自动 wipe、迁移或重算 checksum。
 
 ## 命中和未命中路径
 
 ```text
 VFS read
   -> kestrelfs_cache_lookup(inode, file_offset, length)
-       -> aligned hit: pin 用户页 -> 连续块合并 BIO -> 用户页（不进 ring）
-       -> partial/fallback hit: 同步 4 KiB BIO -> 内核页 -> copy_to_user
+       -> aligned hit: pin 用户页 -> 连续块合并 BIO -> 用户页 -> 逐块 CRC（不进 ring）
+       -> partial/fallback hit: 同步 4 KiB BIO -> 内核页 -> CRC -> copy_to_user
        -> miss: 返回 -ENODATA
   -> 取得 kestrelfs_data_ipc_lock
   -> READ_DATA + 16 KiB bounce + req/resp ring
@@ -151,14 +162,18 @@ hook 位于 `kestrelfs_data_ipc_lock` 之前，因此 hit 不占 bounce buffer�
 块设备 logical sector 与 DMA mask 时自动使用 buffered fallback。提交过 BIO 的
 用户页在完成后按 dirty unpin，包括设备报告错误的情形，因为失败 BIO 也可能已经
 修改部分页；之后 buffered path 会覆盖请求区间，若 cache 设备仍失败则回远端 miss。
+pinned-page 路径在页仍固定时对每个 4 KiB block 计算 CRC；若失败，系统调用不会
+把这批字节作为成功结果返回，条目先被退休，再由同一次 READ_DATA miss 覆盖完整
+请求区间。buffered 路径则在 `copy_to_user()` 前完成校验，因此坏字节从不复制给
+调用者。
 
 ## 索引模型
 
 索引键为 `(inode_id, 4 KiB-aligned file_offset)`，内存值为
-`LBA + generation + slot`。模块加载时按 4 KiB 页扫描 2 MiB 元数据区，校验每个
-非空条目的 offset 对齐、slot/LBA 对应关系和非零 generation，再恢复到
-`rhashtable` 和 slot bitmap。重复 key、半空条目或越界映射均使模块 fail
-closed；不会猜测或覆盖可疑格式。
+`LBA + generation + slot + data_crc32`。模块加载时按 4 KiB 页扫描 2 MiB 元数据区，
+先校验每个非空条目的 entry CRC，再检查 offset 对齐、slot 映射和非零 generation，
+然后恢复到 `rhashtable` 和 slot bitmap。重复 key、半空条目、坏 CRC 或越界映射
+均使模块 fail closed；不会猜测或覆盖可疑格式。
 
 generation 在当前版本中用于持久化条目版本和恢复后继续单调分配；同一模块
 生命周期内另有全局 mutation epoch 防止 miss 与并发 mutation 竞态发布旧 fill。
@@ -168,9 +183,10 @@ list，不同步写 generation，因此重启会丢失精确访问热度并退�
 
 ## 填充、失效与顺序
 
-miss 时 daemon 仍通过 `READ_DATA` 把远端数据放入 bounce。Step 20 在把数据交付
-给调用者后同步填充：先写并 flush 4 KiB data block，再写并 flush 32-byte 索引
-所在的 4 KiB metadata page，保证索引不会先于数据发布。非对齐 read 的首个
+miss 时 daemon 仍通过 `READ_DATA` 把远端数据放入 bounce。fill 对 EOF 尾块补零，
+计算完整 4 KiB data CRC，再先写并 flush data block，最后写带 data/entry CRC 的
+32-byte index entry 并 flush 所在 4 KiB metadata page，保证索引不会先于数据
+发布。非对齐 read 的首个
 partial block 不填充；EOF 尾块补零后可填充。填充失败不影响已经成功的远端
 读取。cache 满时 Step 23 回收 LRU 头部：先把 victim 的盘上 index 清零并 flush，
 成功后从 rhashtable/list/bitmap 移除，再写入并 flush 新 data，最后发布并 flush
@@ -207,18 +223,19 @@ pin 生命周期、index generation 和 slot reuse 的复杂竞态。
 - 失效写失败会拒绝 mutation；这是“宁可写失败、不可脏命中”的选择。
 - Step 23 是 block 粒度、单锁内存 LRU；重启后只恢复 generation insertion order，
   不持久化精确 hit recency，也没有分区配额、热点保护或批量 metadata 回收。
-- 当前没有数据 checksum、索引 journal/镜像或 torn-write 检测。
+- v3 的逐 data block CRC 可局部退休坏数据，index entry CRC 在恢复时 fail closed；
+  CRC32 不是密码学完整性保护，仍存在碰撞概率。当前没有 journal、双 superblock
+  或 metadata 镜像，superblock/reserved 区的 torn write 保护仍不完整。
 - Step 22 是 read hit 的受限少拷贝路径：完整、对齐、连续块可以直达用户页；
   partial block 和不能 pin/对齐的 buffer 仍有一次 `copy_to_user()`。它不是异步
   DMA、`read_iter`/page-cache/splice 全覆盖，也没有并行 BIO pipeline。
-- v2 superblock 已持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
+- v3 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
 - 只观察本机 VFS mutation；其他节点或直接修改 Redis 的操作没有失效通知，
   所以 Step 20 仍是单 kernel/daemon correctness prototype，不可直接作为共享
   Redis+S3 多节点缓存部署。
-- 当前格式没有 checksum 或双 superblock；任何已识别字段不匹配都会拒绝，
-  但 reserved 区和未来索引项的损坏检测仍属于后续版本。
+- v1/v2 cache 默认拒绝且不自动迁移；当前仍无显式 wipe 参数。
 - exclusive holder 防止其他内核 holder 抢占设备，但不能在所有内核配置下阻止
   root 直接 raw write；设备隔离仍是部署要求。
 
@@ -229,9 +246,9 @@ pin 生命周期、index generation 和 slot reuse 的复杂竞态。
 验证完整块直达，也用 `file_offset=1`、`user_shift=1` 和越过 EOF 的请求覆盖非对齐
 head/tail 与 EOF clamp；随后停 daemon 再读，证明 hit 不经过 IPC。
 
-脚本在同一 v2 cache、相同 namespace 和同一 1 MiB × 64 次 `pread()` workload 上，
+脚本在同一 v3 cache、相同 namespace 和同一 1 MiB × 64 次 `pread()` workload 上，
 分别以 `cache_direct_io=0/1` 重载模块。2026-09-14 的 TCG vng 粗测为：buffered
-copy 3.88 s（16.51 MiB/s），pinned-page direct 0.54 s（117.65 MiB/s），约 7.1×。
+copy 3.80 s（16.84 MiB/s），pinned-page direct 0.73 s（87.34 MiB/s），约 5.2×。
 这是 loop + TCG 下的路径级对比，不代表真实 NVMe 性能；辅助程序的数据校验成本
 也包含在两组数字中。验收看明确 PASS、命中计数和数据一致性，不把固定倍数作为
 门槛。
@@ -244,6 +261,20 @@ data slot 的 loop cache。它先用 1 MiB 文件 A 填满全部 slot，再命�
 A 尾块仍命中，而被驱逐的 A[1] 必须读取失败；rmmod/insmod 后重复边界断言，并
 确认恢复 256 个 entry。
 
-2026-09-14 自检输出 `cache_evictions=32`、`restored 256 cache index entries`、
-`STEP23_EVICTION_PASS`，最终复跑 umount 67 ms。脚本自身包含 `insmod`、合法 64-hex
-namespace、PID 隔离的 data-dir 和 daemon.log；只允许通过 vng+loop 执行。
+2026-09-14 在 v3 最终格式上复跑输出 `cache_evictions=32`、
+`restored 256 cache index entries`、`STEP23_EVICTION_PASS`，umount 68 ms。脚本自身
+包含 `insmod`、合法 64-hex namespace、PID 隔离的 data-dir 和 daemon.log；只允许
+通过 vng+loop 执行。
+
+## Step 24 vng 数据完整性验证
+
+`test-step24-checksum-vng.sh` 在 vng guest 的 16 MiB loop 上填充两个独立 entry，
+分别 raw 修改 slot 0 和 slot 1 的 data byte。它覆盖 pinned-page 完整块以及
+`file_offset=1/user_shift=1` 的 buffered 非对齐读取：daemon 停止时坏 entry 必须
+miss、未损坏 entry 仍必须命中；daemon 恢复后坏范围从 ObjectStore 重填，随后
+再次停 daemon 仍可命中。两条路径都断言 `cache_checksum_failures=1`。
+
+脚本随后修改 slot 0 的 `file_offset` 而不更新 entry CRC，要求模块加载在恢复索引
+时失败；最后把 superblock version 改成 v2，要求无迁移拒绝。2026-09-14 最终
+自检输出 `STEP24_CHECKSUM_PASS`，最后一次 umount 53 ms。所有 load 均含 `insmod`、
+合法 namespace、PID 隔离 data-dir 和保留的 daemon.log，仅通过 vng+loop 执行。
