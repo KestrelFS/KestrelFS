@@ -18,11 +18,13 @@
 
 **A high-performance, cloud-native distributed filesystem — built with a pragmatic C + Rust hybrid architecture, engineered to outperform JuiceFS.**
 
-> ⚠️ **Project status: early development (Phase 3 in progress; ABI v11).**
-> Phase 1–2 are done. Phase 3 currently provides a working local control plane
+> ⚠️ **Project status: early development (Phase 4 Step 18; ABI v11).**
+> Phase 1–3 are done. Phase 3 provides a working control-plane prototype
 > (dynamic VFS ops, 16 KiB bounce-buffer data/name IPC, `FileMetaStore`, an
 > optional Redis metadata prototype, `LocalFsObjectStore`, and an optional
-> S3/MinIO object prototype). Phase 4 NVMe cache is **not** started — see
+> S3/MinIO object prototype). Phase 4 now has its kernel-owned cache boundary,
+> block-device configuration, and a compileable always-miss read hook; it does
+> not perform cache I/O yet. See
 > [Roadmap](#roadmap) and `HANDOFF.md`.
 
 ---
@@ -89,7 +91,7 @@ a language and privilege boundary:
                          │                                 │
                          │  • VFS registration (super/inode/file) │
                          │  • /dev/kestrel_ctl char device  │
-                         │  • Local NVMe cache (planned)     │
+                         │  • Local NVMe cache (stub/hook)   │
                          │  • Zero-copy read/write (planned) │
                          └─────────────────────────────────┘
 ```
@@ -97,8 +99,9 @@ a language and privilege boundary:
 **Data plane (kernel, C).** An out-of-tree Linux kernel module that:
 - Registers a VFS filesystem type and implements the inode/dentry/file
   operations needed to mount and serve files.
-- Owns the local NVMe SSD cache and performs zero-copy reads on cache hits
-  (planned — see [Roadmap](#roadmap)).
+- Owns the local NVMe SSD cache boundary. Step 18 has an always-miss read hook;
+  block I/O and zero-copy cache hits remain planned — see
+  [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md).
 - Talks to the Rust daemon only when necessary (cache miss, metadata
   lookup) via a lock-free shared-memory IPC bridge.
 
@@ -130,8 +133,8 @@ phase beyond what's marked "done" below is implemented.**
 |---|---|---|
 | **1. Minimal C kernel VFS skeleton** | Out-of-tree module, VFS registration, super/inode/file ops. | ✅ Done |
 | **2. C↔Rust IPC bridge** | `/dev/kestrel_ctl`, mmap dual SPSC rings, poll/ioctl, Rust daemon consumer. | ✅ Done |
-| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic VFS operations, bounce-buffer I/O, symlink, truncate, GC, local persistence, optional RedisMetaStore and S3ObjectStore prototypes (ABI v11 / Steps 1–17). | 🚧 In progress — Redis + S3-compatible shared backend prototype implemented |
-| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits DMA back to the VFS caller, bypassing the Rust daemon. | ⏳ Not started |
+| **3. Rust daemon control plane** | MetaStore + ObjectStore, dynamic VFS operations, bounce-buffer I/O, symlink, truncate, GC, local persistence, optional RedisMetaStore and S3ObjectStore prototypes (ABI v11 / Steps 1–17). | ✅ Prototype complete |
+| **4. Kernel-owned NVMe cache** | Direct I/O against a local NVMe block device from kernel space. Cache hits bypass the Rust daemon. | 🚧 Step 18 — block-device config + always-miss read hook |
 
 See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
 
@@ -143,10 +146,11 @@ See `HANDOFF.md` for step-level progress, opcodes, and known limitations.
 KestrelFS/   # local checkout directory may historically be named FerroFS
 ├── LICENSE / README.md / HANDOFF.md
 ├── kestrelfs/                 # kernel module (C) — out-of-tree build
-│   ├── Makefile, super.c, inode.c, dir.c, file.c
+│   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
 │   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI contract (ABI v11)
 │   └── chardev_test.c
+├── docs/phase4-nvme-cache.md # Phase 4 ownership/index/invalidation design
 └── daemon/                    # Rust control-plane daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
 ```
@@ -443,7 +447,7 @@ without changing any existing struct's size, alignment, or field offsets.
 
 ### Known Limitations
 
-Current Phase 3 local stack supports create/mkdir/unlink/rmdir/rename/symlink,
+The Phase 3 stack supports create/mkdir/unlink/rmdir/rename/symlink,
 read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
 255-byte names (ABI v11). Remaining gaps include:
 
@@ -454,7 +458,10 @@ read/write (16 KiB bounce), truncate/`O_TRUNC`, and batched readdir with
   concurrency).
 - **Redis metadata is currently a single-key/full-snapshot prototype**, not a
   scalable per-inode schema. S3 delete failures can still leak objects because
-  GC has no durable retry queue. **Phase 4 NVMe cache** is not started.
+  GC has no durable retry queue.
+- **Phase 4 cache is a skeleton only**: `cache_device` is type-checked as a
+  block device and the pre-bounce read hook always misses. There is no device
+  open, index, block I/O, DMA, fill, or invalidation implementation yet.
 
 Authoritative detail lives in `HANDOFF.md` §6.
 

@@ -30,23 +30,31 @@ static int __init kestrelfs_init(void)
 {
 	int ret;
 
+	ret = kestrelfs_cache_init();
+	if (ret)
+		return ret;
+
 	ret = register_filesystem(&kestrelfs_fs_type);
 	if (ret) {
 		pr_err("kestrelfs: register_filesystem failed: %d\n", ret);
-		return ret;
+		goto err_cache;
 	}
 
 	ret = kestrelfs_chardev_init();
 	if (ret) {
 		pr_err("kestrelfs: chardev init failed: %d\n", ret);
 		unregister_filesystem(&kestrelfs_fs_type);
-		return ret;
+		goto err_cache;
 	}
 
 	kestrelfs_ipc_ring_init();
 
-	pr_info("kestrelfs: Phase 1+2 module loaded, filesystem + chardev registered\n");
+	pr_info("kestrelfs: module loaded, filesystem + chardev + cache skeleton registered\n");
 	return 0;
+
+err_cache:
+	kestrelfs_cache_exit();
+	return ret;
 }
 
 /*
@@ -66,7 +74,8 @@ static void __exit kestrelfs_exit(void)
 	kestrelfs_ipc_ring_exit();
 	kestrelfs_chardev_exit();
 	unregister_filesystem(&kestrelfs_fs_type);
-	pr_info("kestrelfs: Phase 1+2 module unloaded, filesystem + chardev unregistered\n");
+	kestrelfs_cache_exit();
+	pr_info("kestrelfs: module unloaded\n");
 }
 
 module_init(kestrelfs_init);
@@ -74,5 +83,5 @@ module_exit(kestrelfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("KestrelFS Project");
-MODULE_DESCRIPTION("KestrelFS Phase 1+2: VFS skeleton + Rust IPC bridge");
-MODULE_VERSION("0.2.0-phase2");
+MODULE_DESCRIPTION("KestrelFS VFS, Rust IPC bridge, and NVMe cache skeleton");
+MODULE_VERSION("0.4.0-step18");

@@ -36,6 +36,18 @@
  */
 #define KESTRELFS_REMOTE_FILE_SIZE	(16 * KESTRELFS_READ_CHUNK_MAX_LEN)
 
+/* cache.c: Phase 4 kernel-owned block-device cache skeleton. */
+int kestrelfs_cache_init(void);
+void kestrelfs_cache_exit(void);
+
+/*
+ * Try to satisfy a read from the kernel-owned cache.  A non-negative return
+ * value is the number of bytes served; -ENODATA is a cache miss and tells the
+ * caller to use the existing daemon READ_DATA path.
+ */
+ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
+			       size_t count, loff_t *ppos);
+
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;
 

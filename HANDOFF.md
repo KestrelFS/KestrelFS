@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 3 Step 17 S3ObjectStore 原型已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
+> **最后更新**：Phase 4 Step 18 NVMe 缓存骨架已由 Cursor 验收并纳入本提交（ABI 仍为 v11）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。
 
@@ -15,7 +15,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 3（控制面真实化）进行中；Phase 4（内核 NVMe 缓存）未开始 |
+| 当前阶段 | Phase 4 已启动：Step 18 内核 NVMe 缓存骨架已验收；完整块 I/O/DMA 尚未开始 |
 
 ---
 
@@ -53,7 +53,7 @@
                     │                                  │
                     │  VFS (super/inode/dir/file ops)  │
                     │  /dev/kestrel_ctl char device     │
-                    │  本地 NVMe 缓存 (Phase 4, 未开始)  │
+                    │  本地 NVMe 缓存 (Step 18 骨架)     │
                     └──────────────────────────────────┘
 ```
 
@@ -61,7 +61,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **明确**：NVMe 缓存是 Phase 4、由内核拥有；当前阶段不存在任何 NVMe cache 代码。不要把宿主机文件路径（如 ZFS pool）当 cache 设备。
+- **NVMe 缓存边界**：缓存由内核拥有；Step 18 已加入块设备参数校验与恒 miss read hook，尚无设备 I/O/索引/DMA。只允许 loop、zvol 或 raw block device，禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -77,6 +77,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │   ├── file.c                   # file_operations (read/write/setattr) + IPC sync call helper
 │   ├── chardev.c                # /dev/kestrel_ctl: mmap/poll/ioctl
 │   ├── ipc_ring.c               # ring buffer push/pop primitives
+│   ├── cache.c                  # Phase 4 cache 参数、设备类型校验、恒 miss read hook
 │   ├── kestrelfs.h              # 内部跨文件声明
 │   └── kestrelfs_ipc.h          # ★ ABI 合约（C/Rust 共享，opcode/payload/struct 定义）
 │
@@ -96,6 +97,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       └── ioctl.rs             # ioctl 号常量
 │
 ├── HANDOFF.md                   # ★ 本文件
+├── docs/phase4-nvme-cache.md    # Phase 4 缓存归属、设备、索引与失效设计
 ├── STEP8_VERIFICATION.md        # Step 8 持久化验证指南
 ├── STEP9_MANUAL_TEST.md         # Step 9 mkdir/unlink 手工测试指南
 ├── test-persistence.sh          # 持久化集成测试脚本（需 sudo）
@@ -131,8 +133,9 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Step 15** | **unlink / rename 覆盖 / truncate 的无引用 ObjectStore block GC** | **11（未变）** | **✅ 已验收** |
 | **Step 16** | **可切换 RedisMetaStore 原型（单 key 快照 + Lua CAS）** | **11（未变）** | **✅ 已验收** |
 | **Step 17** | **可切换 S3ObjectStore 原型（AWS S3 / MinIO）** | **11（未变）** | **✅ 已验收** |
+| **Phase 4 Step 18** | **内核拥有的 NVMe 缓存骨架：块设备参数 + 恒 miss read hook** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码、137 tests 与实现方 MinIO 门控测确认 Step 17 已验收。
+Cursor 对照代码、137 tests、vng GC 回归与参数校验（`STEP18_PARAM_PASS`）确认 Step 18 已验收；Step 17 MinIO 门控测此前已验收。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
@@ -238,6 +241,7 @@ Cursor 对照代码、137 tests 与实现方 MinIO 门控测确认 Step 17 已�
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 22 | **S3 delete 仍是提交后 best-effort** | Step 15 在 metadata 提交后调用 S3 DeleteObject；成功会真删对象，缺失对象视为成功。网络/权限失败只记录泄漏，不回滚已生效的 unlink/rename/truncate，也没有持久化重试队列。 | `daemon/src/object_store_s3.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
+| 24 | **NVMe cache 仅有 Step 18 骨架** | `cache_device` 只做块设备 inode 类型校验，`cache_size_mib` 仅预留；`kestrelfs_cache_lookup()` 恒返回 miss。尚未打开/声明设备，也没有索引、block I/O、DMA、填充或失效实现。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -447,6 +451,12 @@ cargo build --release --manifest-path daemon/Cargo.toml
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 ```
 
+2026-09-14 对最终代码执行通过：unlink、rename overwrite、truncate COW GC
+均通过，`umount_ms=88`，最终输出 `VNG_GC_PASS`。
+另用临时 guest 脚本确认普通文件参数使 `insmod` 返回
+`Block device required`，无设备时 `cache_size_mib=128` 可加载并最终输出
+`STEP18_PARAM_PASS`；临时脚本未纳入仓库。
+
 成功标记为 `VNG_GC_PASS`；guest 脚本任一断言失败均以非零状态退出。
 
 ### 7.10 Step 16 RedisMetaStore 集成测试
@@ -548,6 +558,36 @@ kill "$daemon_pid"; wait "$daemon_pid" || true
 sudo rmmod kestrelfs
 ```
 
+### 7.12 Phase 4 Step 18 NVMe 缓存骨架验证
+
+本步改动内核 read 路径，必须先执行 mount 级 vng 回归。现有 Step 15 脚本覆盖
+模块加载、daemon、读写/truncate/GC，以及小于 1 秒的卸载断言：
+
+```bash
+make -C kestrelfs
+cargo build --release --manifest-path daemon/Cargo.toml
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+```
+
+人类补充验证参数可见性与恒 miss 回退时，仍沿用固定启动约定。Step 18 不会
+打开或写入 `cache_device`；真正测试设备参数时只能传 loop/zvol/raw block
+device，不能传普通文件：
+
+```bash
+sudo insmod kestrelfs/kestrelfs.ko cache_size_mib=128
+test "$(cat /sys/module/kestrelfs/parameters/cache_size_mib)" = 128
+./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+daemon_pid=$!
+sleep 2
+sudo mkdir -p /mnt/kestrelfs
+sudo mount -t kestrelfs none /mnt/kestrelfs
+printf 'step18 still uses READ_DATA\n' | sudo tee /mnt/kestrelfs/step18.dat >/dev/null
+test "$(sudo cat /mnt/kestrelfs/step18.dat)" = "step18 still uses READ_DATA"
+time sudo umount /mnt/kestrelfs
+kill "$daemon_pid"; wait "$daemon_pid" || true
+sudo rmmod kestrelfs
+```
+
 ---
 
 ## 8. 路线图（未做）
@@ -556,11 +596,12 @@ sudo rmmod kestrelfs
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **等待 Cursor 的 Step 18 提示词** | 候选：Phase 4 NVMe 缓存启动，或分布式后端生产化 |
-| 2 | 分布式后端生产化 | Redis 拆 key、持久 GC 重试、连接恢复与配置治理 |
-| 3 | Phase 4：内核 NVMe 缓存 | 内核直接 I/O 本地 NVMe 块设备 |
+| 1 | **等待 Cursor 的 Step 19 提示词** | 打开专用块设备、缓存 superblock/索引骨架；开发机可用 zvol |
+| 2 | Phase 4 后续：命中路径与填充 | LBA 索引、fill-on-miss、失效、真正块 I/O |
+| 3 | 分布式后端生产化 | Redis 拆 key、GC 重试、配置治理（与 Phase 4 可并行但须 Cursor 明示） |
 
-> **⚠️ 明确**：在 Cursor 新提示词下达前，Codex **不要**自行开始 Redis/S3/Phase 4 等任何方向。只做 Cursor 提示词范围内的事。
+> **⚠️ 明确**：Step 18 不实现完整 DMA/direct I/O 缓存；在 Cursor 验收并下达
+> 后续提示词前，不继续扩大 Phase 4，也不自行改做分布式生产化。
 
 ---
 
@@ -588,10 +629,18 @@ sudo rmmod kestrelfs
 
 ## 10. 交接检查清单
 
+- [x] Step 18 NVMe 缓存骨架已由 Cursor 验收并提交（设计文档 + 恒 miss hook + vng）
+- [x] ABI 版本核对无误（内核 = Rust = 11）
+- [x] Step 8–17 + Phase 4 Step 18 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 19 提示词（打开块设备 / 索引骨架）
+- [x] 已知限制与坑已列出（第 6 节）
+- [x] vng 站立规则见 §9；cache 设备仅允许块设备（loop/zvol/raw）
+
 - [x] Step 17 S3ObjectStore 已由 Cursor 验收并提交（137 tests；MinIO 门控测由实现方跑通）
 - [x] ABI 版本核对无误（内核 = Rust = 11）
 - [x] Step 8–17 已验收状态已写清
-- [x] 下一步明确：等待 Cursor 的 Step 18 提示词
+- [ ] Step 18 NVMe 缓存骨架待 Cursor 验收，worktree 尚未 commit
+- [x] 下一步明确：等待 Cursor 验收 Step 18
 - [x] 已知限制与坑已列出（第 6 节）
 - [x] vng 站立规则见 §9
 ---
