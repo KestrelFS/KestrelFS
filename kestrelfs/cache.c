@@ -3,7 +3,9 @@
  * cache.c - Kernel-owned persistent block cache for KestrelFS.
  *
  * Step 21 binds Step 20's persistent 4 KiB cache to one metadata namespace.
- * Cache failures never replace the authoritative daemon/ObjectStore path.
+ * Step 22 sends aligned, contiguous cache hits straight into pinned user pages;
+ * unaligned head/tail blocks retain the buffered fallback.  Cache failures
+ * never replace the authoritative daemon/ObjectStore path.
  */
 
 #include <linux/bio.h>
@@ -16,6 +18,7 @@
 #include <linux/highmem.h>
 #include <linux/hex.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/random.h>
@@ -37,6 +40,8 @@
 	(KESTRELFS_CACHE_METADATA_BYTES + KESTRELFS_CACHE_BLOCK_SIZE)
 #define KESTRELFS_CACHE_SECTORS_PER_BLOCK \
 	(KESTRELFS_CACHE_BLOCK_SIZE >> SECTOR_SHIFT)
+/* Bound GUP and BIO resources while still batching normal readahead-sized IO. */
+#define KESTRELFS_CACHE_DIRECT_MAX_BYTES	(128U * 1024U)
 
 struct kestrelfs_cache_disk_index_entry {
 	__le64 inode_id;
@@ -105,6 +110,30 @@ static char *cache_namespace;
 module_param(cache_namespace, charp, 0444);
 MODULE_PARM_DESC(cache_namespace,
 		 "SHA-256 metadata namespace identity as exactly 64 hex digits");
+
+static bool cache_direct_io = true;
+module_param(cache_direct_io, bool, 0444);
+MODULE_PARM_DESC(cache_direct_io,
+		 "read aligned cache hits directly into pinned user pages (default Y)");
+
+/* Read-only observability for vng correctness/performance tests. */
+static unsigned long kestrelfs_cache_direct_hit_blocks;
+module_param_named(cache_direct_hit_blocks,
+		   kestrelfs_cache_direct_hit_blocks, ulong, 0444);
+MODULE_PARM_DESC(cache_direct_hit_blocks,
+		 "4 KiB cache-hit blocks read directly into pinned user pages");
+
+static unsigned long kestrelfs_cache_copy_hit_blocks;
+module_param_named(cache_copy_hit_blocks,
+		   kestrelfs_cache_copy_hit_blocks, ulong, 0444);
+MODULE_PARM_DESC(cache_copy_hit_blocks,
+		 "4 KiB cache-hit blocks served through the buffered copy fallback");
+
+static unsigned long kestrelfs_cache_direct_fallbacks;
+module_param_named(cache_direct_fallbacks,
+		   kestrelfs_cache_direct_fallbacks, ulong, 0444);
+MODULE_PARM_DESC(cache_direct_fallbacks,
+		 "direct user-page attempts that fell back to buffered cache IO");
 
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
@@ -204,6 +233,91 @@ out_bio:
 	bio_put(bio);
 out_page:
 	__free_page(page);
+	return ret;
+}
+
+/*
+ * Read one or more contiguous 4 KiB cache blocks directly into userspace.
+ * The caller holds kestrelfs_cache_lock across pin, BIO completion and unpin,
+ * so an invalidation cannot retire/reuse the indexed slots during DMA.
+ *
+ * Alignment or transient GUP/BIO construction failures are returned to the
+ * caller as a request to use the buffered cache path.  Once submitted, all
+ * pinned pages are dirtied even on IO failure because the device may have
+ * modified a prefix before reporting the error.
+ */
+static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
+					     size_t length)
+{
+	struct page **pages;
+	struct bio *bio;
+	unsigned long address = (unsigned long)buf;
+	unsigned long page_start = address & PAGE_MASK;
+	unsigned int page_offset = offset_in_page(address);
+	unsigned int dma_alignment;
+	unsigned int nr_pages;
+	unsigned int i;
+	long pinned;
+	size_t remaining;
+	bool submitted = false;
+	int ret = 0;
+
+	if (!length || length > KESTRELFS_CACHE_DIRECT_MAX_BYTES ||
+	    length % KESTRELFS_CACHE_BLOCK_SIZE)
+		return -EINVAL;
+
+	dma_alignment = bdev_dma_alignment(kestrelfs_cache_bdev);
+	if ((address & dma_alignment) ||
+	    !IS_ALIGNED(address, kestrelfs_cache_logical_size))
+		return -EINVAL;
+
+	nr_pages = DIV_ROUND_UP(page_offset + length, PAGE_SIZE);
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return -ENOMEM;
+
+	pinned = pin_user_pages_fast(page_start, nr_pages, FOLL_WRITE, pages);
+	if (pinned != nr_pages) {
+		if (pinned > 0)
+			unpin_user_pages(pages, pinned);
+		ret = pinned < 0 ? pinned : -EFAULT;
+		goto out_pages;
+	}
+
+	bio = bio_alloc(kestrelfs_cache_bdev, nr_pages, REQ_OP_READ, GFP_KERNEL);
+	if (!bio) {
+		ret = -ENOMEM;
+		goto out_unpin;
+	}
+	bio->bi_iter.bi_sector = sector;
+	remaining = length;
+	for (i = 0; i < nr_pages && remaining; i++) {
+		unsigned int offset = i ? 0 : page_offset;
+		unsigned int bytes = min_t(size_t, PAGE_SIZE - offset,
+					       remaining);
+
+		if (bio_add_page(bio, pages[i], bytes, offset) != bytes) {
+			ret = -EIO;
+			goto out_bio;
+		}
+		remaining -= bytes;
+	}
+	if (remaining) {
+		ret = -EIO;
+		goto out_bio;
+	}
+
+	submitted = true;
+	ret = submit_bio_wait(bio);
+out_bio:
+	bio_put(bio);
+out_unpin:
+	if (submitted)
+		unpin_user_pages_dirty_lock(pages, nr_pages, true);
+	else
+		unpin_user_pages(pages, nr_pages);
+out_pages:
+	kfree(pages);
 	return ret;
 }
 
@@ -676,19 +790,60 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 			goto out;
 	}
 
-	block = kmalloc(KESTRELFS_CACHE_BLOCK_SIZE, GFP_KERNEL);
-	if (!block) {
-		ret = -ENODATA;
-		goto out;
-	}
 	block_offset = round_down(offset, (u64)KESTRELFS_CACHE_BLOCK_SIZE);
 	while (block_offset < end) {
 		u32 within = offset > block_offset ? offset - block_offset : 0;
 		size_t bytes = min_t(u64, KESTRELFS_CACHE_BLOCK_SIZE - within,
 				     end - (block_offset + within));
+		size_t direct_bytes = KESTRELFS_CACHE_BLOCK_SIZE;
 
 		entry = kestrelfs_cache_find(inode_id, block_offset);
-		if (!entry || kestrelfs_cache_rw_block(block, entry->lba, false)) {
+		if (!entry) {
+			ret = -ENODATA;
+			goto out;
+		}
+
+		/*
+		 * Coalesce complete file blocks whose cache slots are contiguous.
+		 * Head/tail partial blocks deliberately stay on the buffered path:
+		 * a block-device BIO must never overwrite bytes outside the read(2)
+		 * range in a userspace page.
+		 */
+		if (cache_direct_io && !within &&
+		    bytes == KESTRELFS_CACHE_BLOCK_SIZE) {
+			while (direct_bytes < KESTRELFS_CACHE_DIRECT_MAX_BYTES &&
+			       block_offset + direct_bytes +
+				       KESTRELFS_CACHE_BLOCK_SIZE <= end) {
+				struct kestrelfs_cache_index_entry *next;
+
+				next = kestrelfs_cache_find(inode_id,
+						 block_offset + direct_bytes);
+				if (!next || next->lba != entry->lba +
+						(direct_bytes >> SECTOR_SHIFT))
+					break;
+				direct_bytes += KESTRELFS_CACHE_BLOCK_SIZE;
+			}
+
+			if (!kestrelfs_cache_read_user_blocks(entry->lba,
+							   buf + copied,
+							   direct_bytes)) {
+				kestrelfs_cache_direct_hit_blocks +=
+					direct_bytes / KESTRELFS_CACHE_BLOCK_SIZE;
+				copied += direct_bytes;
+				offset += direct_bytes;
+				block_offset += direct_bytes;
+				continue;
+			}
+			kestrelfs_cache_direct_fallbacks++;
+		}
+
+		if (!block)
+			block = kmalloc(KESTRELFS_CACHE_BLOCK_SIZE, GFP_KERNEL);
+		if (!block) {
+			ret = -ENODATA;
+			goto out;
+		}
+		if (kestrelfs_cache_rw_block(block, entry->lba, false)) {
 			ret = -ENODATA;
 			goto out;
 		}
@@ -699,6 +854,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		copied += bytes;
 		offset += bytes;
 		block_offset += KESTRELFS_CACHE_BLOCK_SIZE;
+		kestrelfs_cache_copy_hit_blocks++;
 	}
 
 	*ppos += copied;
@@ -792,6 +948,9 @@ int kestrelfs_cache_init(void)
 		pr_info("kestrelfs: NVMe cache disabled (no cache_device)\n");
 		return 0;
 	}
+	kestrelfs_cache_direct_hit_blocks = 0;
+	kestrelfs_cache_copy_hit_blocks = 0;
+	kestrelfs_cache_direct_fallbacks = 0;
 	ret = kestrelfs_cache_parse_namespace();
 	if (ret)
 		return ret;
@@ -831,6 +990,10 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	mutex_lock(&kestrelfs_cache_lock);
+	pr_info("kestrelfs: cache hit stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu\n",
+		kestrelfs_cache_direct_hit_blocks,
+		kestrelfs_cache_copy_hit_blocks,
+		kestrelfs_cache_direct_fallbacks);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);

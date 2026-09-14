@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–21）
+## 当前边界（Step 18–22）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -18,6 +18,13 @@ namespace 不匹配时在恢复任何 index entry 前 fail closed，从而阻止
 不同 FileMetaStore data-dir 或 Redis namespace 中重用造成的错误命中。IPC ABI
 未改变，仍为 v11。
 
+Step 22 在不改 IPC ABI 和盘上格式的前提下加速 hit：完整、块设备对齐且 cache
+LBA 连续的 4 KiB block，会合并为最多 128 KiB 的同步 BIO，直接写入
+`pin_user_pages_fast(FOLL_WRITE)` 固定的调用者页；不再先读入临时内核页再
+`copy_to_user()`。非对齐 head/tail、用户地址不满足 logical/DMA alignment，或
+pin/BIO 构造失败时，按 block 回退到 Step 20 buffered-copy 路径。miss/fill 和
+daemon 路径没有变化。
+
 ## 缓存设备
 
 缓存后端必须是 Linux 块设备节点，例如：
@@ -34,12 +41,13 @@ namespace 不匹配时在恢复任何 index entry 前 fail closed，从而阻止
 `CONFIG_BLK_DEV_WRITE_MOUNTED` 的内核仍允许未参与 holder 协议的 raw writer；
 部署侧必须保证该专用设备不被其他进程写入。
 
-当前有三个只读模块参数：
+当前主要只读模块参数：
 
 ```text
 cache_device=/dev/loop0
 cache_size_mib=4096
 cache_namespace=<64 hex digits>
+cache_direct_io=1
 ```
 
 `cache_size_mib=0` 表示以整个块设备容量为上限；非零值转换为 MiB 后必须不
@@ -70,7 +78,12 @@ digest 可出现在 `/sys/module/kestrelfs/parameters/`，但它不是凭据。�
 filesystem 在重启时必须使用同一 digest；修改 MetaStore namespace 或 ObjectStore
 dataset 时必须使用不同 digest。
 
-## Step 19–21 磁盘格式
+`cache_direct_io` 默认为 1。设为 0 只关闭 Step 22 用户页直达，保留 Step 20
+同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。三个只读
+观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks` 和
+`cache_direct_fallbacks` 可从 sysfs 读取；它们不是稳定用户 ABI。
+
+## Step 19–22 磁盘格式
 
 所有多字节字段采用 little-endian，LBA 固定表示 512 字节 sector。磁盘头占
 第一个 4 KiB：
@@ -111,7 +124,8 @@ closed，模块加载返回错误，不覆盖已有内容。用不同 `cache_siz
 ```text
 VFS read
   -> kestrelfs_cache_lookup(inode, file_offset, length)
-       -> hit:  同步 4 KiB BIO -> 内核页 -> copy_to_user（不进 ring）
+       -> aligned hit: pin 用户页 -> 连续块合并 BIO -> 用户页（不进 ring）
+       -> partial/fallback hit: 同步 4 KiB BIO -> 内核页 -> copy_to_user
        -> miss: 返回 -ENODATA
   -> 取得 kestrelfs_data_ipc_lock
   -> READ_DATA + 16 KiB bounce + req/resp ring
@@ -123,6 +137,13 @@ hook 位于 `kestrelfs_data_ipc_lock` 之前，因此 hit 不占 bounce buffer�
 单 in-flight data/name IPC 串行化。miss 继续使用 ABI v11，共享内存布局和同步
 模型均不改变。只有请求的整个 EOF-clamped 范围都有索引时才按 hit 返回；否则
 整次请求安全回退到 READ_DATA，避免把部分结果暴露给调用者。
+
+直达路径只处理 read 范围完整覆盖的 cache block，绝不把 4 KiB BIO 指向只允许
+修改其中一部分的用户区间。连续的 file block 还必须映射到连续 cache LBA 才能
+合并；每个 BIO 上限 128 KiB，以限制 GUP 页数和 BIO vector 资源。用户地址不满足
+块设备 logical sector 与 DMA mask 时自动使用 buffered fallback。提交过 BIO 的
+用户页在完成后按 dirty unpin，包括设备报告错误的情形，因为失败 BIO 也可能已经
+修改部分页；之后 buffered path 会覆盖请求区间，若 cache 设备仍失败则回远端 miss。
 
 ## 索引模型
 
@@ -159,6 +180,12 @@ metadata BIO 失败都会让相应 VFS mutation 失败，避免权威数据已�
 期间发生，返回数据不会再被发布为 cache fill。普通 rename 不改变源 inode
 内容，因此只在覆盖已存在目标时失效目标 inode。
 
+`kestrelfs_cache_lock` 覆盖 index 检查、用户页 pin、整个同步 BIO 和 unpin。
+invalidate 必须取得同一把锁，所以正在进行的 hit 要么在 mutation 前完整读到旧
+版本，要么在失效完成后看不到条目；slot 不会在 DMA 期间被释放/复用。这个模型
+牺牲了 cache hit 间的并发度，但避免了 page pin 生命周期与 index generation 的
+复杂竞态。
+
 ## 故障与安全原则
 
 - cache 永远不是唯一数据副本；损坏或不可用时退化为 miss。
@@ -166,8 +193,10 @@ metadata BIO 失败都会让相应 VFS mutation 失败，避免权威数据已�
 - hit data BIO 失败退化为远端 miss；fill 失败忽略。初始化时 superblock/index
   恢复不确定则 fail closed，不让该设备以可疑索引继续加载。
 - 失效写失败会拒绝 mutation；这是“宁可写失败、不可脏命中”的选择。
-- 当前没有 eviction/LRU、数据 checksum、索引 journal/镜像或 torn-write 检测，
-  也没有完整 DMA/零拷贝。
+- 当前没有 eviction/LRU、数据 checksum、索引 journal/镜像或 torn-write 检测。
+- Step 22 是 read hit 的受限少拷贝路径：完整、对齐、连续块可以直达用户页；
+  partial block 和不能 pin/对齐的 buffer 仍有一次 `copy_to_user()`。它不是异步
+  DMA、`read_iter`/page-cache/splice 全覆盖，也没有并行 BIO pipeline。
 - v2 superblock 已持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
@@ -178,3 +207,17 @@ metadata BIO 失败都会让相应 VFS mutation 失败，避免权威数据已�
   但 reserved 区和未来索引项的损坏检测仍属于后续版本。
 - exclusive holder 防止其他内核 holder 抢占设备，但不能在所有内核配置下阻止
   root 直接 raw write；设备隔离仍是部署要求。
+
+## Step 22 vng 验证与粗测
+
+`test-step22-cache-vng.sh` 只在 vng guest 内创建 loop、加载模块和挂载，daemon
+使用按 PID 隔离的 data-dir 并写 `daemon.log`。辅助程序用 4 KiB 对齐用户 buffer
+验证完整块直达，也用 `file_offset=1`、`user_shift=1` 和越过 EOF 的请求覆盖非对齐
+head/tail 与 EOF clamp；随后停 daemon 再读，证明 hit 不经过 IPC。
+
+脚本在同一 v2 cache、相同 namespace 和同一 1 MiB × 64 次 `pread()` workload 上，
+分别以 `cache_direct_io=0/1` 重载模块。2026-09-14 的 TCG vng 粗测为：buffered
+copy 3.88 s（16.51 MiB/s），pinned-page direct 0.54 s（117.65 MiB/s），约 7.1×。
+这是 loop + TCG 下的路径级对比，不代表真实 NVMe 性能；辅助程序的数据校验成本
+也包含在两组数字中。验收看明确 PASS、命中计数和数据一致性，不把固定倍数作为
+门槛。
