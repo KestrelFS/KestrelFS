@@ -681,13 +681,12 @@ sudo rmmod kestrelfs
 
 ## 10. 交接检查清单
 
-- [x] Step 18 NVMe 缓存骨架已由 Cursor 验收并提交（设计文档 + 恒 miss hook + vng）
+- [x] Step 19 块设备 claim + v1 格式/索引骨架已由 Cursor 验收并提交
 - [x] ABI 版本核对无误（内核 = Rust = 11）
-- [x] Step 8–17 + Phase 4 Step 18 已验收状态已写清
-- [ ] Step 19 块设备/superblock/索引骨架待 Cursor 验收，worktree 尚未 commit
-- [x] 下一步明确：等待 Cursor 验收 Step 19
-- [x] 已知限制与坑已列出（第 6 节）
-- [x] vng 站立规则见 §9；cache 设备仅允许块设备（loop/zvol/raw）
+- [x] Step 8–18 + Phase 4 Step 19 已验收状态已写清
+- [x] 下一步明确：等待 Cursor 的 Step 20 提示词
+- [x] 开发 zvol 路径：`/dev/zvol/nvraid1tank1/kestrel-cache`
+- [x] Codex 默认用 vng+loop；宿主机 zvol 需人类配置 NOPASSWD sudo（见 §8）
 
 ---
 
