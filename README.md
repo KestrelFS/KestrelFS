@@ -442,7 +442,7 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链
 
 - Step 36 已支持 open-unlink 与 last-close GC；若最终 close 时 daemon
   不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37已实现
-  文件/目录 chmod（待验收）；chown、完整时间属性与 mode+size 单事务仍未实现。
+  文件/目录持久 chmod；chown、完整时间属性与 mode+size 单事务仍未实现。
   symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
