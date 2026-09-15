@@ -119,6 +119,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step28-cache-vfs.c      # Step 28 preadv 与 iovec guard 辅助程序
 ├── test-step29-cache-evict-vng.sh # Step 29 批量 LRU/index 合并写/崩溃恢复回归
 ├── test-step32-posix-core-vng.sh # Step 32 硬链接/重启/nlink/末引用 GC 回归
+├── test-step33-posix-rename-vng.sh # Step 33 RENAME_NOREPLACE / EEXIST 原子性
+├── test-step33-renameat2.c       # renameat2 小助手（供 Step 33 vng 使用）
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
