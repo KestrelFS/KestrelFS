@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4/控制面 Step 31（DIST-META：Redis v2 分记录 schema）已由 Cursor 验收并纳入本提交（IPC ABI v11、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 32 POSIX-CORE（硬链接子集）已由 Cursor 验收并纳入本提交（IPC ABI v12、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 31 DIST-META 已验收；下一步 Step 32 = POSIX-CORE（见 remaining-capabilities §8） |
+| 当前阶段 | Step 32 硬链接已验收；下一步 Step 33 = POSIX-RENAME（见 remaining-capabilities §8） |
 
 ---
 
@@ -118,6 +118,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step28-cache-vfs-vng.sh # Step 28 read_iter/iovec/EOF/daemon-free hit 回归
 ├── test-step28-cache-vfs.c      # Step 28 preadv 与 iovec guard 辅助程序
 ├── test-step29-cache-evict-vng.sh # Step 29 批量 LRU/index 合并写/崩溃恢复回归
+├── test-step32-posix-core-vng.sh # Step 32 硬链接/重启/nlink/末引用 GC 回归
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -164,12 +165,14 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 29** | **批量 LRU victim journal + 同页 index 合并清零 + MRU 保护/崩溃恢复** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 30** | **metadata 同事务持久化 GC queue + 启动/运行期指数退避重试** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 31** | **Redis v2 分记录 schema + 字段级 diff + Lua revision-CAS 原子 mutation** | **11（未变）** | **✅ 已验收** |
+| **Phase 4/控制面 Step 32** | **硬链接：持久化 nlink、多 dirent 同 inode、末引用 GC、VFS `.link`** | **12** | **✅ 已验收** |
 
-Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
-点查定向读 + Lua revision-CAS；v1 fail closed；TLS/重连留后可接受。ABI **v11**；format **v4**。
-下一步：**Step 32 POSIX-CORE**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
+硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
+下一步：**Step 33 POSIX-RENAME**，提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 12`（含 `LINK_DATA`）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -185,7 +188,7 @@ Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 11`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 12`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -199,6 +202,7 @@ Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
 9. Phase 3 Step 12：新增 RENAME_DATA；两个名字依次放入 bounce buffer，单名上限 255 字节
 10. Phase 3 Step 13：新增 LOOKUP/CREATE/MKDIR/UNLINK/READDIR_DATA；单名统一为 255 字节，READDIR 批量打包变长条目
 11. Phase 3 Step 14：新增 SYMLINK_DATA / READLINK_DATA；link name 与 target 通过同一 16 KiB bounce 传输，target 仅存 MetaStore
+12. Phase 4/控制面 Step 32：新增 LINK_DATA；payload 携带 parent inode、现有 inode 与 name_len，新名字位于 bounce，响应返回持久化 nlink
 
 ### 5.4 已实现 Opcode 列表
 
@@ -225,6 +229,7 @@ Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
 | 18 | `OP_READDIR_DATA` | 通过 bounce buffer 批量返回变长目录条目 | 10 |
 | 19 | `OP_SYMLINK_DATA` | bounce 中依次传输 link name 与 target，创建符号链接 | 11 |
 | 20 | `OP_READLINK_DATA` | daemon 将符号链接 target 返回到 bounce buffer | 11 |
+| 21 | `OP_LINK_DATA` | 为现有非目录 inode 创建 bounce 长名硬链接，返回更新后的 nlink | 12 |
 | 64 | `OP_RESULT_OK` | 响应：成功 | 1 |
 | 65 | `OP_RESULT_ERROR` | 响应：失败（error_code 携带负 errno） | 1 |
 
@@ -254,13 +259,13 @@ Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
 | 2 | **旧 RENAME 仍为每名 ≤7 字节** | opcode 10 仅为兼容既有测试保留；普通 VFS rename 已切到 opcode 13 `RENAME_DATA`，单名上限 255 字节，两个名字依次位于 bounce buffer。 | `kestrelfs_ipc.h` RENAME / RENAME_DATA 布局 |
 | 3 | **旧名字 opcode 仍有短 payload 上限** | opcode 1/6/7/8/9 仅为兼容既有测试保留；普通 VFS 的 lookup/create/readdir/mkdir/unlink 已切换到 ABI v10 DATA opcode，统一支持 255 字节名字。 | `kestrelfs_ipc.h` 各 legacy / DATA opcode 布局 |
 | 4 | **GC 为持久化 at-least-once 删除** | Step 30 让 unlink、rename 覆盖和 truncate 在提交 metadata 时一并持久化无引用 block key；delete 成功后才确认出队，失败不回滚命名空间并在启动/运行期重试。永久后端故障会使队列增长，尚无容量上限/dead-letter/管理接口。 | `daemon/src/meta.rs`、`daemon/src/meta_persist.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
-| 5 | **new_inode() 而非 iget5_locked()** | 曾尝试 `iget5_locked()` 做严格 inode 缓存，导致 umount 时内核死循环（commit `7787a6a`）。已回退为 `new_inode()` + `insert_inode_hash()`。**不要轻易重试 iget5_locked 方案**，除非彻底解决 I_FREEING 竞态。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
-| 6 | **同一 ino 可能有多实例 inode** | 使用 `new_inode()` 意味着每次 lookup 都创建新 inode 对象（而非复用哈希表中已有实例）。dentry cache 保证路径唯一性，但同一文件通过不同路径访问时内核中可能有多个 inode 对象。 | 同上 |
+| 5 | **按 ino 使用基础 iget，未恢复历史 iget5 自定义方案** | Step 32 为保证硬链接别名共享 VFS `i_nlink`，改用标准 `iget_locked(sb, ino)`；没有恢复曾导致卸载死循环的 `iget5_locked()` 自定义 test/set 路径，也没有引入 open-handle 生命周期。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
+| 6 | **inode identity 仍是单挂载、daemon inode id** | 同一 superblock 内的硬链接别名复用一个 inode；不同 mount 各自维护 VFS inode 实例，MetaStore 仍是持久属性权威。open-unlink 生命周期仍未建模。 | 同上、`daemon/src/meta.rs` |
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
 | 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
 | 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
 | 10 | **rename 不支持 flags** | `kestrelfs_inode_rename()` 对 `flags != 0` 直接返回 `-EINVAL`。不支持 `RENAME_NOREPLACE` / `RENAME_EXCHANGE` / `RENAME_WHITEOUT`。 | `kestrelfs/dir.c` |
-| 11 | **nlink 不递归计算** | 目录 nlink 固定为 2（`.` + 父目录回链），文件 nlink 固定为 1。不随子目录增减而更新。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
+| 11 | **目录 nlink 不递归计算** | Step 32 已为非目录硬链接持久化并维护 nlink；目录 nlink 仍固定为 2，不随子目录增减而更新。 | `daemon/src/meta.rs`、`kestrelfs/inode.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
 | 14 | **create() 忽略 kernel 传入的 mode** | `MemStore::create()` 内部用 `Inode::new_file()` 的默认 mode（`S_IFREG | 0o644`），忽略 kernel 传入的 mode 参数。 | `daemon/src/meta.rs` `create()` |
@@ -302,7 +307,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 31 验收基线 144 个）
+cargo test                    # 单元测试 + 集成测试（Step 32 验收基线 151 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1031,6 +1036,37 @@ v1 schema fail-closed。此步只修改 daemon 与文档，未改 `kestrelfs/*.c
 或 mount 行为，因此按规则未运行 make/vng；全程没有在物理机执行
 insmod/mount/cache-device 操作。
 
+### 7.26 Phase 4/控制面 Step 32 POSIX-CORE（硬链接）
+
+本步择优完成优先级 A 硬链接：ABI v12 新增 `LINK_DATA`（parent u64@0、target
+inode u64@8、name_len u16@16，名字在 16 KiB bounce，成功响应 nlink u32@0）。
+Mem/File/Redis MetaStore 在同一次 mutation 中新增 dirent 并递增 inode nlink；unlink
+与 rename-overwrite 只有移除最后引用时才删除 inode/slices、提交 GC key。内核 `.link`
+使用同一 data IPC mutex，`iget_locked()` 保证同 superblock 的不同别名共享 VFS inode。
+
+Cursor 验收自检（2026-09-15）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  151 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec ./test-step32-posix-core-vng.sh
+  STEP32_LINK_CREATE_PASS
+  STEP32_LINK_RESTART_PASS
+  STEP32_LINK_SURVIVING_REFERENCE_PASS
+  STEP32_LINK_FINAL_GC_PASS
+  STEP32_LINK_RENAME_OVERWRITE_PASS
+  STEP32_LINK_NEGATIVE_PASS
+  STEP32_POSIX_CORE_PASS (umount_ms=25)
+```
+
+vng 用例仅在 guest 内创建 loop cache device，并显式 `insmod`；daemon 使用独立
+`/tmp/kestrelfs-step32-$$` 且保留 `daemon.log`。未触碰宿主机模块、mount 或 zvol。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1039,8 +1075,8 @@ insmod/mount/cache-device 操作。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 32 POSIX-CORE** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | 多节点 / 对象层 | CACHE-COHERENCE → DIST-OBJECT… |
+| 1 | **Step 33 POSIX-RENAME** | 至少 `RENAME_NOREPLACE`；提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | 其余 POSIX / 多节点 | open-unlink、mode·目录 nlink、CACHE-COHERENCE… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1095,10 +1131,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 31 DIST-META 已由 Cursor 验收并提交
-- [x] IPC ABI = 11；cache format = v4
-- [x] Step 8–30 + Step 31 已验收状态已写清
-- [x] 下一步明确：Step 32 POSIX-CORE（`docs/remaining-capabilities.md` §8）
+- [x] Step 32 POSIX-CORE（硬链接）已由 Cursor 验收并提交
+- [x] IPC ABI = 12；cache format = v4
+- [x] Step 8–31 + Step 32 已验收状态已写清
+- [x] 下一步明确：Step 33 POSIX-RENAME（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

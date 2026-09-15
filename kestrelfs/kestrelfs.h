@@ -134,11 +134,11 @@ extern const struct inode_operations kestrelfs_symlink_inode_operations;
 /*
  * inode.c: inode cache management.
  *
- * kestrelfs_get_inode() - fetch or create an inode with given ino/mode/size.
+ * kestrelfs_get_inode() - fetch or create an inode with wire attributes.
  * Used by dir.c's lookup/create handlers.
  */
 struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
-				  u32 mode, u64 size);
+				  u32 mode, u64 size, u32 nlink);
 
 /*
  * file.c: unified file operations for regular files.

@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 11;
+pub const ABI_VERSION: u32 = 12;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -115,6 +115,8 @@ pub const OP_READDIR_DATA: u32 = 18;
 pub const OP_SYMLINK_DATA: u32 = 19;
 /// Request: return a symbolic-link target through the bounce buffer.
 pub const OP_READLINK_DATA: u32 = 20;
+/// Request: create a hard link whose new name is in the bounce buffer.
+pub const OP_LINK_DATA: u32 = 21;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -431,6 +433,49 @@ impl KestrelfsEvent {
         Ok(NameDataReq {
             parent_inode,
             mode,
+            name,
+        })
+    }
+
+    /// Decodes an ABI v12 hard-link request. The fixed payload carries the
+    /// destination parent and existing inode id; the new name is stored at
+    /// the beginning of the serialized bounce buffer.
+    ///
+    /// # Safety
+    ///
+    /// `data_buffer` must point to a live [`DATA_BUFFER_SIZE`]-byte bounce
+    /// buffer exclusively owned by this synchronous request.
+    pub unsafe fn decode_link_data_req(
+        &self,
+        data_buffer: *const u8,
+    ) -> Result<LinkDataReq, NameDataDecodeError> {
+        if self.flags != 0 {
+            return Err(NameDataDecodeError::UnsupportedFlags(self.flags));
+        }
+        let parent_inode = u64::from_le_bytes(self.payload[0..8].try_into().unwrap());
+        let inode_id = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
+        let name_len = u16::from_le_bytes(self.payload[16..18].try_into().unwrap());
+        if name_len == 0 {
+            return Err(NameDataDecodeError::EmptyName);
+        }
+        if name_len as usize > NAME_DATA_MAX {
+            return Err(NameDataDecodeError::NameTooLong(name_len));
+        }
+
+        let mut name_bytes = vec![0u8; name_len as usize];
+        // SAFETY: guaranteed by this function's contract and the checked ABI
+        // name bound above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_buffer,
+                name_bytes.as_mut_ptr(),
+                name_len as usize,
+            );
+        }
+        let name = String::from_utf8(name_bytes).map_err(|_| NameDataDecodeError::InvalidUtf8)?;
+        Ok(LinkDataReq {
+            parent_inode,
+            inode_id,
             name,
         })
     }
@@ -808,6 +853,14 @@ pub struct NameDataReq {
     pub name: String,
 }
 
+/// Decoded ABI v12 `OP_LINK_DATA` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkDataReq {
+    pub parent_inode: u64,
+    pub inode_id: u64,
+    pub name: String,
+}
+
 /// Decoded ABI v11 symbolic-link creation request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymlinkDataReq {
@@ -995,6 +1048,7 @@ const _: () =
 const _: () = assert!(8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(NAME_DATA_MAX + SYMLINK_TARGET_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(SYMLINK_TARGET_MAX <= u16::MAX as usize);
+const _: () = assert!(8 + 8 + 2 <= EVENT_PAYLOAD_SIZE);
 
 /// Compile-time layout assertions, mirroring the `_Static_assert`s at
 /// the bottom of `kestrelfs_ipc.h`. Called once from `main()` - Rust
@@ -1333,5 +1387,27 @@ mod tests {
     fn truncate_request_fits_payload_budget() {
         // inode_id(8) + new_size(8) = 16, well within 32 bytes
         const { assert!(8 + 8 <= EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn decode_link_data_req_reads_fixed_fields_and_bounce_name() {
+        let name = "long-hard-link-name-over-twenty-three-bytes";
+        let mut data = [0u8; DATA_BUFFER_SIZE];
+        data[..name.len()].copy_from_slice(name.as_bytes());
+        let mut event = KestrelfsEvent::zeroed(OP_LINK_DATA, 77);
+        event.payload[0..8].copy_from_slice(&41u64.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&99u64.to_le_bytes());
+        event.payload[16..18].copy_from_slice(&(name.len() as u16).to_le_bytes());
+
+        // SAFETY: data is a live DATA_BUFFER_SIZE allocation owned by the test.
+        let decoded = unsafe { event.decode_link_data_req(data.as_ptr()) }.unwrap();
+        assert_eq!(
+            decoded,
+            LinkDataReq {
+                parent_inode: 41,
+                inode_id: 99,
+                name: name.to_owned(),
+            }
+        );
     }
 }

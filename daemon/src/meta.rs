@@ -88,6 +88,12 @@ pub enum MetaError {
     /// `readlink()` was called for an inode whose type is not `S_IFLNK`.
     #[error("inode is not a symbolic link")]
     NotASymlink,
+    /// Hard links to directories are forbidden so the namespace remains a tree.
+    #[error("hard links to directories are not permitted")]
+    IsADirectory,
+    /// Incrementing the inode's persistent link count would overflow.
+    #[error("too many hard links")]
+    TooManyLinks,
     /// I/O error during persistence operations (FileMetaStore).
     #[error("I/O error")]
     Io,
@@ -235,9 +241,15 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::InvalidName`] if `name` is empty, contains '/', or > 255 bytes.
     async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64>;
 
+    /// Adds `name` in `parent` as another directory entry for `inode` and
+    /// returns the atomically updated persistent link count. Directory hard
+    /// links are rejected. No ObjectStore reference is created or copied.
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> Result<u32>;
+
     /// Removes a file or empty directory from `parent` directory.
     ///
-    /// For regular files: removes the dirent and marks the inode as deleted.
+    /// For non-directories: removes one dirent and decrements `nlink`; only the
+    /// final reference removes the inode, slices, and symlink target.
     /// For directories: only succeeds if the directory is empty (no children).
     ///
     /// # Errors
@@ -843,6 +855,54 @@ impl MetaStore for MemStore {
         Ok(new_inode_id)
     }
 
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> Result<u32> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(MetaError::InvalidName(format!("invalid name: {name}")));
+        }
+        if name.len() > 255 {
+            return Err(MetaError::InvalidName(format!(
+                "name too long: {}",
+                name.len()
+            )));
+        }
+
+        let mut inner = self.inner.write().await;
+        let parent_inode = inner.inodes.get(&parent).ok_or(MetaError::NotFound)?;
+        if !parent_inode.is_dir() {
+            return Err(MetaError::NotADirectory);
+        }
+        if inner
+            .dir_entries
+            .get(&parent)
+            .is_some_and(|entries| entries.contains_key(name))
+        {
+            return Err(MetaError::AlreadyExists);
+        }
+
+        let target = inner.inodes.get(&inode).ok_or(MetaError::NotFound)?;
+        if target.is_dir() {
+            return Err(MetaError::IsADirectory);
+        }
+        let new_nlink = target
+            .nlink
+            .checked_add(1)
+            .ok_or(MetaError::TooManyLinks)?;
+
+        inner
+            .dir_entries
+            .entry(parent)
+            .or_insert_with(HashMap::new)
+            .insert(name.to_owned(), inode);
+        let now = current_unix_time();
+        if let Some(target) = inner.inodes.get_mut(&inode) {
+            target.nlink = new_nlink;
+        }
+        if let Some(parent_inode) = inner.inodes.get_mut(&parent) {
+            parent_inode.mtime = now;
+        }
+        Ok(new_nlink)
+    }
+
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
         // Validate name
         if name.is_empty() || name == "." || name == ".." {
@@ -864,14 +924,17 @@ impl MetaStore for MemStore {
             .and_then(|entries| entries.get(name).copied())
             .ok_or(MetaError::NotFound)?;
 
-        // Get child inode to check if it's a directory
+        // Snapshot the fields needed below so subsequent mutations do not
+        // retain an immutable borrow into the inode table.
         let child_inode = inner
             .inodes
             .get(&child_inode_id)
             .ok_or(MetaError::NotFound)?;
+        let child_is_dir = child_inode.is_dir();
+        let child_nlink = child_inode.nlink;
 
         // If it's a directory, check if it's empty
-        if child_inode.is_dir() {
+        if child_is_dir {
             if let Some(child_entries) = inner.dir_entries.get(&child_inode_id) {
                 if !child_entries.is_empty() {
                     return Err(MetaError::NotEmpty);
@@ -884,6 +947,16 @@ impl MetaStore for MemStore {
         // Remove from parent's directory entries
         if let Some(entries) = inner.dir_entries.get_mut(&parent) {
             entries.remove(name);
+        }
+
+        // A non-final hard-link removal only drops one name and one reference.
+        // The inode, its slices/symlink target, and every ObjectStore key stay
+        // live until the final directory entry disappears.
+        if !child_is_dir && child_nlink > 1 {
+            if let Some(child_inode) = inner.inodes.get_mut(&child_inode_id) {
+                child_inode.nlink -= 1;
+            }
+            return Ok(Vec::new());
         }
 
         // Remove the inode itself
@@ -984,6 +1057,11 @@ impl MetaStore for MemStore {
 
         let mut candidates = HashSet::new();
         if let Some(target_inode_id) = target_exists {
+            // POSIX rename between two names already referring to the same
+            // inode is a successful no-op: neither directory entry changes.
+            if target_inode_id == source_inode_id {
+                return Ok(Vec::new());
+            }
             let target_inode = inner.inodes.get(&target_inode_id).ok_or(MetaError::NotFound)?;
 
             // POSIX semantics: can replace regular file, but not non-empty directory
@@ -998,14 +1076,23 @@ impl MetaStore for MemStore {
                 inner.dir_entries.remove(&target_inode_id);
                 inner.inodes.remove(&target_inode_id);
             } else {
-                // Replace regular file: remove old target
-                inner.inodes.remove(&target_inode_id);
-                if let Some(chunks) = inner.slices.remove(&target_inode_id) {
-                    candidates.extend(slice_block_keys(
-                        chunks.values().flat_map(|slices| slices.iter()),
-                    ));
+                // Replacing one hard link drops only that reference. Object
+                // data becomes collectible only when this was the final name.
+                if target_inode.nlink > 1 {
+                    inner
+                        .inodes
+                        .get_mut(&target_inode_id)
+                        .expect("target inode checked above")
+                        .nlink -= 1;
+                } else {
+                    inner.inodes.remove(&target_inode_id);
+                    if let Some(chunks) = inner.slices.remove(&target_inode_id) {
+                        candidates.extend(slice_block_keys(
+                            chunks.values().flat_map(|slices| slices.iter()),
+                        ));
+                    }
+                    inner.symlink_targets.remove(&target_inode_id);
                 }
-                inner.symlink_targets.remove(&target_inode_id);
             }
         }
 
@@ -1521,6 +1608,119 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MetaError::InvalidName(_)));
+    }
+
+    #[tokio::test]
+    async fn hard_link_keeps_inode_and_objects_until_final_unlink() {
+        let store = MemStore::new();
+        let inode = store
+            .create(ROOT_INODE, "hardlink-source", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        store.append_slice(inode, slice).await.unwrap();
+
+        assert_eq!(
+            store
+                .link(ROOT_INODE, "hardlink-alias", inode)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "hardlink-alias").await.unwrap(),
+            inode
+        );
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 2);
+
+        assert!(store
+            .unlink(ROOT_INODE, "hardlink-source")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 1);
+        assert_eq!(store.read_slices(inode, 0).await.unwrap().len(), 1);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+
+        assert_eq!(
+            store
+                .unlink(ROOT_INODE, "hardlink-alias")
+                .await
+                .unwrap(),
+            vec![key.clone()]
+        );
+        assert!(matches!(
+            store.getattr(inode).await,
+            Err(MetaError::NotFound)
+        ));
+        assert_eq!(store.pending_garbage().await.unwrap(), vec![key]);
+    }
+
+    #[tokio::test]
+    async fn hard_link_rejects_directory_and_existing_destination() {
+        let store = MemStore::new();
+        let file = store
+            .create(ROOT_INODE, "existing", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let directory = store.mkdir(ROOT_INODE, "directory", 0o755).await.unwrap();
+
+        assert!(matches!(
+            store.link(ROOT_INODE, "existing", file).await,
+            Err(MetaError::AlreadyExists)
+        ));
+        assert!(matches!(
+            store.link(ROOT_INODE, "directory-link", directory).await,
+            Err(MetaError::IsADirectory)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_over_shared_target_drops_only_replaced_link() {
+        let store = MemStore::new();
+        let target = store
+            .create(ROOT_INODE, "target", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        store.link(ROOT_INODE, "target-alias", target).await.unwrap();
+        let source = store
+            .create(ROOT_INODE, "source", S_IFREG | 0o644)
+            .await
+            .unwrap();
+
+        assert!(store
+            .rename(ROOT_INODE, "source", ROOT_INODE, "target")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.lookup(ROOT_INODE, "target").await.unwrap(), source);
+        assert_eq!(
+            store.lookup(ROOT_INODE, "target-alias").await.unwrap(),
+            target
+        );
+        assert_eq!(store.getattr(target).await.unwrap().nlink, 1);
+
+        // Renaming one alias over another alias of the same inode is a no-op.
+        store.link(ROOT_INODE, "target-alias-2", target).await.unwrap();
+        store
+            .rename(
+                ROOT_INODE,
+                "target-alias",
+                ROOT_INODE,
+                "target-alias-2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.getattr(target).await.unwrap().nlink, 2);
+        store.lookup(ROOT_INODE, "target-alias").await.unwrap();
+        store.lookup(ROOT_INODE, "target-alias-2").await.unwrap();
     }
 
     #[tokio::test]

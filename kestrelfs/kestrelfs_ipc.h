@@ -143,6 +143,7 @@
 #define KESTRELFS_OP_READDIR_DATA	18	/* req: batched readdir via data_buffer */
 #define KESTRELFS_OP_SYMLINK_DATA	19	/* req: create symlink via data_buffer */
 #define KESTRELFS_OP_READLINK_DATA	20	/* req: read symlink target via data_buffer */
+#define KESTRELFS_OP_LINK_DATA		21	/* req: hard link using name in data_buffer */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -584,6 +585,19 @@
  */
 #define KESTRELFS_SYMLINK_TARGET_MAX	4095
 
+/*
+ * ABI v12 hard-link layout
+ * ------------------------
+ * LINK_DATA request payload:
+ *   offset  0, 8 bytes, little-endian u64: destination parent inode id.
+ *   offset  8, 8 bytes, little-endian u64: existing target inode id.
+ *   offset 16, 2 bytes, little-endian u16: new name length.
+ *   offset 18..32: reserved, must be zero.
+ * data_buffer starts with the non-NUL-terminated new name, limited to
+ * KESTRELFS_NAME_DATA_MAX bytes. RESULT_OK payload offset 0 contains the
+ * atomically updated little-endian u32 nlink value.
+ */
+
 /* ------------------------------------------------------------------
  * Event payload
  * ------------------------------------------------------------------ */
@@ -737,8 +751,12 @@ struct kestrelfs_ring_ctrl {
  *  11 - Phase 3 step 14: Added SYMLINK_DATA and READLINK_DATA (opcodes
  *       19..20). Link names and targets use the existing serialized bounce
  *       buffer; symlink targets remain metadata rather than object data.
+ *
+ *  12 - Phase 4/control-plane step 32: Added LINK_DATA (opcode 21). The destination name
+ *       uses the serialized bounce buffer and supports POSIX NAME_MAX; the
+ *       response returns the persistent inode link count.
  */
-#define KESTRELFS_ABI_VERSION		11
+#define KESTRELFS_ABI_VERSION		12
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -844,6 +862,9 @@ _Static_assert(8 + 8 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 
 _Static_assert(8 + 8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"RENAME_DATA request fields overflow the event payload");
+
+_Static_assert(8 + 8 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"LINK_DATA request fields overflow the event payload");
 
 _Static_assert(2 * KESTRELFS_RENAME_DATA_NAME_MAX <=
 		KESTRELFS_DATA_BUFFER_SIZE,

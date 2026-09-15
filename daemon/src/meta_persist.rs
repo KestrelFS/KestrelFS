@@ -190,6 +190,12 @@ impl MetaStore for FileMetaStore {
         Ok(inode_id)
     }
 
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> Result<u32> {
+        let nlink = self.mem.link(parent, name, inode).await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
+        Ok(nlink)
+    }
+
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
         let garbage = self.mem.unlink(parent, name).await?;
         self.sync_to_disk()
@@ -327,6 +333,50 @@ mod tests {
 
         let inode = store2.getattr(found).await.unwrap();
         assert_eq!(inode.size, 128);
+    }
+
+    #[tokio::test]
+    async fn hard_links_and_link_count_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let inode;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            inode = store
+                .create(ROOT_INODE, "persistent-source", 0o644)
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .link(ROOT_INODE, "persistent-alias", inode)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(
+            restored
+                .lookup(ROOT_INODE, "persistent-source")
+                .await
+                .unwrap(),
+            inode
+        );
+        assert_eq!(
+            restored
+                .lookup(ROOT_INODE, "persistent-alias")
+                .await
+                .unwrap(),
+            inode
+        );
+        assert_eq!(restored.getattr(inode).await.unwrap().nlink, 2);
+        assert!(restored
+            .unlink(ROOT_INODE, "persistent-source")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(restored.getattr(inode).await.unwrap().nlink, 1);
     }
 
     #[tokio::test]

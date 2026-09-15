@@ -209,6 +209,11 @@ enum Mutation {
         name: String,
         mode: u32,
     },
+    Link {
+        parent: u64,
+        name: String,
+        inode: u64,
+    },
     Unlink {
         parent: u64,
         name: String,
@@ -226,6 +231,7 @@ enum Mutation {
 
 enum MutationOutput {
     Inode(u64),
+    Nlink(u32),
     Unit,
     Garbage(Vec<String>),
 }
@@ -703,6 +709,14 @@ impl RedisMetaStore {
                 .mkdir(*parent, name, *mode)
                 .await
                 .map(MutationOutput::Inode),
+            Mutation::Link {
+                parent,
+                name,
+                inode,
+            } => mem
+                .link(*parent, name, *inode)
+                .await
+                .map(MutationOutput::Nlink),
             Mutation::Unlink { parent, name } => {
                 mem.unlink(*parent, name).await.map(MutationOutput::Garbage)
             }
@@ -941,6 +955,20 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
+    async fn link(&self, parent: u64, name: &str, inode: u64) -> Result<u32> {
+        match self
+            .mutate(Mutation::Link {
+                parent,
+                name: name.to_owned(),
+                inode,
+            })
+            .await?
+        {
+            MutationOutput::Nlink(nlink) => Ok(nlink),
+            _ => unreachable!("link mutation returned wrong output"),
+        }
+    }
+
     async fn rename(
         &self,
         old_parent: u64,
@@ -1058,6 +1086,27 @@ mod tests {
         assert_eq!(patch.gc_add, vec![victim_key]);
     }
 
+    #[tokio::test]
+    async fn hard_link_patch_atomically_updates_inode_and_dirent() {
+        let mem = MemStore::new();
+        let inode = mem.create(ROOT_INODE, "source", 0o644).await.unwrap();
+        let old = mem.snapshot().await;
+        assert_eq!(mem.link(ROOT_INODE, "alias", inode).await.unwrap(), 2);
+        let new = mem.snapshot().await;
+        let patch = RedisPatch::between(
+            &SnapshotRecords::from_snapshot(&old).unwrap(),
+            &SnapshotRecords::from_snapshot(&new).unwrap(),
+        );
+
+        assert_eq!(patch.inodes_set.len(), 1);
+        assert_eq!(patch.inodes_set[0].0, inode.to_string());
+        assert!(patch
+            .dirents_set
+            .contains(&(dirent_field(ROOT_INODE, "alias"), inode.to_string())));
+        assert!(patch.gc_add.is_empty());
+        assert!(patch.gc_del.is_empty());
+    }
+
     #[test]
     fn rejects_invalid_connection_settings_without_network_access() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1113,6 +1162,9 @@ mod tests {
         store.lookup(directory, "concurrent-right").await.unwrap();
 
         let file = store.create(directory, "data", 0o644).await.unwrap();
+        assert_eq!(store.link(directory, "data-alias", file).await.unwrap(), 2);
+        assert_eq!(peer.lookup(directory, "data-alias").await.unwrap(), file);
+        assert_eq!(peer.getattr(file).await.unwrap().nlink, 2);
         let link = store
             .symlink(directory, "link", "../target-with-redis")
             .await
@@ -1168,8 +1220,10 @@ mod tests {
             Err(MetaError::NotFound)
         ));
         assert_eq!(peer.lookup(directory, "victim").await.unwrap(), source);
+        assert!(store.unlink(directory, "data").await.unwrap().is_empty());
+        assert_eq!(peer.getattr(file).await.unwrap().nlink, 1);
         assert_eq!(
-            store.unlink(directory, "data").await.unwrap(),
+            store.unlink(directory, "data-alias").await.unwrap(),
             vec![older_key.clone()]
         );
 

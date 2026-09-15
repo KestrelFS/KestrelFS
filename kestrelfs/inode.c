@@ -105,25 +105,30 @@ const struct super_operations kestrelfs_super_ops = {
  * @ino:	inode number
  * @mode:	file type and permissions (S_IFDIR | 0755, S_IFREG | 0644, etc.)
  * @size:	file size in bytes
+ * @nlink:	persistent link count reported by MetaStore
  *
  * Used by dir.c's lookup/create handlers to instantiate inodes dynamically.
  * 
- * NOTE: We use new_inode() instead of iget5_locked() because:
- * 1. Daemon is the authoritative metadata store (no persistent inode cache needed)
- * 2. VFS dentry cache already prevents duplicate lookups for the same path
- * 3. iget5_locked() adds complexity and potential race conditions during evict
- * 4. Each lookup creates a fresh inode, but dentry cache ensures path uniqueness
+ * iget_locked() makes the daemon's 64-bit inode id the superblock-local VFS
+ * identity. This is required for hard links: independent lookups of two names
+ * for the same daemon inode must share i_nlink and cache invalidation state.
  *
  * Return: pointer to inode on success, ERR_PTR(-errno) on failure.
  */
 struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
-				  u32 mode, u64 size)
+				  u32 mode, u64 size, u32 nlink)
 {
 	struct inode *inode;
 
-	inode = new_inode(sb);
+	inode = iget_locked(sb, (unsigned long)ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
+	if (!(inode->i_state & I_NEW)) {
+		inode->i_mode = mode;
+		i_size_write(inode, size);
+		set_nlink(inode, nlink);
+		return inode;
+	}
 
 	inode->i_ino = ino;
 	inode->i_mode = mode;
@@ -138,22 +143,23 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		/* Directory */
 		inode->i_op = &kestrelfs_dir_inode_operations;
 		inode->i_fop = &kestrelfs_dir_file_operations;
-		set_nlink(inode, 2);
+		set_nlink(inode, nlink);
 	} else if (S_ISLNK(mode)) {
 		/* Target bytes are fetched from MetaStore through ->get_link(). */
 		inode->i_op = &kestrelfs_symlink_inode_operations;
-		set_nlink(inode, 1);
+		set_nlink(inode, nlink);
 	} else if (S_ISREG(mode)) {
 		/* Regular file - no custom a_ops (avoid dirty_folio without writeback) */
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
-		set_nlink(inode, 1);
+		set_nlink(inode, nlink);
 	} else {
 		/* Unsupported file type */
-		iput(inode);
+		iget_failed(inode);
 		return ERR_PTR(-EINVAL);
 	}
 
+	unlock_new_inode(inode);
 	return inode;
 }
 

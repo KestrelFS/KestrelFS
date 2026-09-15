@@ -510,6 +510,7 @@ async fn build_response_with_data(
         abi::OP_READDIR_DATA => handle_readdir_data(event, store, data_buffer).await,
         abi::OP_SYMLINK_DATA => handle_symlink_data(event, store, data_buffer).await,
         abi::OP_READLINK_DATA => handle_readlink_data(event, store, data_buffer).await,
+        abi::OP_LINK_DATA => handle_link_data(event, store, data_buffer).await,
         _ => build_response(event, store, object_store).await,
     }
 }
@@ -738,6 +739,39 @@ async fn handle_readlink_data(
     let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
     response.payload[0..4].copy_from_slice(&(target.len() as u32).to_le_bytes());
     response
+}
+
+async fn handle_link_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    data_buffer: *const u8,
+) -> KestrelfsEvent {
+    // SAFETY: the kernel keeps kestrelfs_data_ipc_lock held until this
+    // synchronous request has received its response.
+    let req = match unsafe { event.decode_link_data_req(data_buffer) } {
+        Ok(req) => req,
+        Err(abi::NameDataDecodeError::NameTooLong(_)) => {
+            return KestrelfsEvent::error_response(event.req_id, -libc::ENAMETOOLONG);
+        }
+        Err(error) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_LINK_DATA req_id={} malformed: {error}",
+                event.req_id
+            );
+            return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+        }
+    };
+
+    match store.link(req.parent_inode, &req.name, req.inode_id).await {
+        Ok(nlink) => {
+            let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            response.payload[0..4].copy_from_slice(&nlink.to_le_bytes());
+            response
+        }
+        Err(error) => {
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
+        }
+    }
 }
 
 /// Handles `KESTRELFS_OP_READDIR` requests: lists directory entries.
@@ -1229,6 +1263,8 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::AlreadyExists => -libc::EEXIST,
         MetaError::NotEmpty => -libc::ENOTEMPTY,
         MetaError::NotASymlink => -libc::EINVAL,
+        MetaError::IsADirectory => -libc::EPERM,
+        MetaError::TooManyLinks => -libc::EMLINK,
         MetaError::Io => -libc::EIO,
     }
 }
@@ -2923,6 +2959,24 @@ mod tests {
         event
     }
 
+    fn raw_link_data_req(
+        req_id: u64,
+        parent_inode: u64,
+        inode_id: u64,
+        name: &str,
+        data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
+    ) -> KestrelfsEvent {
+        let name = name.as_bytes();
+        assert!(!name.is_empty());
+        assert!(name.len() <= abi::NAME_DATA_MAX);
+        data_buffer[..name.len()].copy_from_slice(name);
+        let mut event = KestrelfsEvent::zeroed(abi::OP_LINK_DATA, req_id);
+        event.payload[0..8].copy_from_slice(&parent_inode.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[16..18].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        event
+    }
+
     fn decode_readdir_data_test_response(
         response: &KestrelfsEvent,
         data_buffer: &[u8; abi::DATA_BUFFER_SIZE],
@@ -2953,6 +3007,34 @@ mod tests {
         }
         assert_eq!(cursor, data_len);
         entries
+    }
+
+    #[tokio::test]
+    async fn link_data_supports_long_name_and_returns_updated_nlink() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "link-source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let mut data = [0u8; abi::DATA_BUFFER_SIZE];
+        let alias = "hard-link-name-longer-than-old-payload-limit";
+        let request = raw_link_data_req(3200, fs_model::ROOT_INODE, inode, alias, &mut data);
+
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(response.payload[0..4].try_into().unwrap()),
+            2
+        );
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, alias).await.unwrap(), inode);
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 2);
     }
 
     #[tokio::test]

@@ -142,6 +142,7 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 	u64 child_ino;
 	u64 size;
 	u32 mode;
+	u32 nlink;
 	int ret;
 
 	pr_info("kestrelfs: lookup parent=%lu name=\"%s\"\n",
@@ -167,20 +168,18 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 	memcpy(&child_ino, &resp.payload[0], sizeof(u64));
 	memcpy(&size, &resp.payload[8], sizeof(u64));
 	memcpy(&mode, &resp.payload[16], sizeof(u32));
+	memcpy(&nlink, &resp.payload[28], sizeof(u32));
 
 	pr_info("kestrelfs: lookup found child_ino=%llu size=%llu mode=0%o\n",
 		child_ino, size, mode);
 
 	/* Create/fetch inode */
-	inode = kestrelfs_get_inode(sb, child_ino, mode, size);
+	inode = kestrelfs_get_inode(sb, child_ino, mode, size, nlink);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
 		return ERR_CAST(inode);
 	}
-
-	/* Insert into inode hash (like shmem, avoid unhashed state) */
-	insert_inode_hash(inode);
 
 	/* Attach to dentry */
 	return d_splice_alias(inode, dentry);
@@ -207,6 +206,7 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	u64 size;
 	u32 resp_mode;
 	u32 create_mode;
+	u32 nlink;
 	int ret;
 
 	pr_info("kestrelfs: create parent=%lu name=\"%s\" mode=0%o\n",
@@ -230,20 +230,18 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	memcpy(&new_ino, &resp.payload[0], sizeof(u64));
 	memcpy(&size, &resp.payload[8], sizeof(u64));
 	memcpy(&resp_mode, &resp.payload[16], sizeof(u32));
+	memcpy(&nlink, &resp.payload[28], sizeof(u32));
 
 	pr_info("kestrelfs: create -> new_ino=%llu size=%llu mode=0%o\n",
 		new_ino, size, resp_mode);
 
 	/* Create inode */
-	inode = kestrelfs_get_inode(sb, new_ino, resp_mode, size);
+	inode = kestrelfs_get_inode(sb, new_ino, resp_mode, size, nlink);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
 		return PTR_ERR(inode);
 	}
-
-	/* Insert into inode hash (like shmem, avoid unhashed state) */
-	insert_inode_hash(inode);
 
 	/* Instantiate dentry */
 	d_instantiate(dentry, inode);
@@ -263,7 +261,7 @@ static int kestrelfs_inode_symlink(struct mnt_idmap *idmap,
 	size_t name_len = dentry->d_name.len;
 	size_t target_len = strnlen(symname, KESTRELFS_SYMLINK_TARGET_MAX + 1);
 	u64 new_ino, size;
-	u32 mode;
+	u32 mode, nlink;
 	int ret;
 
 	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
@@ -299,10 +297,10 @@ out_unlock_symlink:
 	new_ino = get_unaligned_le64(&resp.payload[0]);
 	size = get_unaligned_le64(&resp.payload[8]);
 	mode = get_unaligned_le32(&resp.payload[16]);
-	inode = kestrelfs_get_inode(dir->i_sb, new_ino, mode, size);
+	nlink = get_unaligned_le32(&resp.payload[28]);
+	inode = kestrelfs_get_inode(dir->i_sb, new_ino, mode, size, nlink);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-	insert_inode_hash(inode);
 	d_instantiate(dentry, inode);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	return 0;
@@ -409,7 +407,7 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	pr_info("kestrelfs: mkdir created dir ino=%llu\n", new_ino);
 
 	/* Create VFS inode for the new directory */
-	inode = kestrelfs_get_inode(sb, new_ino, S_IFDIR | mode, 0);
+	inode = kestrelfs_get_inode(sb, new_ino, S_IFDIR | mode, 0, 2);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
@@ -419,6 +417,55 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	/* Instantiate dentry */
 	d_instantiate(dentry, inode);
 
+	return 0;
+}
+
+/* Create another directory entry for an existing non-directory inode. */
+static int kestrelfs_inode_link(struct dentry *old_dentry, struct inode *dir,
+				struct dentry *new_dentry)
+{
+	struct kestrelfs_shared_region *region;
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	struct inode *inode = d_inode(old_dentry);
+	size_t name_len = new_dentry->d_name.len;
+	u32 nlink;
+	int ret;
+
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
+	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
+		return -ENAMETOOLONG;
+
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_unlock_link;
+	}
+
+	memcpy(region->data_buffer, new_dentry->d_name.name, name_len);
+	req.opcode = KESTRELFS_OP_LINK_DATA;
+	put_unaligned_le64(dir->i_ino, &req.payload[0]);
+	put_unaligned_le64(inode->i_ino, &req.payload[8]);
+	put_unaligned_le16((u16)name_len, &req.payload[16]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+
+out_unlock_link:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+
+	nlink = get_unaligned_le32(&resp.payload[0]);
+	if (nlink < 2)
+		return -EPROTO;
+	set_nlink(inode, nlink);
+	inode_set_ctime_current(inode);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	ihold(inode);
+	d_instantiate(new_dentry, inode);
 	return 0;
 }
 
@@ -442,7 +489,7 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 		pr_warn("kestrelfs: unlink name too long: %zu bytes\n", name_len);
 		return -ENAMETOOLONG;
 	}
-	if (d_really_is_positive(dentry)) {
+	if (d_really_is_positive(dentry) && d_inode(dentry)->i_nlink == 1) {
 		ret = kestrelfs_cache_invalidate_inode(d_inode(dentry)->i_ino);
 		if (ret)
 			return ret;
@@ -572,6 +619,14 @@ out_unlock:
 	pr_info("kestrelfs: rename success\n");
 
 	/* Update VFS metadata. VFS performs the dentry move after this callback. */
+	if (d_really_is_positive(new_dentry) &&
+	    d_inode(new_dentry) != d_inode(old_dentry) &&
+	    !S_ISDIR(d_inode(new_dentry)->i_mode)) {
+		struct inode *replaced = d_inode(new_dentry);
+
+		drop_nlink(replaced);
+		inode_set_ctime_current(replaced);
+	}
 	if (d_really_is_positive(old_dentry)) {
 		struct inode *inode = d_inode(old_dentry);
 		inode_set_ctime_current(inode);
@@ -587,6 +642,7 @@ out_unlock:
 const struct inode_operations kestrelfs_dir_inode_operations = {
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
+	.link		= kestrelfs_inode_link,
 	.symlink	= kestrelfs_inode_symlink,
 	.mkdir		= kestrelfs_inode_mkdir,
 	.unlink		= kestrelfs_inode_unlink,
