@@ -232,7 +232,7 @@ Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
 
 | 层 | 内存模式 (`--memory`) | 默认持久化模式 | 可选远端后端 |
 |---|---|---|---|
-| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；v2 control/inode/dirent/slice/symlink/GC HASH/SET + Lua revision-CAS，待验收） |
+| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；v2 control/inode/dirent/slice/symlink/GC HASH/SET + Lua revision-CAS） |
 | 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | `S3ObjectStore`（`--objects s3://bucket/prefix`；AWS S3 或 MinIO） |
 
 **CLI 参数**（`daemon/src/main.rs`）：
@@ -302,7 +302,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 31 工作树当前 144 个）
+cargo test                    # 单元测试 + 集成测试（Step 31 验收基线 144 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -517,7 +517,7 @@ REDIS_URL='redis://:<PASSWORD>@192.168.18.253:8379/15' \
 
 该测试当前覆盖两个 RedisMetaStore 并发 create、mkdir/create、symlink target、
 rename 覆盖、truncate/unlink GC keys、重新构造 RedisMetaStore 后的恢复，以及旧 v1
-schema fail-closed。Step 31 工作树中 Redis mutation 先从 v2 HASH/SET 读取一致状态并
+schema fail-closed。Step 31 起 Redis mutation 先从 v2 HASH/SET 读取一致状态并
 复用 MemStore 语义，再由 Lua 校验 revision 并原子应用字段级 diff；CAS 失败会从
 最新 revision 重试。
 
@@ -975,7 +975,7 @@ exit 255，另有一次 Step 25 daemon 重启时 `Transport endpoint is not conn
 
 GC queue 是 MetaStore 持久状态的一部分。unlink、rename-overwrite、truncate 在移除
 最后 slice 引用的同一次 mutation 中把 key 加入 `pending_garbage`：FileMetaStore 使用
-同一次 tmp + fsync + rename；Step 31 工作树的 RedisMetaStore 使用同一次 v2 Lua
+同一次 tmp + fsync + rename；Step 31 起 RedisMetaStore 使用同一次 v2 Lua
 revision-CAS 将候选写入 `gc` SET（Step 30 验收基线为单 key Lua CAS）。delete 成功后
 才以第二次 metadata mutation 确认出队，因此进程在 metadata commit 后或 delete/ack
 之间退出，重启都只会产生安全的幂等重试。
@@ -1014,7 +1014,7 @@ Redis schema v2 使用六个固定结构：`control` HASH 记录 `schema_version
 revision-CAS 并原子更新全部相关结构。旧 `<prefix>:meta:v1`、未知 schema 或无 control
 的半布局均拒绝启动，不自动迁移/wipe。
 
-2026-09-15 工作树自检：
+2026-09-15 Cursor 验收自检（与 Codex 汇报一致）：
 
 ```text
 cargo test --manifest-path daemon/Cargo.toml
@@ -1028,7 +1028,7 @@ REDIS_URL=... cargo test redis_url_gated_full_semantics_and_restart -- --nocaptu
 门控测试覆盖两个 store 并发 inode 分配、rename-overwrite 提交后的 old/new 原子结果、
 truncate/unlink GC 入队、store 重建后的 namespace/symlink/GC queue 恢复、ack 以及旧
 v1 schema fail-closed。此步只修改 daemon 与文档，未改 `kestrelfs/*.c`、tools、IPC
-或 mount 行为，因此按 §8/§9.9 未运行 make/vng；全程没有在物理机执行
+或 mount 行为，因此按规则未运行 make/vng；全程没有在物理机执行
 insmod/mount/cache-device 操作。
 
 ---

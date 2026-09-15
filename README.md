@@ -18,10 +18,10 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 30 持久化对象 GC 重试已验收；Step 31 Redis 分记录元数据待 Cursor 验收；IPC ABI v11；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 31 Redis v2 分记录元数据已验收；下一步 Step 32 POSIX-CORE；IPC ABI v11；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
-> 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据原型、`LocalFsObjectStore`、
+> 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
 > 可选 S3/MinIO 对象原型）。Phase 4 已实现：4 KiB 块索引持久化/恢复、READ_DATA
 > miss 填充、同步内核 BIO 命中、rewrite/truncate/unlink/rename-overwrite 失效、
 > namespace SHA-256 绑定、对齐连续 hit 直达 pinned user pages、满盘 block-LRU、
@@ -29,11 +29,9 @@
 > cache-hit 调用者并行等待同步 BIO、Step 27 离线只读诊断/双确认 metadata wipe，
 > Step 28 `read_iter` / iov_iter 读路径，以及 Step 29 批量 LRU 回收。Step 30
 > 已把无引用对象 key 与 metadata mutation 一起写入持久队列，daemon 启动及运行中
-> 会幂等重试删除。Step 31 待验收工作树将 Redis metadata 拆为 v2 分记录 schema，
-> 并用 Lua revision-CAS 原子提交字段级变更；真正的异步 completion 流水线与多节点
-> 失效尚未实现。
-> 详见[路线图](#路线图)、`HANDOFF.md` 与
-> `docs/remaining-capabilities.md`。
+> 会幂等重试删除。Step 31 已将 Redis metadata 拆为 v2 分记录 schema，并用 Lua
+> revision-CAS 原子提交字段级变更；真正的异步 completion 流水线与多节点失效尚未
+> 实现。详见[路线图](#路线图)、`HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
 
@@ -130,7 +128,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29 cache 已验收；Step 30 DIST-GC 已验收；Step 31 DIST-META 待 Cursor 验收（ABI v11 / format v4 均未变） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–31 已验收（cache / DIST-GC / DIST-META）；下一步 Step 32 POSIX-CORE（ABI v11 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -292,7 +290,7 @@ sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
 S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 CLI 参数或打印到日志。
 目标 bucket 须预先存在。
 
-Step 31 待验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
+Step 31 已验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
 queue 拆到独立 HASH/SET；点查只读取目标 field，复合 mutation 用 Lua
 revision-CAS 原子提交字段级 diff。旧 `<PREFIX>:meta:v1` 默认拒绝且不自动迁移。
 可选集成测试：
@@ -415,7 +413,7 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名（ABI v11）。仍缺�
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
 - 数据/名字 IPC 由一把全局 mutex 串行化。
-- Step 31 待验收的 Redis 元数据已改为 v2 分记录 HASH/SET，点查不再全量读取；但
+- Step 31 已验收的 Redis 元数据为 v2 分记录 HASH/SET，点查不再全量读取；但
   mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
   引用确认也仍需聚合扫描。当前仅支持 `redis://` 与一条 multiplexed connection，
   尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。S3 delete 失败会保留队列并
