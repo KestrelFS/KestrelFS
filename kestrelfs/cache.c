@@ -33,6 +33,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 
 #include "kestrelfs.h"
 
@@ -1326,8 +1327,8 @@ out:
 	return ret;
 }
 
-ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
-			       size_t count, loff_t *ppos, u64 *miss_epoch)
+ssize_t kestrelfs_cache_read_iter(struct inode *inode, struct iov_iter *to,
+				  loff_t *ppos, u64 *miss_epoch)
 {
 	struct kestrelfs_cache_index_entry *entry;
 	u64 inode_id = inode->i_ino;
@@ -1337,6 +1338,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 	u64 offset;
 	u64 end;
 	u64 block_offset;
+	size_t count = iov_iter_count(to);
 	size_t wanted;
 	size_t copied = 0;
 	u32 direct_checksums[KESTRELFS_CACHE_DIRECT_MAX_BYTES /
@@ -1377,6 +1379,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		size_t bytes = min_t(u64, KESTRELFS_CACHE_BLOCK_SIZE - within,
 				     end - (block_offset + within));
 		size_t direct_bytes = KESTRELFS_CACHE_BLOCK_SIZE;
+		size_t direct_limit = 0;
 
 		entry = kestrelfs_cache_find(inode_id, block_offset);
 		if (!entry) {
@@ -1387,16 +1390,21 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		/*
 		 * Coalesce complete file blocks whose cache slots are contiguous.
 		 * Head/tail partial blocks deliberately stay on the buffered path:
-		 * a block-device BIO must never overwrite bytes outside the read(2)
-		 * range in a userspace page.
+		 * a block-device BIO must never overwrite bytes outside the current
+		 * iovec segment or the caller's requested range.
 		 */
-		if (cache_direct_io && !within &&
+		if (user_backed_iter(to))
+			direct_limit = iov_iter_single_seg_count(to);
+		if (cache_direct_io && direct_limit >= KESTRELFS_CACHE_BLOCK_SIZE &&
+		    !within &&
 		    bytes == KESTRELFS_CACHE_BLOCK_SIZE) {
 			unsigned int bad_block = 0;
 			int io_ret;
 
 			direct_checksums[0] = entry->data_checksum;
 			while (direct_bytes < KESTRELFS_CACHE_DIRECT_MAX_BYTES &&
+			       direct_bytes + KESTRELFS_CACHE_BLOCK_SIZE <=
+					direct_limit &&
 			       block_offset + direct_bytes +
 				       KESTRELFS_CACHE_BLOCK_SIZE <= end) {
 				struct kestrelfs_cache_index_entry *next;
@@ -1413,7 +1421,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 			}
 
 			io_ret = kestrelfs_cache_read_user_blocks(
-				entry->lba, buf + copied, direct_bytes,
+				entry->lba, iter_iov_addr(to), direct_bytes,
 				direct_checksums, &bad_block);
 			if (!io_ret) {
 				u64 touch_offset;
@@ -1428,6 +1436,7 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 				}
 				kestrelfs_cache_account_direct(
 					direct_bytes / KESTRELFS_CACHE_BLOCK_SIZE);
+				iov_iter_advance(to, direct_bytes);
 				copied += direct_bytes;
 				offset += direct_bytes;
 				block_offset += direct_bytes;
@@ -1468,20 +1477,31 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 			ret = -ENODATA;
 			goto out;
 		}
-		if (copy_to_user(buf + copied, (u8 *)block + within, bytes)) {
-			ret = -EFAULT;
-			goto out;
+		{
+			size_t iter_copied;
+
+			iter_copied = copy_to_iter((u8 *)block + within, bytes, to);
+			copied += iter_copied;
+			offset += iter_copied;
+			if (iter_copied != bytes) {
+				ret = copied ? (ssize_t)copied : -EFAULT;
+				goto out;
+			}
 		}
-		copied += bytes;
-		offset += bytes;
 		block_offset += KESTRELFS_CACHE_BLOCK_SIZE;
 		kestrelfs_cache_touch(entry);
 		kestrelfs_cache_account_copy();
 	}
 
-	*ppos += copied;
 	ret = copied;
 out:
+	if (ret == -ENODATA && copied) {
+		/* The daemon miss path must restart at the original iterator. */
+		iov_iter_revert(to, copied);
+		copied = 0;
+	} else if (ret >= 0) {
+		*ppos += copied;
+	}
 	if (hit_accounted)
 		kestrelfs_cache_hit_end();
 	kfree(block);

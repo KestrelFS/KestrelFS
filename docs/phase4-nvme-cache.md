@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–27）
+## 当前边界（Step 18–28）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -63,6 +63,14 @@ unformatted 状态。`wipe` 是显式离线恢复动作：仅接受块设备，�
 且必须同时传 `--yes-really-wipe` 并令 `KESTRELFS_CACHE_WIPE_CONFIRM` 精确等于设备
 参数；它只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址，但
 不承诺安全擦除 data 区。IPC ABI 仍为 v11，cache format 仍为 v4。
+
+Step 28 把动态 regular file 的读入口从 `.read` 切到 `.read_iter`，让普通
+read/pread 与 readv/preadv 共享一条结构化 `iov_iter` 路径。cache hit 只在完整
+4 KiB block 位于当前单个用户 iovec 段、且地址满足既有 DMA/logical alignment 时
+直接 pin 该段用户页；连续 cache LBA 仍可在段内合并到 128 KiB。跨 iovec 边界、
+partial/unaligned、kernel-backed iter 或 pin/BIO 构造失败时，读取完整 cache block
+并经 `copy_to_iter` 分发。READ_DATA miss 也用 `copy_to_iter` 写入同一 iterator。
+IPC ABI 仍为 v11，cache format 仍为 v4。
 
 ## 缓存设备
 
@@ -186,11 +194,11 @@ Step 25 从 v3 bump 到 v4；v1/v2/v3 均默认拒绝，不自动 wipe、迁移�
 ## 命中和未命中路径
 
 ```text
-VFS read
-  -> kestrelfs_cache_lookup(inode, file_offset, length)
+VFS read/readv -> read_iter
+  -> kestrelfs_cache_read_iter(inode, iov_iter, file_offset)
        -> 取得 cache rwsem 读侧（不同 reader 可并行）
-       -> aligned hit: pin 用户页 -> 连续块合并 BIO -> 用户页 -> 逐块 CRC（不进 ring）
-       -> partial/fallback hit: 同步 4 KiB BIO -> 内核页 -> CRC -> copy_to_user
+       -> aligned single-iovec hit: pin 用户页 -> 连续块合并 BIO -> 用户页 -> 逐块 CRC
+       -> cross-iovec/partial/fallback: 同步 4 KiB BIO -> 内核页 -> CRC -> copy_to_iter
        -> miss: 返回 -ENODATA
   -> 取得 kestrelfs_data_ipc_lock
   -> READ_DATA + 16 KiB bounce + req/resp ring
@@ -203,15 +211,16 @@ hook 位于 `kestrelfs_data_ipc_lock` 之前，因此 hit 不占 bounce buffer�
 模型均不改变。只有请求的整个 EOF-clamped 范围都有索引时才按 hit 返回；否则
 整次请求安全回退到 READ_DATA，避免把部分结果暴露给调用者。
 
-直达路径只处理 read 范围完整覆盖的 cache block，绝不把 4 KiB BIO 指向只允许
-修改其中一部分的用户区间。连续的 file block 还必须映射到连续 cache LBA 才能
-合并；每个 BIO 上限 128 KiB，以限制 GUP 页数和 BIO vector 资源。用户地址不满足
-块设备 logical sector 与 DMA mask 时自动使用 buffered fallback。提交过 BIO 的
+直达路径只处理 read 范围完整覆盖、且完全位于当前单个用户 iovec 段的 cache block，
+绝不把 4 KiB BIO 指向只允许修改其中一部分或属于下一段的用户区间。连续的 file
+block 还必须映射到连续 cache LBA 才能合并；每个 BIO 上限 128 KiB，以限制 GUP
+页数和 BIO vector 资源。用户地址不满足块设备 logical sector 与 DMA mask 时自动
+使用 buffered fallback。提交过 BIO 的
 用户页在完成后按 dirty unpin，包括设备报告错误的情形，因为失败 BIO 也可能已经
 修改部分页；之后 buffered path 会覆盖请求区间，若 cache 设备仍失败则回远端 miss。
 pinned-page 路径在页仍固定时对每个 4 KiB block 计算 CRC；若失败，系统调用不会
 把这批字节作为成功结果返回，条目先被退休，再由同一次 READ_DATA miss 覆盖完整
-请求区间。buffered 路径则在 `copy_to_user()` 前完成校验，因此坏字节从不复制给
+请求区间。buffered 路径则在 `copy_to_iter()` 前完成校验，因此坏字节从不复制给
 调用者。
 
 ## 索引模型
@@ -278,9 +287,10 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
   存在碰撞概率；当前没有双 superblock 或 metadata 镜像，单 journal 还会给每次
   metadata mutation 增加两次同步写/flush。
 - Step 22/26 是 read hit 的受限少拷贝并行路径：完整、对齐、连续块可以直达用户
-  页，多个调用者可并行等待各自的同步 BIO；partial block 和不能 pin/对齐的 buffer
-  仍有一次 `copy_to_user()`。它不是异步 completion、`read_iter`/page-cache/splice
-  全覆盖，也没有单次请求内的多 BIO pipeline。
+  页，多个调用者可并行等待各自的同步 BIO；Step 28 通过 `read_iter` 覆盖
+  read/pread/readv/preadv，但跨 iovec、partial block 和不能 pin/对齐的 buffer 仍有
+  一次 `copy_to_iter()`。它不是异步 completion、page-cache/readahead/splice 全覆盖，
+  也没有跨 iovec scatter-gather BIO 或单次请求内的多 BIO pipeline。
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
@@ -395,3 +405,19 @@ v4 摘要和合法 PREPARED journal，再损坏 journal 验证 CRC 诊断。脚�
 entry 不可命中、恢复 daemon 后重填以及再次停 daemon 命中。2026-09-15 自检输出
 `STEP27_INSPECT_PASS`、`STEP27_WIPE_GUARD_PASS`、`STEP27_WIPE_PASS`、
 `STEP27_REFILL_PASS`、`STEP27_OPS_RECOVERY_PASS`，最终复跑 umount 50 ms。
+
+## Step 28 read_iter / iov_iter 验证
+
+`test-step28-cache-vfs-vng.sh` 在 vng guest+loop 中显式加载模块，并用独立 data-dir
+保留 daemon.log。辅助程序 `test-step28-cache-vfs.c` 经真实 `preadv()` 构造：
+
+- 两个页对齐 iovec，其中第二段跨两个用户页，确认三个 block 走 pinned BIO；
+- file offset、用户地址与 iovec 边界均非对齐的三段读，确认安全 buffered fallback；
+- 跨 EOF 的三段读，确认返回正确短读，且每段未返回区域保持 sentinel；
+- 每个 iovec 前后各 64-byte guard，确认 direct/fallback 都没有段外覆盖。
+
+warm 填充后脚本停止 daemon，再执行上述全部 vectored reads，因此成功只能来自本地
+cache。2026-09-15 自检输出 `STEP28_IOVEC_PASS`、`STEP28_UNALIGNED_PASS`、
+`STEP28_EOF_PASS`、`STEP28_DAEMON_FREE_HIT_PASS direct_delta=3 copy_delta=5`、
+`STEP28_CACHE_VFS_PASS`，umount 83 ms。Step 27/26/25/24/23/22/21/20/19/15
+回归均通过；所有 cache/mount 操作只在 vng guest+loop 执行。

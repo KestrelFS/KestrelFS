@@ -34,6 +34,7 @@
 #include <linux/jiffies.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/uio.h>
 
 #include "kestrelfs.h"
 
@@ -295,18 +296,21 @@ const struct file_operations kestrelfs_remote_file_ops = {
 };
 
 /*
- * kestrelfs_writable_read() - fops->read for writable.dat (inode 4).
+ * kestrelfs_writable_read_iter() - fops->read_iter for regular files.
  *
- * Uses ABI v8 READ_DATA requests and loops in 16 KiB bounce-buffer chunks,
- * allowing one read(2) to return the caller's full requested range.
+ * Uses an iov_iter for cache hits and ABI v8 READ_DATA requests for misses.
+ * The miss path loops in 16 KiB bounce-buffer chunks, allowing one read(2) or
+ * readv(2) call to return the caller's full requested range.
  *
  * Return: bytes read on success, 0 at EOF, negative errno on error.
  */
-static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
-					size_t count, loff_t *ppos)
+static ssize_t kestrelfs_writable_read_iter(struct kiocb *iocb,
+					   struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_inode;
 	struct kestrelfs_shared_region *region;
+	size_t count = iov_iter_count(to);
 	loff_t file_size;
 	size_t done = 0;
 	ssize_t cache_ret;
@@ -315,17 +319,17 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 
 	if (count == 0)
 		return 0;
-	if (*ppos < 0)
+	if (iocb->ki_pos < 0)
 		return -EINVAL;
 
 	/*
 	 * Phase 4 fast-path hook.  It deliberately runs before the bounce-buffer
-	 * mutex: a future cache hit must not serialize with daemon IPC.  The Step
-	 * 20 cache serves a request only when its complete range is indexed;
+	 * mutex so a cache hit does not serialize with daemon IPC.  The cache
+	 * serves a request only when its complete range is indexed;
 	 * otherwise READ_DATA remains the authoritative miss path.
 	 */
-	cache_ret = kestrelfs_cache_lookup(inode, buf, count, ppos,
-					   &miss_epoch);
+	cache_ret = kestrelfs_cache_read_iter(inode, to, &iocb->ki_pos,
+					      &miss_epoch);
 	if (cache_ret != -ENODATA)
 		return cache_ret;
 
@@ -340,18 +344,21 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 	}
 
 	file_size = i_size_read(inode);
-	while (done < count && *ppos < file_size) {
+	while (done < count && iocb->ki_pos < file_size) {
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
 		size_t chunk = min_t(size_t, count - done,
 					 KESTRELFS_DATA_BUFFER_SIZE);
 		u32 actual, requested;
 
-		chunk = min_t(u64, chunk, (u64)(file_size - *ppos));
+		u64 chunk_offset = iocb->ki_pos;
+		size_t copied;
+
+		chunk = min_t(u64, chunk, (u64)(file_size - iocb->ki_pos));
 		requested = (u32)chunk;
 		req.opcode = KESTRELFS_OP_READ_DATA;
 		put_unaligned_le64((u64)inode->i_ino, &req.payload[0]);
-		put_unaligned_le64((u64)*ppos, &req.payload[8]);
+		put_unaligned_le64(chunk_offset, &req.payload[8]);
 		put_unaligned_le32(requested, &req.payload[16]);
 
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
@@ -373,15 +380,18 @@ static ssize_t kestrelfs_writable_read(struct file *file, char __user *buf,
 		}
 		if (actual == 0)
 			break;
-		if (copy_to_user(buf + done, region->data_buffer, actual)) {
+		copied = copy_to_iter(region->data_buffer, actual, to);
+		if (copied != actual) {
+			done += copied;
+			iocb->ki_pos += copied;
 			ret = -EFAULT;
 			goto out_unlock;
 		}
-		kestrelfs_cache_fill(inode, (u64)*ppos, region->data_buffer,
+		kestrelfs_cache_fill(inode, chunk_offset, region->data_buffer,
 				       actual, miss_epoch);
 
 		done += actual;
-		*ppos += actual;
+		iocb->ki_pos += actual;
 		if (actual < chunk)
 			break;
 	}
@@ -500,7 +510,7 @@ out_unlock:
 
 const struct file_operations kestrelfs_writable_file_ops = {
 	.owner	= THIS_MODULE,
-	.read	= kestrelfs_writable_read,
+	.read_iter	= kestrelfs_writable_read_iter,
 	.write	= kestrelfs_writable_write,
 	.llseek	= kestrelfs_writable_llseek,
 };
@@ -594,7 +604,7 @@ const struct inode_operations kestrelfs_writable_inode_ops = {
  */
 const struct file_operations kestrelfs_reg_file_ops = {
 	.owner	= THIS_MODULE,
-	.read	= kestrelfs_writable_read,
+	.read_iter	= kestrelfs_writable_read_iter,
 	.write	= kestrelfs_writable_write,
 	.llseek	= kestrelfs_writable_llseek,
 };

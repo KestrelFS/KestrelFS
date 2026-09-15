@@ -19,6 +19,8 @@
 
 #include "kestrelfs_ipc.h"
 
+struct iov_iter;
+
 #define KESTRELFS_NAME		"kestrelfs"
 #define KESTRELFS_MAGIC		0x4B455354	/* "KEST" */
 
@@ -41,12 +43,12 @@ int kestrelfs_cache_init(void);
 void kestrelfs_cache_exit(void);
 
 /*
- * Try to satisfy a read from the kernel-owned cache.  A non-negative return
- * value is the number of bytes served; -ENODATA is a cache miss and tells the
- * caller to use the existing daemon READ_DATA path.
+ * Try to satisfy an iov_iter read from the kernel-owned cache. A non-negative
+ * return value is the number of bytes served; -ENODATA is a cache miss and
+ * tells the caller to use the existing daemon READ_DATA path.
  */
-ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
-			       size_t count, loff_t *ppos, u64 *miss_epoch);
+ssize_t kestrelfs_cache_read_iter(struct inode *inode, struct iov_iter *to,
+				  loff_t *ppos, u64 *miss_epoch);
 void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
 			  size_t length, u64 miss_epoch);
 int kestrelfs_cache_invalidate_inode(u64 inode_id);
