@@ -53,16 +53,16 @@ use crate::meta::current_unix_time;
 /// so serde can serialize it without exposing MemStore's internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MetaSnapshot {
-    inodes: HashMap<u64, Inode>,
-    dir_entries: HashMap<u64, HashMap<String, u64>>,
-    slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
+    pub(crate) inodes: HashMap<u64, Inode>,
+    pub(crate) dir_entries: HashMap<u64, HashMap<String, u64>>,
+    pub(crate) slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
     /// Default keeps ABI-v10-era snapshots loadable after symlink support lands.
     #[serde(default)]
-    symlink_targets: HashMap<u64, String>,
+    pub(crate) symlink_targets: HashMap<u64, String>,
     /// Default keeps pre-Step-30 snapshots loadable with an empty GC queue.
     #[serde(default)]
-    pending_garbage: HashSet<String>,
-    next_inode_id: u64,
+    pub(crate) pending_garbage: HashSet<String>,
+    pub(crate) next_inode_id: u64,
 }
 
 /// A MetaStore implementation that persists to a local JSON file.

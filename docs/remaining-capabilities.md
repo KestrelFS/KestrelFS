@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-15，Cursor（验收 Step 30；选定 Step 31 = DIST-META）
+> 最后更新：2026-09-15，Codex（Step 31 DIST-META 实现完成，待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -25,7 +25,7 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–6 | cache + DIST-GC | Step 24–30 | **ACCEPTED** | 命中路径、运维、对象回收重试 |
-| 7 | DIST-META | Step 31 Redis 拆 key / 连接生产化 | **DECIDED** | 单 key 全量快照是规模瓶颈 |
+| 7 | DIST-META | Step 31 Redis 拆 key / 连接生产化 | **REVIEW** | v2 分记录 schema + Lua revision-CAS 已实现，待 Cursor 验收 |
 | 8 | POSIX-CORE | hard link、open-unlink、rename flags | PROPOSED | 语义补齐 |
 | 9 | CACHE-COHERENCE | 多节点失效 | PROPOSED | 共享部署正确性 |
 | — | CACHE-WRITE | 写缓存 | **DEFERRED** | 默认只读 fill cache |
@@ -47,9 +47,12 @@ CACHE-* 主线已 ACCEPTED；`CACHE-WRITE` 仍 DEFERRED。
 
 ### DIST-META — Step 31
 
-- 状态：`DECIDED`
-- 缺口：单 Redis key 全量 JSON；无 TLS/`rediss://`；无连接恢复。
-- 范围：见 §8。
+- 状态：`REVIEW`
+- 已实现：v2 将 control / inode / dirent / slice / symlink / GC queue 拆为独立
+  Redis HASH/SET；点查不再读取全量 metadata，复合 mutation 用 Lua revision-CAS
+  原子发布字段级 diff。
+- 剩余缺口：mutation、readdir 与 GC 引用确认仍会读取聚合记录；无 TLS/
+  `rediss://`、自动重连与超时/健康检查；v1 不自动迁移。
 
 ### DIST-OBJECT / POSIX-CORE / IPC-SCALE
 
@@ -68,6 +71,8 @@ OPS-CONFIG / TEST-PERF / DOC-CLEANUP 仍为 `PROPOSED`。
 | 2026-09-15 | Codex | DIST-GC | 实现与自检 | **REVIEW** |
 | 2026-09-15 | Cursor | DIST-GC | Step 30 验收 | **ACCEPTED**；同事务队列 + 退避重试认可 |
 | 2026-09-15 | Cursor | DIST-META | 选定 Step 31 | **DECIDED**；见 §8 |
+| 2026-09-15 | Codex | DIST-META | Step 31 开工 | **IMPLEMENTING**；仅执行 §8 |
+| 2026-09-15 | Codex | DIST-META | v2 分记录 schema、Lua 原子 mutation 与自检完成 | **REVIEW**；见 §9 |
 
 ## 7. 不应顺手扩大
 
@@ -119,6 +124,31 @@ POSIX hard link 大工程（留给 POSIX-CORE）。
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-15 — Step 31 DIST-META（Codex REVIEW）
+
+- 方案：Redis schema v2 使用固定命名空间的 `control` HASH、`inodes` HASH、
+  `dirents` HASH、`slices` HASH、`symlinks` HASH 与 `gc` SET；dirent 名字以 UTF-8
+  字节 hex 编码成无歧义 field。`lookup/getattr/read_slices/readlink` 走定向字段读取。
+- 原子性：复合 mutation 在一致快照上复用 `MemStore` 语义，计算字段级 diff，再由
+  单个 Lua 脚本校验 revision 后同时提交 inode 分配、rename、slice/truncate 和
+  `pending_garbage` 入队/ack；并发冲突最多重试 64 次。语义错误也校验 revision 后
+  才返回，避免基于过期状态线性化。
+- schema：`<prefix>:meta:v2:control` 明确记录 `schema_version=2`、`revision` 与
+  `next_inode_id`。检测到旧 `<prefix>:meta:v1`、未知版本或无 control 的半布局均
+  fail closed；不自动迁移或 wipe。
+- 测试：默认 `cargo test` 为 **144 passed; 0 failed**；clippy
+  `--all-targets -- -D warnings` 零警告。真实 `REDIS_URL` 门控测试 **1 passed**，
+  覆盖并发 inode 分配、rename 覆盖的最终原子可见性、truncate/unlink GC queue、
+  重启恢复/ack 以及 v1 拒绝。纯 daemon 改动，未运行内核/tools/vng，也未在物理机
+  执行 insmod/mount/cache 操作。
+- 权衡/风险：本步优先消除单 value 全量读写；为复用既有完整 POSIX/GC 正确性，
+  mutation 仍原子读取 v2 各聚合 HASH 后计算 diff，readdir/GC 引用确认也仍有聚合
+  扫描，后续可演进为操作专用 Lua/索引。Redis 仍只支持 `redis://` 与一条
+  multiplexed connection；TLS、连接恢复、超时/健康检查和 Redis Cluster 留后续。
+  Redis 与 S3 之间仍是 at-least-once delete，不是跨后端两阶段事务。
+- ABI/cache：IPC ABI 保持 v11，cache format 保持 v4；MemStore/FileMetaStore 与 CLI
+  选择规则不变。未 commit/push。
 
 ### 2026-09-15 — Step 30 DIST-GC（Cursor ACCEPTED）
 

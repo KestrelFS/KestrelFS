@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Phase 4 Step 29 已验收；Step 30 持久化对象 GC 重试待 Cursor 验收；IPC ABI v11；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 30 持久化对象 GC 重试已验收；Step 31 Redis 分记录元数据待 Cursor 验收；IPC ABI v11；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据原型、`LocalFsObjectStore`、
@@ -28,8 +28,10 @@
 > data/index CRC32、v4 单页 intent journal（半提交恢复为安全 miss），以及多个
 > cache-hit 调用者并行等待同步 BIO、Step 27 离线只读诊断/双确认 metadata wipe，
 > Step 28 `read_iter` / iov_iter 读路径，以及 Step 29 批量 LRU 回收。Step 30
-> 待验收工作树把无引用对象 key 与 metadata mutation 一起写入持久队列，daemon
-> 启动及运行中会幂等重试删除；真正的异步 completion 流水线与多节点失效尚未实现。
+> 已把无引用对象 key 与 metadata mutation 一起写入持久队列，daemon 启动及运行中
+> 会幂等重试删除。Step 31 待验收工作树将 Redis metadata 拆为 v2 分记录 schema，
+> 并用 Lua revision-CAS 原子提交字段级变更；真正的异步 completion 流水线与多节点
+> 失效尚未实现。
 > 详见[路线图](#路线图)、`HANDOFF.md` 与
 > `docs/remaining-capabilities.md`。
 
@@ -128,7 +130,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29 已验收；Step 30 DIST-GC 待 Cursor 验收（ABI v11 / format v4 均未变） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29 cache 已验收；Step 30 DIST-GC 已验收；Step 31 DIST-META 待 Cursor 验收（ABI v11 / format v4 均未变） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -282,15 +284,18 @@ sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
 - `--data-dir <PATH>` — 持久化 `meta.json` 与本地对象目录（默认 `./.kestrelfs-data`）
 - `--memory` — 内存 MetaStore + ObjectStore（重启丢失；仅测试）
 - `--meta <REDIS_URL>` — 例如 `redis://127.0.0.1:6379/0`；对象仍可用 `--data-dir`
-- `--redis-prefix <PREFIX>` — Redis 快照键前缀（默认 `kestrelfs`；完整键
-  `<PREFIX>:meta:v1`）；需同时使用 `--meta`
+- `--redis-prefix <PREFIX>` — Redis metadata 命名空间（默认 `kestrelfs`；v2 键位于
+  `<PREFIX>:meta:v2:*`）；需同时使用 `--meta`
 - `--objects <S3_URL>` — 例如 `s3://bucket/kestrelfs-data`；不可与 `--memory` 同用
 - `--s3-endpoint <URL>` — MinIO 等自定义 endpoint（path-style）；也可读 `S3_ENDPOINT`
 
 S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 CLI 参数或打印到日志。
 目标 bucket 须预先存在。
 
-Redis 后端当前是**单 key 全量 JSON 快照 + Lua CAS** 原型。可选集成测试：
+Step 31 待验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
+queue 拆到独立 HASH/SET；点查只读取目标 field，复合 mutation 用 Lua
+revision-CAS 原子提交字段级 diff。旧 `<PREFIX>:meta:v1` 默认拒绝且不自动迁移。
+可选集成测试：
 
 ```bash
 cd daemon
@@ -306,8 +311,8 @@ AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
 AWS_REGION=us-east-1 cargo test s3_environment_gated -- --nocapture
 ```
 
-Step 30 待验收实现把 GC 候选保存在 MetaStore 快照的 `pending_garbage` 中：
-FileMetaStore 随 `meta.json` 原子落盘，RedisMetaStore 随同一单 key 快照 CAS 提交。
+Step 30 已把 GC 候选保存在 MetaStore 的 `pending_garbage` 中：FileMetaStore 随
+`meta.json` 原子落盘，RedisMetaStore 随同一 v2 Lua mutation 提交到 `gc` SET。
 daemon 启动时立即重放，运行中按 1 秒到 60 秒指数退避重试；对象删除成功后才从
 队列确认移除。`--memory` 下队列与对象都只在内存中，进程退出后二者一起消失。
 
@@ -407,12 +412,14 @@ Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读�
 truncate/`O_TRUNC`、批量 readdir、255 字节文件名（ABI v11）。仍缺：
 
 - 尚无 hard link；symlink 目标目前要求 UTF-8，最长 4095 字节。
-- Step 30 待验收实现会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
+- Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
 - 数据/名字 IPC 由一把全局 mutex 串行化。
-- Redis 元数据仍是单 key 全量快照原型；GC 入队/确认也会重写整份快照。S3 delete
-  失败会保留队列并重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加
-  IPC 尾延迟。
+- Step 31 待验收的 Redis 元数据已改为 v2 分记录 HASH/SET，点查不再全量读取；但
+  mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
+  引用确认也仍需聚合扫描。当前仅支持 `redis://` 与一条 multiplexed connection，
+  尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。S3 delete 失败会保留队列并
+  重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加 IPC 尾延迟。
 - Phase 4 仍是单节点原型：v4 绑定 namespace；CRC32 非密码学；半提交可安全
   miss，但无双 superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO
   仍同步等待，mutation 会等待在途 reader；无多节点远端失效。Step 29 可用一次

@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4/控制面 Step 30（DIST-GC：持久化 GC 队列 + 退避重试）已由 Cursor 验收并纳入本提交（IPC ABI v11、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Phase 4/控制面 Step 31（DIST-META：Redis v2 分记录 schema）已由 Cursor 验收并纳入本提交（IPC ABI v11、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 30 DIST-GC 已验收；下一步 Step 31 = DIST-META（见 remaining-capabilities §8） |
+| 当前阶段 | Step 31 DIST-META 已验收；下一步 Step 32 = POSIX-CORE（见 remaining-capabilities §8） |
 
 ---
 
@@ -39,7 +39,7 @@
                     │  MetaStore (元数据)               │
                     │    ├─ MemStore (内存)             │
                     │    ├─ FileMetaStore (meta.json)   │
-                    │    └─ RedisMetaStore (可选原型)   │
+                    │    └─ RedisMetaStore (v2 分记录)  │
                     │  ObjectStore (块数据)             │
                     │    ├─ MemObjectStore (内存)       │
                     │    ├─ LocalFsObjectStore (磁盘)   │
@@ -58,7 +58,7 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
 - **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
@@ -87,7 +87,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       ├── abi.rs               # ★ ABI mirror of kestrelfs_ipc.h（opcode 常量、编解码、编译时断言）
 │       ├── meta.rs              # MetaStore trait + MemStore 实现
 │       ├── meta_persist.rs      # FileMetaStore（JSON 持久化）
-│       ├── meta_redis.rs        # RedisMetaStore（单 key 快照 + Lua CAS）
+│       ├── meta_redis.rs        # RedisMetaStore（v2 分记录 HASH/SET + Lua revision-CAS）
 │       ├── object_store.rs      # ObjectStore trait + MemObjectStore + LocalFsObjectStore
 │       ├── object_store_s3.rs   # S3ObjectStore（AWS SDK、MinIO path-style）
 │       ├── fs_model.rs          # Inode / Slice / Block 数据模型
@@ -163,10 +163,11 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 28** | **regular file read_iter + iov_iter cache/miss 路径 + 安全跨段 fallback** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 29** | **批量 LRU victim journal + 同页 index 合并清零 + MRU 保护/崩溃恢复** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 30** | **metadata 同事务持久化 GC queue + 启动/运行期指数退避重试** | **11（未变）** | **✅ 已验收** |
+| **Phase 4/控制面 Step 31** | **Redis v2 分记录 schema + 字段级 diff + Lua revision-CAS 原子 mutation** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码、141 tests、FileMeta 崩溃重放与 Redis/S3 门控测确认 Step 30 已验收。
-同事务入队 + 读队列时过滤仍引用 key + delete 后 ack；ABI **v11**；format **v4**。
-下一步：**Step 31 DIST-META**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、144 tests 与 Redis 门控测确认 Step 31 已验收。
+点查定向读 + Lua revision-CAS；v1 fail closed；TLS/重连留后可接受。ABI **v11**；format **v4**。
+下一步：**Step 32 POSIX-CORE**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
@@ -231,14 +232,14 @@ Cursor 对照代码、141 tests、FileMeta 崩溃重放与 Redis/S3 门控测确
 
 | 层 | 内存模式 (`--memory`) | 默认持久化模式 | 可选远端后端 |
 |---|---|---|---|
-| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；`{prefix}:meta:v1` 单 key JSON + Lua CAS） |
+| 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；v2 control/inode/dirent/slice/symlink/GC HASH/SET + Lua revision-CAS，待验收） |
 | 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | `S3ObjectStore`（`--objects s3://bucket/prefix`；AWS S3 或 MinIO） |
 
 **CLI 参数**（`daemon/src/main.rs`）：
 - `--data-dir <PATH>`：持久化目录（默认 `./.kestrelfs-data`），meta.json 和块数据均存于此
 - `--memory`：纯内存模式（元数据 + 块数据均不持久化）
 - `--meta <REDIS_URL>`：将 metadata 切到 Redis，例如 `redis://127.0.0.1:6379/0`；与 `--memory` 冲突
-- `--redis-prefix <PREFIX>`：Redis key 命名空间，默认 `kestrelfs`，实际 key 为 `<PREFIX>:meta:v1`
+- `--redis-prefix <PREFIX>`：Redis key 命名空间，默认 `kestrelfs`，v2 keys 为 `<PREFIX>:meta:v2:{control,inodes,dirents,slices,symlinks,gc}`
 - `--objects <S3_URL>`：将对象数据切到 S3，例如 `s3://bucket/kestrelfs-data`；与 `--memory` 冲突，可与 FileMetaStore 或 RedisMetaStore 任意组合
 - `--s3-endpoint <URL>`：可选 S3 兼容 endpoint；设置后强制 path-style，适配 MinIO。未传时读取 `S3_ENDPOINT`，再回退到 AWS SDK 默认 endpoint
 - S3 凭据/region：走 AWS SDK provider chain；常用环境变量为 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、可选 `AWS_SESSION_TOKEN` 与 `AWS_REGION`
@@ -266,11 +267,11 @@ Cursor 对照代码、141 tests、FileMeta 崩溃重放与 Redis/S3 门控测确
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
 | 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
-| 18 | **RedisMetaStore 是全量快照原型** | 每次读 GET/反序列化整份 JSON；每次写还要全量序列化并 Lua CAS，冲突最多重试 64 次。优点是 rename、inode 分配、slice 裁剪和 GC keys 与元数据在单 key 上线性化；大规模部署需拆 key/索引或采用服务端 Lua 数据模型。 | `daemon/src/meta_redis.rs` |
+| 18 | **Redis v2 写放大已降低，mutation 读放大仍在** | Step 31 把 metadata 拆为固定 HASH/SET，`lookup/getattr/read_slices/readlink` 定向读取，mutation 只写发生变化的 fields；但为复用 MemStore 的完整 rename/truncate/引用确认语义，每次 mutation 仍一致读取各聚合 HASH 并在客户端计算 diff，冲突最多重试 64 次。readdir 与 GC 引用确认也仍有聚合扫描。 | `daemon/src/meta_redis.rs` |
 | 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
-| 20 | **Redis 快照损坏/丢失时 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，Redis key 已存在但 JSON 非法时 daemon 启动失败；运行中 key 被外部删除时 metadata 操作返回 EIO，避免静默创建新文件系统。 | `daemon/src/meta_redis.rs` |
+| 20 | **Redis schema 异常/旧 v1 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，v2 control/record 非法、版本未知、control 缺失但残留 v2 key 或旧 `<prefix>:meta:v1` 存在时 daemon 启动失败；运行中 schema/control 被删除或破坏时 metadata 操作返回 EIO。没有 v1 自动迁移或自动 wipe。 | `daemon/src/meta_redis.rs` |
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
-| 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 30 将候选存入所选 File/Redis MetaStore；S3 DeleteObject 成功或对象已缺失后确认出队，网络/权限失败按 1–60 秒退避重试且不回滚命名空间。Redis+S3 的共享快照允许多个 daemon 看到同一队列，幂等 delete/CAS ack 可容忍重复处理；尚无跨 Redis/S3 原子事务或队列限流。 | `daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
+| 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 30 将候选存入所选 File/Redis MetaStore；S3 DeleteObject 成功或对象已缺失后确认出队，网络/权限失败按 1–60 秒退避重试且不回滚命名空间。Redis v2 `gc` SET 由同一 Lua mutation 入队/ack，多个 daemon 可看到同一队列；幂等 delete/revision-CAS ack 可容忍重复处理，但尚无跨 Redis/S3 原子事务或队列限流。 | `daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 | 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 28 已用 `read_iter` / `iov_iter` 覆盖普通 read/pread/readv/preadv。完整、对齐且位于单个当前用户 iovec 段的连续 4 KiB blocks 最多合并 128 KiB 并直达 pinned pages；跨段、partial/unaligned、kernel-backed iter 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_iter`。没有真正异步 completion、跨 iovec scatter-gather BIO、page-cache/readahead 或 splice 全覆盖；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
@@ -301,7 +302,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 30 工作树当前 141 个）
+cargo test                    # 单元测试 + 集成测试（Step 31 工作树当前 144 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -503,7 +504,7 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 成功标记为 `VNG_GC_PASS`；guest 脚本任一断言失败均以非零状态退出。
 
-### 7.10 Step 16 RedisMetaStore 集成测试
+### 7.10 Step 16/31 RedisMetaStore 集成测试
 
 默认 `cargo test` 不要求本机存在 Redis；设置 `REDIS_URL` 后才执行真实 Redis
 语义与重连恢复断言，测试使用随机 prefix 并在成功后删除测试 key：
@@ -514,10 +515,11 @@ REDIS_URL='redis://:<PASSWORD>@192.168.18.253:8379/15' \
   cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
 ```
 
-该测试覆盖两个 RedisMetaStore 并发 create、mkdir/create、symlink target、
-rename 覆盖、truncate/unlink GC keys 以及重新构造 RedisMetaStore 后的恢复。
-Redis mutation 先在快照副本上复用
-MemStore 语义，再由 Lua 比较旧 JSON 并 `SET` 新 JSON；CAS 失败会从最新快照重试。
+该测试当前覆盖两个 RedisMetaStore 并发 create、mkdir/create、symlink target、
+rename 覆盖、truncate/unlink GC keys、重新构造 RedisMetaStore 后的恢复，以及旧 v1
+schema fail-closed。Step 31 工作树中 Redis mutation 先从 v2 HASH/SET 读取一致状态并
+复用 MemStore 语义，再由 Lua 校验 revision 并原子应用字段级 diff；CAS 失败会从
+最新 revision 重试。
 
 2026-09-14 已对 `192.168.18.253:8379` 的真实 Redis 执行上述门控测试：
 `1 passed; 0 failed`（约 0.03s）。密码只通过 `REDIS_URL` 环境变量注入，禁止
@@ -531,7 +533,11 @@ export REDIS_URL="redis://:${KESTRELFS_REDIS_PASSWORD}@192.168.18.253:8379/15"
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
 sudo insmod kestrelfs/kestrelfs.ko
-./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step16 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+data_dir=/tmp/kestrelfs-step31-$$
+mkdir -p "$data_dir"
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" \
+  --redis-prefix kestrelfs-step31 --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mkdir -p /mnt/kestrelfs
@@ -967,9 +973,10 @@ exit 255，另有一次 Step 25 daemon 重启时 `Transport endpoint is not conn
 
 ### 7.24 Phase 4/控制面 Step 30 DIST-GC 验证
 
-GC queue 是 MetaStore 快照的一部分。unlink、rename-overwrite、truncate 在移除最后
-slice 引用的同一次 mutation 中把 key 加入 `pending_garbage`：FileMetaStore 使用
-同一次 tmp + fsync + rename，RedisMetaStore 使用同一次单 key Lua CAS。delete 成功后
+GC queue 是 MetaStore 持久状态的一部分。unlink、rename-overwrite、truncate 在移除
+最后 slice 引用的同一次 mutation 中把 key 加入 `pending_garbage`：FileMetaStore 使用
+同一次 tmp + fsync + rename；Step 31 工作树的 RedisMetaStore 使用同一次 v2 Lua
+revision-CAS 将候选写入 `gc` SET（Step 30 验收基线为单 key Lua CAS）。delete 成功后
 才以第二次 metadata mutation 确认出队，因此进程在 metadata commit 后或 delete/ack
 之间退出，重启都只会产生安全的幂等重试。
 
@@ -997,6 +1004,33 @@ S3_ENDPOINT=... cargo test s3_environment_gated -- --nocapture
 最后引用移除后入队、FileMetaStore 模拟 commit 后 crash 并在重启时向 LocalFs
 重放、ack 再重启仍为空，以及真实 Redis queue 重启/ack 与 MinIO DeleteObject。
 
+### 7.25 Phase 4/控制面 Step 31 DIST-META 验证
+
+Redis schema v2 使用六个固定结构：`control` HASH 记录 `schema_version=2`、revision
+和 next inode id；`inodes`、`dirents`、`slices`、`symlinks` 为分记录 HASH；`gc`
+为待删对象 SET。dirent field 是 `parent_inode:hex(UTF-8 name)`，slice field 是
+`inode_id:chunk_index`。point reads 定向读取对应 field；复合 mutation 在 Redis
+`MULTI/EXEC` 一致快照上复用 MemStore 语义，计算字段级 diff，再用单个 Lua 脚本做
+revision-CAS 并原子更新全部相关结构。旧 `<prefix>:meta:v1`、未知 schema 或无 control
+的半布局均拒绝启动，不自动迁移/wipe。
+
+2026-09-15 工作树自检：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  144 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+REDIS_URL=... cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
+  1 passed; 0 failed
+```
+
+门控测试覆盖两个 store 并发 inode 分配、rename-overwrite 提交后的 old/new 原子结果、
+truncate/unlink GC 入队、store 重建后的 namespace/symlink/GC queue 恢复、ack 以及旧
+v1 schema fail-closed。此步只修改 daemon 与文档，未改 `kestrelfs/*.c`、tools、IPC
+或 mount 行为，因此按 §8/§9.9 未运行 make/vng；全程没有在物理机执行
+insmod/mount/cache-device 操作。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1005,8 +1039,8 @@ S3_ENDPOINT=... cargo test s3_environment_gated -- --nocapture
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 31 DIST-META** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | POSIX / 多节点 | POSIX-CORE → CACHE-COHERENCE… |
+| 1 | **Step 32 POSIX-CORE** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | 多节点 / 对象层 | CACHE-COHERENCE → DIST-OBJECT… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1061,10 +1095,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 30 DIST-GC 已由 Cursor 验收并提交
+- [x] Step 31 DIST-META 已由 Cursor 验收并提交
 - [x] IPC ABI = 11；cache format = v4
-- [x] Step 8–29 + Step 30 已验收状态已写清
-- [x] 下一步明确：Step 31 DIST-META（`docs/remaining-capabilities.md` §8）
+- [x] Step 8–30 + Step 31 已验收状态已写清
+- [x] 下一步明确：Step 32 POSIX-CORE（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 
