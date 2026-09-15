@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::fs_model::{Inode, Slice, ROOT_INODE, SYMLINK_TARGET_MAX};
+use crate::fs_model::{Inode, Slice, MODE_PERMISSIONS_MASK, ROOT_INODE, SYMLINK_TARGET_MAX};
 
 /// Errors a [`MetaStore`] implementation can report.
 ///
@@ -161,6 +161,10 @@ pub trait MetaStore: Send + Sync {
     ///
     /// [`MetaError::NotFound`] if no inode with this id exists.
     async fn getattr(&self, inode: u64) -> Result<Inode>;
+
+    /// Atomically replaces an inode's permission and special bits while
+    /// preserving its file type. Returns the authoritative full mode.
+    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32>;
 
     /// Resolves `(inode, chunk_idx)` to the list of [`Slice`] records
     /// making up that chunk's currently-visible data.
@@ -656,6 +660,14 @@ impl MetaStore for MemStore {
     async fn getattr(&self, inode: u64) -> Result<Inode> {
         let inner = self.inner.read().await;
         inner.inodes.get(&inode).cloned().ok_or(MetaError::NotFound)
+    }
+
+    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
+        let mut inner = self.inner.write().await;
+        let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
+        inode_meta.mode = (inode_meta.mode & !MODE_PERMISSIONS_MASK)
+            | (mode & MODE_PERMISSIONS_MASK);
+        Ok(inode_meta.mode)
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
@@ -1654,6 +1666,28 @@ mod tests {
             store.getattr(directory).await.unwrap().mode,
             crate::fs_model::S_IFDIR | 0o1711
         );
+    }
+
+    #[tokio::test]
+    async fn set_mode_preserves_type_and_updates_retained_orphan() {
+        let store = MemStore::new();
+        let file = store.create(ROOT_INODE, "chmod-file", 0o640).await.unwrap();
+        let directory = store.mkdir(ROOT_INODE, "chmod-dir", 0o750).await.unwrap();
+
+        assert_eq!(
+            store.set_mode(file, S_IFDIR | 0o6751).await.unwrap(),
+            S_IFREG | 0o6751
+        );
+        assert_eq!(
+            store.set_mode(directory, S_IFREG | 0o1770).await.unwrap(),
+            S_IFDIR | 0o1770
+        );
+        assert!(store
+            .unlink_with_lifecycle(ROOT_INODE, "chmod-file", true)
+            .await.unwrap().is_empty());
+        assert_eq!(store.getattr(file).await.unwrap().nlink, 0);
+        assert_eq!(store.set_mode(file, 0o600).await.unwrap(), S_IFREG | 0o600);
+        assert!(matches!(store.set_mode(u64::MAX, 0o644).await, Err(MetaError::NotFound)));
     }
 
     #[tokio::test]

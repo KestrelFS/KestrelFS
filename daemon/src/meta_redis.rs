@@ -204,6 +204,10 @@ enum Mutation {
         inode: u64,
         new_size: u64,
     },
+    SetMode {
+        inode: u64,
+        mode: u32,
+    },
     Mkdir {
         parent: u64,
         name: String,
@@ -238,6 +242,7 @@ enum Mutation {
 enum MutationOutput {
     Inode(u64),
     Nlink(u32),
+    Mode(u32),
     Unit,
     Garbage(Vec<String>),
 }
@@ -711,6 +716,10 @@ impl RedisMetaStore {
                 .truncate(*inode, *new_size)
                 .await
                 .map(MutationOutput::Garbage),
+            Mutation::SetMode { inode, mode } => mem
+                .set_mode(*inode, *mode)
+                .await
+                .map(MutationOutput::Mode),
             Mutation::Mkdir { parent, name, mode } => mem
                 .mkdir(*parent, name, *mode)
                 .await
@@ -831,6 +840,13 @@ impl MetaStore for RedisMetaStore {
 
     async fn getattr(&self, inode: u64) -> Result<Inode> {
         self.load_inode(inode).await
+    }
+
+    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
+        match self.mutate(Mutation::SetMode { inode, mode }).await? {
+            MutationOutput::Mode(mode) => Ok(mode),
+            _ => unreachable!("set_mode mutation returned wrong output"),
+        }
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
@@ -1289,6 +1305,19 @@ mod tests {
             .create(directory, "mode-persist", 0o2750)
             .await
             .unwrap();
+        let revision_before_chmod = peer.coherence_revision().await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .set_mode(persistent_mode_file, S_IFDIR | 0o6751)
+                .await
+                .unwrap(),
+            S_IFREG | 0o6751
+        );
+        assert_eq!(
+            peer.getattr(persistent_mode_file).await.unwrap().mode,
+            S_IFREG | 0o6751
+        );
+        assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_chmod);
         assert_eq!(store.link(directory, "data-alias", file).await.unwrap(), 2);
         assert_eq!(peer.lookup(directory, "data-alias").await.unwrap(), file);
         assert_eq!(peer.getattr(file).await.unwrap().nlink, 2);
@@ -1456,7 +1485,7 @@ mod tests {
         assert_eq!(restarted.getattr(ROOT_INODE).await.unwrap().nlink, 4);
         assert_eq!(
             restarted.getattr(persistent_mode_file).await.unwrap().mode,
-            S_IFREG | 0o2750
+            S_IFREG | 0o6751
         );
         assert_eq!(restarted.lookup(directory, "victim").await.unwrap(), source);
         assert_eq!(restarted.pending_garbage().await.unwrap(), pending);

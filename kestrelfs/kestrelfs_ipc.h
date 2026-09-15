@@ -145,6 +145,7 @@
 #define KESTRELFS_OP_READLINK_DATA	20	/* req: read symlink target via data_buffer */
 #define KESTRELFS_OP_LINK_DATA		21	/* req: hard link using name in data_buffer */
 #define KESTRELFS_OP_FINALIZE_ORPHAN	22	/* req: reclaim an unlinked inode */
+#define KESTRELFS_OP_SETATTR		23	/* req: persist supported inode attributes */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -196,6 +197,22 @@
  * Response: RESULT_OK on success, RESULT_ERROR with negative errno on failure.
  * On failure, the kernel will NOT update i_size.
  */
+
+/*
+ * Payload layout for KESTRELFS_OP_SETATTR requests
+ * -------------------------------------------------
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id
+ *   offset  8, 4 bytes, little-endian u32: valid attribute mask
+ *   offset 12, 4 bytes, little-endian u32: requested mode
+ *   offset 16..31: reserved, must be zero
+ *
+ * ABI v16 supports only KESTRELFS_SETATTR_MODE. The daemon preserves the
+ * inode's existing file-type bits and replaces only mode & 07777. A successful
+ * response returns the authoritative full mode as little-endian u32 at
+ * payload offset 0; remaining response payload bytes are zero.
+ */
+#define KESTRELFS_SETATTR_MODE		(1U << 0)
 
 /*
  * Payload layout for KESTRELFS_OP_READ_CHUNK requests
@@ -791,8 +808,12 @@ struct kestrelfs_ring_ctrl {
  *  15 - Phase 4/control-plane step 36: UNLINK_DATA mode@12 and
  *       RENAME_DATA lifecycle_flags@24 can defer final inode reclamation;
  *       added FINALIZE_ORPHAN (opcode 22) for last-close reclamation.
+ *
+ *  16 - Phase 4/control-plane step 37: Added SETATTR (opcode 23). The first
+ *       supported mutation is KESTRELFS_SETATTR_MODE; file type is preserved
+ *       and only permission/special bits (07777) are replaced.
  */
-#define KESTRELFS_ABI_VERSION		15
+#define KESTRELFS_ABI_VERSION		16
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -967,5 +988,8 @@ _Static_assert(8 + 8 + 4 + 4 + 4 + 4 == KESTRELFS_EVENT_PAYLOAD_SIZE,
  */
 _Static_assert(8 + 4 + 4 + 4 + 4 + 8 == KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_GETATTR response payload field layout no longer sums to KESTRELFS_EVENT_PAYLOAD_SIZE");
+
+_Static_assert(8 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_SETATTR request fields overflow the event payload");
 
 #endif /* _KESTRELFS_IPC_H */

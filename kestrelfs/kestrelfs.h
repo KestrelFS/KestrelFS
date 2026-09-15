@@ -155,5 +155,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
  */
 extern const struct file_operations kestrelfs_reg_file_ops;
 extern const struct inode_operations kestrelfs_reg_inode_ops;
+int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			    struct iattr *attr);
 
 #endif /* _KESTRELFS_H */

@@ -744,6 +744,7 @@ out_unlock_lifecycle:
 
 const struct inode_operations kestrelfs_dir_inode_operations = {
 	.getattr	= kestrelfs_inode_getattr,
+	.setattr	= kestrelfs_inode_setattr,
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
 	.link		= kestrelfs_inode_link,

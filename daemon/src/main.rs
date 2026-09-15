@@ -591,6 +591,7 @@ async fn build_response(
         abi::OP_UNLINK => handle_unlink(event, store, object_store).await,
         abi::OP_RENAME => handle_rename(event, store, object_store).await,
         abi::OP_FINALIZE_ORPHAN => handle_finalize_orphan(event, store, object_store).await,
+        abi::OP_SETATTR => handle_setattr(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -598,6 +599,34 @@ async fn build_response(
                 event.req_id
             );
             KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+    }
+}
+
+async fn handle_setattr(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
+    let req = event.decode_setattr_req();
+    if event.flags != 0
+        || req.valid != abi::SETATTR_MODE
+        || event.payload[16..].iter().any(|byte| *byte != 0)
+    {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+
+    match store.set_mode(req.inode_id, req.mode).await {
+        Ok(mode) => {
+            let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            response.payload[0..4].copy_from_slice(&mode.to_le_bytes());
+            response
+        }
+        Err(error) => {
+            eprintln!(
+                "kestrelfs-daemon:    OP_SETATTR inode={} valid={:#x} -> {error:?}",
+                req.inode_id, req.valid
+            );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
         }
     }
 }
@@ -2215,6 +2244,14 @@ mod tests {
         event
     }
 
+    fn raw_setattr_req(req_id: u64, inode_id: u64, valid: u32, mode: u32) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_SETATTR, req_id);
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&valid.to_le_bytes());
+        event.payload[12..16].copy_from_slice(&mode.to_le_bytes());
+        event
+    }
+
     /// Shared test fixture: a fresh runtime + `MemStore`, exactly
     /// mirroring how `main()` constructs both.
     fn test_fixture() -> (
@@ -2333,6 +2370,47 @@ mod tests {
 
         assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
         assert_eq!(resp.error_code, -libc::ENOENT);
+    }
+
+    #[test]
+    fn setattr_mode_preserves_type_and_getattr_observes_update() {
+        let (runtime, store, object_store) = test_fixture();
+        let req = raw_setattr_req(
+            9,
+            REMOTE_TXT_INODE,
+            abi::SETATTR_MODE,
+            fs_model::S_IFDIR | 0o6751,
+        );
+
+        let resp = runtime.block_on(build_response(&req, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(resp.payload[0..4].try_into().unwrap()),
+            fs_model::S_IFREG | 0o6751
+        );
+
+        let getattr = raw_getattr_req(10, REMOTE_TXT_INODE);
+        let resp = runtime.block_on(build_response(&getattr, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(resp.payload[8..12].try_into().unwrap()),
+            fs_model::S_IFREG | 0o6751
+        );
+    }
+
+    #[test]
+    fn setattr_rejects_unsupported_mask_and_nonzero_reserved_bytes() {
+        let (runtime, store, object_store) = test_fixture();
+        let unsupported = raw_setattr_req(11, REMOTE_TXT_INODE, 2, 0o600);
+        let resp = runtime.block_on(build_response(&unsupported, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp.error_code, -libc::EINVAL);
+
+        let mut reserved = raw_setattr_req(12, REMOTE_TXT_INODE, abi::SETATTR_MODE, 0o600);
+        reserved.payload[16] = 1;
+        let resp = runtime.block_on(build_response(&reserved, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp.error_code, -libc::EINVAL);
     }
 
     #[test]

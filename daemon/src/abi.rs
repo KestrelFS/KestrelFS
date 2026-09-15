@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 15;
+pub const ABI_VERSION: u32 = 16;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -119,6 +119,8 @@ pub const OP_READLINK_DATA: u32 = 20;
 pub const OP_LINK_DATA: u32 = 21;
 /// Request: reclaim an unlinked inode after its final open handle closes.
 pub const OP_FINALIZE_ORPHAN: u32 = 22;
+/// Request: persist supported inode attributes (currently mode only).
+pub const OP_SETATTR: u32 = 23;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -248,6 +250,18 @@ impl KestrelfsEvent {
         TruncateReq {
             inode_id,
             new_size,
+        }
+    }
+
+    /// Decodes the ABI v16 `OP_SETATTR` fixed payload.
+    ///
+    /// Callers validate `flags`, `valid`, and reserved bytes before applying
+    /// the requested mutation.
+    pub fn decode_setattr_req(&self) -> SetattrReq {
+        SetattrReq {
+            inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+            valid: u32::from_le_bytes(self.payload[8..12].try_into().unwrap()),
+            mode: u32::from_le_bytes(self.payload[12..16].try_into().unwrap()),
         }
     }
 
@@ -858,6 +872,17 @@ pub struct TruncateReq {
     pub new_size: u64,
 }
 
+/// Decoded ABI v16 `OP_SETATTR` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetattrReq {
+    pub inode_id: u64,
+    pub valid: u32,
+    pub mode: u32,
+}
+
+/// The only attribute mutation supported by ABI v16.
+pub const SETATTR_MODE: u32 = 1 << 0;
+
 /// Decoded `KESTRELFS_OP_CREATE` request payload.
 pub struct CreateReq {
     pub parent_inode: u64,
@@ -1064,6 +1089,7 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
     data_buffer
 )];
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
@@ -1414,6 +1440,24 @@ mod tests {
     fn truncate_request_fits_payload_budget() {
         // inode_id(8) + new_size(8) = 16, well within 32 bytes
         const { assert!(8 + 8 <= EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn decode_setattr_req_and_payload_budget() {
+        let mut event = KestrelfsEvent::zeroed(OP_SETATTR, 124);
+        event.payload[0..8].copy_from_slice(&42u64.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&SETATTR_MODE.to_le_bytes());
+        event.payload[12..16].copy_from_slice(&0o106751u32.to_le_bytes());
+
+        assert_eq!(
+            event.decode_setattr_req(),
+            SetattrReq {
+                inode_id: 42,
+                valid: SETATTR_MODE,
+                mode: 0o106751,
+            }
+        );
+        const { assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE) };
     }
 
     #[test]

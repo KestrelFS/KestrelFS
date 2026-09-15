@@ -575,33 +575,48 @@ const struct file_operations kestrelfs_writable_file_ops = {
 };
 
 /**
- * kestrelfs_writable_setattr() - handle setattr for writable.dat (truncate support).
- * @idmap: idmap for user namespace (unused, VFS plumbing)
- * @dentry: dentry of writable.dat
+ * kestrelfs_inode_setattr() - persist supported inode attribute changes.
+ * @idmap: idmap used by VFS ownership/permission checks
+ * @dentry: dentry whose inode is being changed
  * @attr: attributes to set
  *
  * This function is called by the VFS when userspace invokes:
  *   - open(..., O_TRUNC) - VFS calls setattr(ATTR_SIZE, 0) after open
  *   - ftruncate(fd, size) - explicit size change
  *   - truncate(path, size) - explicit size change
+ *   - chmod/fchmod - permission and special-bit change
  *
- * We only handle ATTR_SIZE changes. For other attributes, we use the
- * simple_setattr() helper.
- *
- * Steps:
- *   1. If ATTR_SIZE is set, send KESTRELFS_OP_TRUNCATE IPC to daemon
- *   2. If daemon succeeds, call truncate_setsize() to update kernel i_size
- *   3. Ensure no residual dirty pages (truncate_inode_pages)
- *   4. Call setattr_copy() to apply other attribute changes
+ * ATTR_SIZE keeps using OP_TRUNCATE. ABI v16 adds OP_SETATTR for ATTR_MODE;
+ * the daemon preserves file-type bits and returns the authoritative full
+ * mode. uid/gid and explicit timestamp changes remain unsupported instead of
+ * being accepted only in the transient VFS inode.
  *
  * Return: 0 on success, negative errno on failure.
  */
-static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
-				       struct dentry *dentry,
-				       struct iattr *attr)
+int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			    struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
+	unsigned int unsupported;
 	int ret;
+
+	unsupported = attr->ia_valid &
+		(ATTR_UID | ATTR_GID | ATTR_ATIME_SET | ATTR_MTIME_SET |
+		 ATTR_TIMES_SET | ATTR_TOUCH | ATTR_DELEG);
+	if (unsupported)
+		return -EOPNOTSUPP;
+	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE)))
+		return -EOPNOTSUPP;
+	/* There is no cross-opcode transaction for this unusual combination. */
+	if ((attr->ia_valid & (ATTR_SIZE | ATTR_MODE)) ==
+	    (ATTR_SIZE | ATTR_MODE))
+		return -EOPNOTSUPP;
+	if ((attr->ia_valid & ATTR_SIZE) && !S_ISREG(inode->i_mode))
+		return -EISDIR;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
 
 	/* Handle ATTR_SIZE (truncate/ftruncate) via IPC */
 	if (attr->ia_valid & ATTR_SIZE) {
@@ -629,6 +644,10 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 			       inode_id, new_size, ret);
 			return ret;
 		}
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+			return resp.error_code;
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK)
+			return -EIO;
 
 		/* Daemon succeeded, update kernel i_size.
 		 * truncate_setsize() handles page cache invalidation. */
@@ -636,6 +655,33 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 
 		/* Ensure no residual dirty pages remain */
 		truncate_inode_pages(&inode->i_data, new_size);
+	}
+
+	if (attr->ia_valid & ATTR_MODE) {
+		u64 inode_id = inode->i_ino;
+		u32 valid = KESTRELFS_SETATTR_MODE;
+		u32 requested_mode = attr->ia_mode;
+		u32 persisted_mode;
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+
+		req.opcode = KESTRELFS_OP_SETATTR;
+		put_unaligned_le64(inode_id, &req.payload[0]);
+		put_unaligned_le32(valid, &req.payload[8]);
+		put_unaligned_le32(requested_mode, &req.payload[12]);
+
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
+		if (ret)
+			return ret;
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+			return resp.error_code;
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK)
+			return -EIO;
+
+		persisted_mode = get_unaligned_le32(&resp.payload[0]);
+		if ((persisted_mode & S_IFMT) != (inode->i_mode & S_IFMT))
+			return -EPROTO;
+		attr->ia_mode = persisted_mode;
 	}
 
 	/* Apply other attribute changes (mtime, mode, etc.)
@@ -650,7 +696,7 @@ static int kestrelfs_writable_setattr(struct mnt_idmap *idmap,
 }
 
 const struct inode_operations kestrelfs_writable_inode_ops = {
-	.setattr = kestrelfs_writable_setattr,
+	.setattr = kestrelfs_inode_setattr,
 };
 
 /*
@@ -671,5 +717,5 @@ const struct file_operations kestrelfs_reg_file_ops = {
 };
 
 const struct inode_operations kestrelfs_reg_inode_ops = {
-	.setattr = kestrelfs_writable_setattr,
+	.setattr = kestrelfs_inode_setattr,
 };

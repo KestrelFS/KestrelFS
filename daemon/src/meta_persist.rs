@@ -140,6 +140,12 @@ impl MetaStore for FileMetaStore {
         self.mem.getattr(inode).await
     }
 
+    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
+        let mode = self.mem.set_mode(inode, mode).await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
+        Ok(mode)
+    }
+
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
         self.mem.read_slices(inode, chunk_idx).await
     }
@@ -447,10 +453,12 @@ mod tests {
             assert!(store
                 .unlink_with_lifecycle(ROOT_INODE, "open-orphan", true)
                 .await.unwrap().is_empty());
+            assert_eq!(store.set_mode(inode, 0o600).await.unwrap(), S_IFREG | 0o600);
         }
         {
             let restarted = FileMetaStore::new(path.clone()).await.unwrap();
             assert_eq!(restarted.getattr(inode).await.unwrap().nlink, 0);
+            assert_eq!(restarted.getattr(inode).await.unwrap().mode, S_IFREG | 0o600);
             assert!(restarted.pending_garbage().await.unwrap().is_empty());
             assert_eq!(restarted.finalize_orphan(inode).await.unwrap(), vec![key.clone()]);
         }
@@ -471,6 +479,8 @@ mod tests {
             file = store.create(ROOT_INODE, "mode-file", 0o2640).await.unwrap();
             left = store.mkdir(ROOT_INODE, "left", 0o1711).await.unwrap();
             right = store.mkdir(ROOT_INODE, "right", 0o750).await.unwrap();
+            assert_eq!(store.set_mode(file, S_IFDIR | 0o6751).await.unwrap(), S_IFREG | 0o6751);
+            assert_eq!(store.set_mode(left, S_IFREG | 0o1770).await.unwrap(), S_IFDIR | 0o1770);
             store.mkdir(left, "child", 0o700).await.unwrap();
             store
                 .rename(left, "child", right, "moved-child")
@@ -479,8 +489,8 @@ mod tests {
         }
 
         let restored = FileMetaStore::new(path).await.unwrap();
-        assert_eq!(restored.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);
-        assert_eq!(restored.getattr(left).await.unwrap().mode, S_IFDIR | 0o1711);
+        assert_eq!(restored.getattr(file).await.unwrap().mode, S_IFREG | 0o6751);
+        assert_eq!(restored.getattr(left).await.unwrap().mode, S_IFDIR | 0o1770);
         assert_eq!(restored.getattr(left).await.unwrap().nlink, 2);
         assert_eq!(restored.getattr(right).await.unwrap().nlink, 3);
         assert_eq!(restored.getattr(ROOT_INODE).await.unwrap().nlink, 4);
