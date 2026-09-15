@@ -409,8 +409,7 @@ offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 Ki
 ### 已知限制
 
 Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
-truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 worktree 另支持硬链接
-（ABI v12，待验收）。仍缺：
+truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 另支持硬链接（ABI v12）。仍缺：
 
 - 尚无 open-unlink 延迟回收；目录 nlink 尚不随子目录变化；symlink 目标目前要求
   UTF-8，最长 4095 字节。
