@@ -8,8 +8,9 @@
  * in-memory block LRU so a full cache can recycle slots.  Step 24 verifies a
  * persisted checksum before returning any hit.  Step 25 adds one persistent
  * intent-journal page: an interrupted index transaction is recovered to a
- * safe miss before the index is restored.  Cache failures never replace the
- * authoritative daemon/ObjectStore path.
+ * safe miss before the index is restored.  Step 26 lets cache-hit readers hold
+ * a shared rwsem across their BIO, while mutations retain exclusive ownership.
+ * Cache failures never replace the authoritative daemon/ObjectStore path.
  */
 
 #include <linux/bio.h>
@@ -26,9 +27,10 @@
 #include <linux/list_sort.h>
 #include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/rhashtable.h>
+#include <linux/rwsem.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
@@ -168,6 +170,11 @@ module_param(cache_direct_io, bool, 0444);
 MODULE_PARM_DESC(cache_direct_io,
 		 "read aligned cache hits directly into pinned user pages (default Y)");
 
+static bool cache_parallel_reads = true;
+module_param(cache_parallel_reads, bool, 0444);
+MODULE_PARM_DESC(cache_parallel_reads,
+		 "allow cache-hit readers to issue BIOs concurrently (default Y)");
+
 /* Read-only observability for vng correctness/performance tests. */
 static unsigned long kestrelfs_cache_direct_hit_blocks;
 module_param_named(cache_direct_hit_blocks,
@@ -204,12 +211,26 @@ module_param_named(cache_journal_recoveries,
 MODULE_PARM_DESC(cache_journal_recoveries,
 		 "incomplete index transactions recovered to cache misses");
 
+static unsigned long kestrelfs_cache_active_hit_readers;
+module_param_named(cache_active_hit_readers,
+		   kestrelfs_cache_active_hit_readers, ulong, 0444);
+MODULE_PARM_DESC(cache_active_hit_readers,
+		 "cache-hit readers currently inside the shared IO section");
+
+static unsigned long kestrelfs_cache_parallel_hit_peak;
+module_param_named(cache_parallel_hit_peak,
+		   kestrelfs_cache_parallel_hit_peak, ulong, 0444);
+MODULE_PARM_DESC(cache_parallel_hit_peak,
+		 "peak concurrent cache-hit readers since module load");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
 static struct rhashtable kestrelfs_cache_index;
 static LIST_HEAD(kestrelfs_cache_entries);
-static DEFINE_MUTEX(kestrelfs_cache_lock);
+static DECLARE_RWSEM(kestrelfs_cache_lock);
+/* Serializes LRU touches and hit counters between shared-lock readers. */
+static DEFINE_SPINLOCK(kestrelfs_cache_runtime_lock);
 static unsigned long *kestrelfs_cache_slots;
 static bool kestrelfs_cache_index_ready;
 static u64 kestrelfs_cache_usable_bytes;
@@ -247,7 +268,80 @@ static u32 kestrelfs_cache_journal_checksum(
 	const struct kestrelfs_cache_disk_journal *journal)
 {
 	return kestrelfs_cache_checksum(journal,
-		offsetof(struct kestrelfs_cache_disk_journal, checksum));
+			offsetof(struct kestrelfs_cache_disk_journal, checksum));
+}
+
+static int kestrelfs_cache_hit_lock(bool *shared)
+{
+	*shared = cache_parallel_reads;
+	return *shared ? down_read_killable(&kestrelfs_cache_lock) :
+		       down_write_killable(&kestrelfs_cache_lock);
+}
+
+static void kestrelfs_cache_hit_unlock(bool shared)
+{
+	if (shared)
+		up_read(&kestrelfs_cache_lock);
+	else
+		up_write(&kestrelfs_cache_lock);
+}
+
+static void kestrelfs_cache_hit_begin(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_active_hit_readers++;
+	kestrelfs_cache_parallel_hit_peak =
+		max(kestrelfs_cache_parallel_hit_peak,
+		    kestrelfs_cache_active_hit_readers);
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+}
+
+static void kestrelfs_cache_hit_end(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_active_hit_readers--;
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+}
+
+static void kestrelfs_cache_touch(
+	struct kestrelfs_cache_index_entry *entry)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	list_move_tail(&entry->list, &kestrelfs_cache_entries);
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+}
+
+static void kestrelfs_cache_account_direct(unsigned long blocks)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_direct_hit_blocks += blocks;
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+}
+
+static void kestrelfs_cache_account_copy(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_copy_hit_blocks++;
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+}
+
+static void kestrelfs_cache_account_fallback(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_direct_fallbacks++;
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
 }
 
 static u32 kestrelfs_cache_pinned_checksum(struct page **pages,
@@ -380,8 +474,9 @@ out_page:
 
 /*
  * Read one or more contiguous 4 KiB cache blocks directly into userspace.
- * The caller holds kestrelfs_cache_lock across pin, BIO completion and unpin,
- * so an invalidation cannot retire/reuse the indexed slots during DMA.
+ * The caller holds kestrelfs_cache_lock for reading across pin, BIO completion
+ * and unpin. Other hits may proceed, while an invalidation cannot obtain the
+ * write side to retire/reuse indexed slots during DMA.
  *
  * Alignment or transient GUP/BIO construction failures are returned to the
  * caller as a request to use the buffered cache path.  Once submitted, all
@@ -1095,6 +1190,24 @@ static void kestrelfs_cache_discard_corrupt(
 }
 
 /*
+ * A shared-lock reader cannot mutate the journal or index. Drop its read side,
+ * reacquire exclusive ownership, then retire only the exact generation that
+ * failed CRC. An intervening invalidate/evict/refill therefore cannot make a
+ * delayed reader remove a newer entry with the same key.
+ */
+static void kestrelfs_cache_retire_corrupt(u64 inode_id, u64 file_offset,
+					   u64 generation)
+{
+	struct kestrelfs_cache_index_entry *entry;
+
+	down_write(&kestrelfs_cache_lock);
+	entry = kestrelfs_cache_find(inode_id, file_offset);
+	if (entry && entry->generation == generation)
+		kestrelfs_cache_discard_corrupt(entry);
+	up_write(&kestrelfs_cache_lock);
+}
+
+/*
  * Retire the least-recently-used entry before its data slot is overwritten.
  * Clearing and flushing the persistent index first is the key invariant: a
  * crash can lose the replacement, but can never restore the evicted key after
@@ -1174,9 +1287,9 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 	entry->slot = slot;
 
 	/*
-	 * Reserve the in-memory key while the cache mutex still hides it from
-	 * lookup.  This prevents publishing a persistent entry that cannot be
-	 * represented in the hash table (and avoids duplicate keys on retry).
+	 * Reserve the in-memory key while the cache write side still hides it
+	 * from lookup. This prevents publishing a persistent entry that cannot
+	 * be represented in the hash table (and avoids duplicate keys on retry).
 	 */
 	ret = rhashtable_insert_fast(&kestrelfs_cache_index, &entry->node,
 				     kestrelfs_cache_index_params);
@@ -1218,6 +1331,8 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 {
 	struct kestrelfs_cache_index_entry *entry;
 	u64 inode_id = inode->i_ino;
+	u64 corrupt_file_offset = 0;
+	u64 corrupt_generation = 0;
 	u64 file_size;
 	u64 offset;
 	u64 end;
@@ -1227,12 +1342,15 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 	u32 direct_checksums[KESTRELFS_CACHE_DIRECT_MAX_BYTES /
 			     KESTRELFS_CACHE_BLOCK_SIZE];
 	void *block = NULL;
+	bool hit_accounted = false;
+	bool retire_corrupt = false;
+	bool shared_lock;
 	ssize_t ret = -ENODATA;
 
 	*miss_epoch = 0;
 	if (!READ_ONCE(kestrelfs_cache_index_ready))
 		return -ENODATA;
-	if (mutex_lock_interruptible(&kestrelfs_cache_lock))
+	if (kestrelfs_cache_hit_lock(&shared_lock))
 		return -EINTR;
 
 	*miss_epoch = kestrelfs_cache_mutation_epoch;
@@ -1250,6 +1368,8 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		if (!kestrelfs_cache_find(inode_id, block_offset))
 			goto out;
 	}
+	kestrelfs_cache_hit_begin();
+	hit_accounted = true;
 
 	block_offset = round_down(offset, (u64)KESTRELFS_CACHE_BLOCK_SIZE);
 	while (block_offset < end) {
@@ -1304,11 +1424,10 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 					entry = kestrelfs_cache_find(inode_id,
 							 touch_offset);
 					if (entry)
-						list_move_tail(&entry->list,
-							       &kestrelfs_cache_entries);
+						kestrelfs_cache_touch(entry);
 				}
-				kestrelfs_cache_direct_hit_blocks +=
-					direct_bytes / KESTRELFS_CACHE_BLOCK_SIZE;
+				kestrelfs_cache_account_direct(
+					direct_bytes / KESTRELFS_CACHE_BLOCK_SIZE);
 				copied += direct_bytes;
 				offset += direct_bytes;
 				block_offset += direct_bytes;
@@ -1319,12 +1438,15 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 					inode_id, block_offset +
 						  bad_block *
 						  KESTRELFS_CACHE_BLOCK_SIZE);
-				if (entry)
-					kestrelfs_cache_discard_corrupt(entry);
+				if (entry) {
+					corrupt_file_offset = entry->key.file_offset;
+					corrupt_generation = entry->generation;
+					retire_corrupt = true;
+				}
 				ret = -ENODATA;
 				goto out;
 			}
-			kestrelfs_cache_direct_fallbacks++;
+			kestrelfs_cache_account_fallback();
 		}
 
 		if (!block)
@@ -1340,7 +1462,9 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		if (kestrelfs_cache_checksum(block,
 					     KESTRELFS_CACHE_BLOCK_SIZE) !=
 		    entry->data_checksum) {
-			kestrelfs_cache_discard_corrupt(entry);
+			corrupt_file_offset = entry->key.file_offset;
+			corrupt_generation = entry->generation;
+			retire_corrupt = true;
 			ret = -ENODATA;
 			goto out;
 		}
@@ -1351,15 +1475,20 @@ ssize_t kestrelfs_cache_lookup(struct inode *inode, char __user *buf,
 		copied += bytes;
 		offset += bytes;
 		block_offset += KESTRELFS_CACHE_BLOCK_SIZE;
-		list_move_tail(&entry->list, &kestrelfs_cache_entries);
-		kestrelfs_cache_copy_hit_blocks++;
+		kestrelfs_cache_touch(entry);
+		kestrelfs_cache_account_copy();
 	}
 
 	*ppos += copied;
 	ret = copied;
 out:
+	if (hit_accounted)
+		kestrelfs_cache_hit_end();
 	kfree(block);
-	mutex_unlock(&kestrelfs_cache_lock);
+	kestrelfs_cache_hit_unlock(shared_lock);
+	if (retire_corrupt)
+		kestrelfs_cache_retire_corrupt(inode_id, corrupt_file_offset,
+					       corrupt_generation);
 	return ret;
 }
 
@@ -1373,7 +1502,7 @@ void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
 
 	if (!miss_epoch || !READ_ONCE(kestrelfs_cache_index_ready) || !length)
 		return;
-	mutex_lock(&kestrelfs_cache_lock);
+	down_write(&kestrelfs_cache_lock);
 	if (miss_epoch != kestrelfs_cache_mutation_epoch)
 		goto out;
 
@@ -1402,7 +1531,7 @@ void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
 		}
 	}
 out:
-	mutex_unlock(&kestrelfs_cache_lock);
+	up_write(&kestrelfs_cache_lock);
 }
 
 int kestrelfs_cache_invalidate_inode(u64 inode_id)
@@ -1414,7 +1543,7 @@ int kestrelfs_cache_invalidate_inode(u64 inode_id)
 
 	if (!READ_ONCE(kestrelfs_cache_index_ready))
 		return 0;
-	if (mutex_lock_interruptible(&kestrelfs_cache_lock))
+	if (down_write_killable(&kestrelfs_cache_lock))
 		return -EINTR;
 	if (!++kestrelfs_cache_mutation_epoch)
 		kestrelfs_cache_mutation_epoch = 1;
@@ -1436,7 +1565,7 @@ int kestrelfs_cache_invalidate_inode(u64 inode_id)
 		kfree(entry);
 	}
 
-	mutex_unlock(&kestrelfs_cache_lock);
+	up_write(&kestrelfs_cache_lock);
 	return ret;
 }
 
@@ -1456,6 +1585,8 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_evictions = 0;
 	kestrelfs_cache_checksum_failures = 0;
 	kestrelfs_cache_journal_recoveries = 0;
+	kestrelfs_cache_active_hit_readers = 0;
+	kestrelfs_cache_parallel_hit_peak = 0;
 	kestrelfs_cache_journal_sequence = 0;
 	kestrelfs_cache_journal_active = false;
 	ret = kestrelfs_cache_parse_namespace();
@@ -1499,19 +1630,20 @@ err_release:
 
 void kestrelfs_cache_exit(void)
 {
-	mutex_lock(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu journal_recoveries=%lu\n",
+	down_write(&kestrelfs_cache_lock);
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
 		kestrelfs_cache_evictions,
 		kestrelfs_cache_checksum_failures,
-		kestrelfs_cache_journal_recoveries);
+		kestrelfs_cache_journal_recoveries,
+		kestrelfs_cache_parallel_hit_peak);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);
 		kestrelfs_cache_file = NULL;
 		kestrelfs_cache_bdev = NULL;
 	}
-	mutex_unlock(&kestrelfs_cache_lock);
+	up_write(&kestrelfs_cache_lock);
 }

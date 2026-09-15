@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-14，Cursor（验收 Step 25；README 全中文；选定 Step 26 = CACHE-ASYNC）
+> 最后更新：2026-09-15，Codex（Step 26 CACHE-ASYNC 实现完成，等待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -36,7 +36,7 @@
 |---:|---|---|---|---|
 | 0 | CACHE-CRC | Step 24 data/index CRC32 | **ACCEPTED** | v3 起落地；现为 v4 布局一部分 |
 | 1 | CACHE-TXN | Step 25 最小 journal | **ACCEPTED** | v4 单页 intent journal + superblock CRC |
-| 2 | CACHE-ASYNC | Step 26 异步/并行 cache-hit BIO | **DECIDED** | 产品差异化；TXN 已落地，可安全扩大并发 hit |
+| 2 | CACHE-ASYNC | Step 26 异步/并行 cache-hit BIO | **REVIEW** | 并行同步 BIO 已实现并自检；等待 Cursor 验收 |
 | 3 | OPS-RECOVERY | fsck/inspect/wipe/repair | PROPOSED | fail-closed 后需要可诊断恢复 |
 | 4 | CACHE-VFS | `read_iter` / iov_iter / readahead | PROPOSED | 扩大少拷贝覆盖 |
 | 5 | CACHE-EVICT | 批量驱逐 / 热点保护 | PROPOSED | 降低满盘连续 fill 的 metadata 成本 |
@@ -65,10 +65,12 @@ Codex **只实现 §8 当前提示词**。
 
 ### CACHE-ASYNC — 并行 hit pipeline（Step 26）
 
-- 状态：`DECIDED`
-- 当前缺口：hit、fill、invalidate、evict 由全局 `kestrelfs_cache_lock` 串行；BIO
-  同步等待，最多 128 KiB；并发读无法发挥 NVMe queue depth。
-- 最小范围：见 §8。必须与 v4 journal / CRC / LRU / pinned-page 共存且不引入 UAF。
+- 状态：`REVIEW`（Codex 自检完成，待 Cursor 验收）
+- 已选最小方案：全局 cache mutex 演进为 rwsem；hit 在完整 BIO/pin/CRC 生命周期持
+  读侧，多个调用者可并行；fill/invalidate/evict/journal/坏块退休持写侧。LRU touch
+  与运行期计数由独立短时 spinlock 保护。
+- 当前边界：每个调用者仍同步等待最多 128 KiB BIO，不是异步 completion 或单请求
+  多 BIO pipeline；详见 §9。
 
 ### CACHE-VFS / CACHE-WRITE / CACHE-EVICT / CACHE-COHERENCE
 
@@ -98,6 +100,8 @@ README 正文已改为全中文（Cursor，2026-09-14）。
 | 2026-09-14 | Cursor | CACHE-TXN | Step 25 验收 | **ACCEPTED**；择 journal 方案认可 |
 | 2026-09-14 | Cursor | DOC | README | 改为全中文 |
 | 2026-09-14 | Cursor | CACHE-ASYNC | 选定 Step 26 | **DECIDED**；见 §8 |
+| 2026-09-15 | Codex | CACHE-ASYNC | Step 26 开工 | **IMPLEMENTING**；仅执行 §8，先审计 hit/失效/evict 生命周期并选择最小并行方案 |
+| 2026-09-15 | Codex | CACHE-ASYNC | Step 26 实现与自检完成 | **REVIEW**；并行同步 BIO + rwsem 生命周期，完整结果见 §9 |
 
 更新规则：开工 `IMPLEMENTING` → 完成 `REVIEW`+§9 → Cursor 验收 `ACCEPTED` 并 commit；勿擅自 commit/push。
 
@@ -162,6 +166,44 @@ write-back cache、多节点失效、Redis/S3 生产化、自动 wipe、整页 p
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-15 — Step 26 CACHE-ASYNC（REVIEW）
+
+- **方案选择**：采用提示词允许的“有界并行同步 BIO”，而不是本步引入异步
+  completion/refcount 状态机。原全局 mutex 改为 rwsem：每个 cache hit 从索引完整性
+  检查起，跨 pinned-page 或 buffered BIO、逐块 CRC、用户复制和 unpin 持读侧；多个
+  reader 可并行。fill、invalidate、evict、journal transaction 和 corrupt-retire
+  全部持写侧，仍保证任一时刻只有一个盘上 metadata transaction。
+- **正确性不变量**：写侧会等待所有在途 reader，因此 entry/slot 在 DMA、checksum
+  或 copy 期间不能被释放和复用；reader 与 rewrite/truncate/unlink/rename-overwrite
+  线性化为“完整旧读后 mutation”或“mutation 后 miss/新读”。并行 reader 的 LRU
+  touch 与计数使用短时 spinlock。CRC 失败时先保存 `(inode_id, file_offset,
+  generation)`，释放读侧后取得写侧，仅在 generation 仍匹配时退休，避免误删期间
+  invalidate/refill 生成的新 entry。
+- **可观测与 A/B**：新增只读启动参数 `cache_parallel_reads`（默认 1）；设为 0 时
+  hit 取得写侧，供同一 build 串行基线。新增只读 sysfs 计数
+  `cache_active_hit_readers`、`cache_parallel_hit_peak`。它们均不是稳定用户 ABI。
+- **ABI/format**：IPC ABI 保持 **v11**；cache format 保持 **v4**；superblock、index、
+  journal 布局和提交点均未改变，不涉及迁移或 wipe。
+- **新增测试**：`test-step26-cache-async-vng.sh` +
+  `test-step26-cache-concurrency.c`。同一 1 MiB × 16 × 8 workload 的串行峰值为 1、
+  并行峰值为 8；两个 reader 与 rewrite 并发时，两者读回完整旧版本，rewrite 后读回
+  完整新版本，停 daemon 后仍命中；dmesg 无 BUG/KASAN/UAF/GPF/hung task。输出
+  `STEP26_PARALLEL_HIT_PASS`、`STEP26_CONCURRENT_INVALIDATE_PASS`、
+  `STEP26_CACHE_ASYNC_PASS`，umount 53 ms。
+- **粗测**：TCG+loop 下串行 877,968,083 ns、并行 430,707,430 ns，约 **2.04×**。
+  该数字包含逐字节校验且受虚拟机调度影响，只证明并行路径生效，不代表真实 NVMe。
+- **完整自检**：`make -C kestrelfs` 零 warning；`cargo test` 为 **137 passed**；
+  `cargo clippy --all-targets -- -D warnings` 通过。vng 回归全部通过：
+  `STEP25_CACHE_TXN_PASS`、`STEP24_CHECKSUM_PASS`、`STEP23_EVICTION_PASS`、
+  `STEP22_CACHE_HIT_PASS`、`STEP21_NAMESPACE_PASS`、`STEP20_CACHE_PASS`、
+  `STEP19_CACHE_PASS`、`VNG_GC_PASS`。所有 insmod/mount/cache 操作只在 guest+loop；
+  daemon 使用独立 data-dir 并保留 daemon.log。
+- **风险/未做**：mutation 会等待慢 reader；没有真正异步 completion、per-entry
+  refcount/RCU、单请求多 BIO、`read_iter`/readahead、write-back、多节点失效、批量
+  eviction、Redis/S3 生产化或自动 wipe。首次 Step 25 vng 在 guest 脚本前偶发退出
+  255，重跑完整通过；不属于内核测试失败。
+- **提交状态**：未 commit、未 push，等待 Cursor 验收。
 
 ### 2026-09-14 — Step 25 CACHE-TXN（Cursor ACCEPTED）
 

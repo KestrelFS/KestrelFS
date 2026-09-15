@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–25）
+## 当前边界（Step 18–26）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -46,6 +46,15 @@ journal。fill、invalidate、evict 和损坏 entry 退休在修改 index 前先
 范围安全退化为 miss；非零但 CRC/字段无效的 journal 则拒绝加载。v4 同时给
 superblock 增加 CRC32，防止 torn geometry/namespace 被当成有效格式。
 
+Step 26 选择“并行同步 BIO”作为最小并发方案，而不是在本步引入异步 completion
+对象：cache hit 在 pin 用户页、提交/等待 BIO、CRC 和 unpin 的完整生命周期持有
+`kestrelfs_cache_lock` 读侧，多个 reader 因而能并发；fill、invalidate、evict、
+journal 和损坏 entry 退休持有写侧。写侧取得锁之前会等待所有旧 reader 完成，
+所以 entry/slot 不会在 DMA 期间释放或复用。并发 reader 的 LRU touch 与运行期
+计数另由短时 spinlock 串行。CRC 失败的 reader 先记录 key+generation，释放读锁后
+取得写锁，仅在 generation 仍相同时退休 entry，避免误删期间重填的新版本。该步
+不改变 IPC ABI v11 或 cache format v4。
+
 ## 缓存设备
 
 缓存后端必须是 Linux 块设备节点，例如：
@@ -69,6 +78,7 @@ cache_device=/dev/loop0
 cache_size_mib=4096
 cache_namespace=<64 hex digits>
 cache_direct_io=1
+cache_parallel_reads=1
 ```
 
 `cache_size_mib=0` 表示以整个块设备容量为上限；非零值转换为 MiB 后必须不
@@ -105,7 +115,12 @@ dataset 时必须使用不同 digest。
 `cache_direct_fallbacks`、`cache_evictions`、`cache_checksum_failures` 和
 `cache_journal_recoveries` 可从 sysfs 读取；它们不是稳定用户 ABI。
 
-## Step 19–25 磁盘格式
+`cache_parallel_reads` 默认为 1；设为 0 会让 hit 也取得写侧，用于同一 build 的
+串行/并行 A/B，不改变盘上格式。另有只读观测值 `cache_active_hit_readers` 与
+`cache_parallel_hit_peak`，分别表示当前和本次加载以来的峰值 hit reader 数；它们
+同样不是稳定用户 ABI。
+
+## Step 19–26 磁盘格式
 
 所有多字节字段采用 little-endian，LBA 固定表示 512 字节 sector。磁盘头占
 第一个 4 KiB：
@@ -144,8 +159,9 @@ journal 页布局也是 little-endian：`magic:u64("KFSJOURN") + version:u32(1) 
 state:u32(PREPARED) + sequence:u64 + operation:u32 + slot:u32 + old_entry:32B +
 new_entry:32B + reserved + crc32:u32`。CRC 覆盖前 4092 字节，reserved 必须全零；
 fill 要求 old 为空/new 有效，invalidate、evict、retire-corrupt 要求 old 有效/new
-为空。全零页表示当前无事务。单页足够是因为所有 cache metadata mutation 已由
-`kestrelfs_cache_lock` 串行，任一时刻最多一个事务。
+为空。全零页表示当前无事务。单页足够是因为所有 cache metadata mutation 都取得
+`kestrelfs_cache_lock` 写侧，任一时刻最多一个事务；并行 hit 只持有读侧，不能修改
+journal 或盘上 index。
 
 Step 21 将 cache format 从 v1 bump 到 v2；v1 设备不会自动迁移或清空。自动格式化
 只发生在整个 2 MiB 保留元数据区全零时，并只写入 4 KiB
@@ -162,6 +178,7 @@ Step 25 从 v3 bump 到 v4；v1/v2/v3 均默认拒绝，不自动 wipe、迁移�
 ```text
 VFS read
   -> kestrelfs_cache_lookup(inode, file_offset, length)
+       -> 取得 cache rwsem 读侧（不同 reader 可并行）
        -> aligned hit: pin 用户页 -> 连续块合并 BIO -> 用户页 -> 逐块 CRC（不进 ring）
        -> partial/fallback hit: 同步 4 KiB BIO -> 内核页 -> CRC -> copy_to_user
        -> miss: 返回 -ENODATA
@@ -229,11 +246,12 @@ journal 清零提交后才释放 slot；任一 metadata BIO 失败都会让相�
 期间发生，返回数据不会再被发布为 cache fill。普通 rename 不改变源 inode
 内容，因此只在覆盖已存在目标时失效目标 inode。
 
-`kestrelfs_cache_lock` 覆盖 index 检查、LRU touch/evict、用户页 pin、整个同步
-BIO 和 unpin。invalidate/fill/evict 必须取得同一把锁，所以正在进行的 hit 要么
-在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot 不会在 DMA
-期间被驱逐、释放或复用。这个模型牺牲了 cache hit 间的并发度，但避免了 page
-pin 生命周期、index generation 和 slot reuse 的复杂竞态。
+`kestrelfs_cache_lock` 是 rwsem。hit 的读侧覆盖 index 检查、用户页 pin、整个同步
+BIO、CRC 和 unpin；invalidate/fill/evict/journal mutation 必须取得写侧。因此正在
+进行的 hit 要么在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot
+不会在 DMA 期间被驱逐、释放或复用。LRU touch 和 reader/counter 更新用独立短时
+spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutation 会等待慢 reader，
+当前还不是异步 completion pipeline，也没有 per-entry refcount/RCU。
 
 ## 故障与安全原则
 
@@ -249,9 +267,10 @@ pin 生命周期、index generation 和 slot reuse 的复杂竞态。
   安全 miss；torn journal/superblock 拒绝设备。CRC32 不是密码学完整性保护，仍
   存在碰撞概率；当前没有双 superblock 或 metadata 镜像，单 journal 还会给每次
   metadata mutation 增加两次同步写/flush。
-- Step 22 是 read hit 的受限少拷贝路径：完整、对齐、连续块可以直达用户页；
-  partial block 和不能 pin/对齐的 buffer 仍有一次 `copy_to_user()`。它不是异步
-  DMA、`read_iter`/page-cache/splice 全覆盖，也没有并行 BIO pipeline。
+- Step 22/26 是 read hit 的受限少拷贝并行路径：完整、对齐、连续块可以直达用户
+  页，多个调用者可并行等待各自的同步 BIO；partial block 和不能 pin/对齐的 buffer
+  仍有一次 `copy_to_user()`。它不是异步 completion、`read_iter`/page-cache/splice
+  全覆盖，也没有单次请求内的多 BIO pipeline。
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
@@ -317,3 +336,17 @@ reserved byte而不更新 CRC，三者必须 fail closed；恢复合法 superblo
 `STEP25_INVALIDATE_RECOVERY_PASS`、`STEP25_EVICT_RECOVERY_PASS`、
 `STEP25_TORN_FAIL_CLOSED_PASS`、`STEP25_V3_REJECT_PASS`、
 `STEP25_SUPER_CHECKSUM_PASS` 和 `STEP25_CACHE_TXN_PASS`，最终复跑 umount 62 ms。
+
+## Step 26 vng 并发 hit 与失效验证
+
+`test-step26-cache-async-vng.sh` 只在 vng guest 的 loop cache 上运行。它用同一 build、
+同一持久 cache 和相同 1 MiB × 16 次 × 8 reader workload，先以
+`cache_parallel_reads=0` 验证串行峰值为 1，再以默认并行模式验证峰值至少为 2。
+随后两个 reader 同时进入 pinned-page hit 区间，rewrite 在写侧等待；旧 reader
+必须得到完整旧版本，rewrite 返回后新读必须得到完整新版本，停 daemon 后仍能命中。
+脚本还检查 dmesg 不含 BUG/KASAN/UAF/general-protection/hung-task 诊断。
+
+2026-09-15 TCG vng 粗测为：串行 877,968,083 ns，并行 430,707,430 ns，约 2.04×；
+峰值分别为 1 和 8。数字包含辅助程序逐字节校验且受 TCG/loop 调度影响，只证明路径
+可重现地并行，不代表真实 NVMe 上限。自检输出 `STEP26_PARALLEL_HIT_PASS`、
+`STEP26_CONCURRENT_INVALIDATE_PASS`、`STEP26_CACHE_ASYNC_PASS`，umount 53 ms。
