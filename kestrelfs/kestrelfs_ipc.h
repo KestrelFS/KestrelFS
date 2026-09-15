@@ -144,6 +144,7 @@
 #define KESTRELFS_OP_SYMLINK_DATA	19	/* req: create symlink via data_buffer */
 #define KESTRELFS_OP_READLINK_DATA	20	/* req: read symlink target via data_buffer */
 #define KESTRELFS_OP_LINK_DATA		21	/* req: hard link using name in data_buffer */
+#define KESTRELFS_OP_FINALIZE_ORPHAN	22	/* req: reclaim an unlinked inode */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -512,7 +513,10 @@
  *   offset 16, 2 bytes, little-endian u16: old_name_len.
  *   offset 18, 2 bytes, little-endian u16: new_name_len.
  *   offset 20, 4 bytes, little-endian u32: rename flags.
- *   offset 24..32: reserved, must be zero.
+ *   offset 24, 4 bytes, little-endian u32: lifecycle flags. The kernel sets
+ *            KESTRELFS_LIFECYCLE_DEFER_RECLAIM when an overwritten regular
+ *            inode still has an open file description.
+ *   offset 28..32: reserved, must be zero.
  *
  * The first old_name_len bytes of shared_region.data_buffer hold old_name;
  * the following new_name_len bytes hold new_name. Neither is NUL-terminated.
@@ -529,6 +533,7 @@
  */
 #define KESTRELFS_RENAME_DATA_NAME_MAX	255
 #define KESTRELFS_RENAME_NOREPLACE	0x00000001U
+#define KESTRELFS_LIFECYCLE_DEFER_RECLAIM	0x00000001U
 
 /*
  * Common ABI v10 single-name request layout
@@ -539,7 +544,9 @@
  *   offset  8, 2 bytes, little-endian u16: name_len.
  *   offset 10, 2 bytes: reserved, must be zero.
  *   offset 12, 4 bytes, little-endian u32: mode for CREATE_DATA and
- *            MKDIR_DATA; zero for LOOKUP_DATA and UNLINK_DATA.
+ *            MKDIR_DATA; zero for LOOKUP_DATA. For UNLINK_DATA this is a
+ *            lifecycle-flags word and may contain only
+ *            KESTRELFS_LIFECYCLE_DEFER_RECLAIM.
  *   offset 16..32: reserved, must be zero.
  *
  * Exactly name_len bytes at the start of data_buffer hold the name, without
@@ -600,6 +607,18 @@
  * data_buffer starts with the non-NUL-terminated new name, limited to
  * KESTRELFS_NAME_DATA_MAX bytes. RESULT_OK payload offset 0 contains the
  * atomically updated little-endian u32 nlink value.
+ */
+
+/*
+ * ABI v15 open-unlink lifecycle layout
+ * ------------------------------------
+ * FINALIZE_ORPHAN request payload:
+ *   offset 0, 8 bytes, little-endian u64: inode id whose final open file
+ *            description has closed.
+ *   offset 8..32: reserved, must be zero.
+ * The daemon reclaims only a non-directory inode whose persistent nlink is
+ * already zero, then durably queues its now-unreferenced ObjectStore keys.
+ * Repeating the request after successful reclamation returns ENOENT.
  */
 
 /* ------------------------------------------------------------------
@@ -768,8 +787,12 @@ struct kestrelfs_ring_ctrl {
  *       KESTRELFS_IOC_INVALIDATE_CACHE_ALL command. Shared-memory and event
  *       layouts are unchanged; the bump prevents an older daemon from
  *       silently running without the coherence control command.
+ *
+ *  15 - Phase 4/control-plane step 36: UNLINK_DATA mode@12 and
+ *       RENAME_DATA lifecycle_flags@24 can defer final inode reclamation;
+ *       added FINALIZE_ORPHAN (opcode 22) for last-close reclamation.
  */
-#define KESTRELFS_ABI_VERSION		14
+#define KESTRELFS_ABI_VERSION		15
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -881,8 +904,11 @@ _Static_assert(KESTRELFS_DATA_BUFFER_SIZE <= (__u32)-1,
 _Static_assert(8 + 8 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"READ_DATA/WRITE_DATA request fields overflow the event payload");
 
-_Static_assert(8 + 8 + 2 + 2 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+_Static_assert(8 + 8 + 2 + 2 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"RENAME_DATA request fields overflow the event payload");
+
+_Static_assert(8 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"FINALIZE_ORPHAN request fields overflow the event payload");
 
 _Static_assert(8 + 8 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"LINK_DATA request fields overflow the event payload");

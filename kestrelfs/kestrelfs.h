@@ -21,6 +21,12 @@
 
 struct iov_iter;
 
+/* Per-regular-inode state; deliberately kept on standard iget_locked(). */
+struct kestrelfs_inode_state {
+	struct mutex lifecycle_lock;
+	unsigned int open_handles;
+};
+
 #define KESTRELFS_NAME		"kestrelfs"
 #define KESTRELFS_MAGIC		0x4B455354	/* "KEST" */
 

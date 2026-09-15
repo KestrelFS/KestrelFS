@@ -590,6 +590,7 @@ async fn build_response(
         abi::OP_MKDIR => handle_mkdir(event, store).await,
         abi::OP_UNLINK => handle_unlink(event, store, object_store).await,
         abi::OP_RENAME => handle_rename(event, store, object_store).await,
+        abi::OP_FINALIZE_ORPHAN => handle_finalize_orphan(event, store, object_store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -597,6 +598,32 @@ async fn build_response(
                 event.req_id
             );
             KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+    }
+}
+
+async fn handle_finalize_orphan(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
+    if event.flags != 0 || event.payload[8..].iter().any(|byte| *byte != 0) {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+    let inode = u64::from_le_bytes(event.payload[0..8].try_into().unwrap());
+    match store.finalize_orphan(inode).await {
+        Ok(garbage_keys) => {
+            delete_garbage_objects(
+                "OP_FINALIZE_ORPHAN",
+                Some(&garbage_keys),
+                store,
+                object_store,
+            ).await;
+            KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+        Err(error) => {
+            eprintln!("kestrelfs-daemon:    OP_FINALIZE_ORPHAN inode={inode} -> {error:?}");
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
         }
     }
 }
@@ -1052,6 +1079,7 @@ async fn handle_unlink(
         "OP_UNLINK",
         parent_inode,
         name,
+        false,
         store,
         object_store,
     )
@@ -1068,11 +1096,15 @@ async fn handle_unlink_data(
         Ok(req) => req,
         Err(response) => return response,
     };
+    if req.mode & !abi::LIFECYCLE_DEFER_RECLAIM != 0 {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
     handle_unlink_request(
         event.req_id,
         "OP_UNLINK_DATA",
         req.parent_inode,
         &req.name,
+        req.mode & abi::LIFECYCLE_DEFER_RECLAIM != 0,
         store,
         object_store,
     )
@@ -1084,13 +1116,17 @@ async fn handle_unlink_request(
     operation: &str,
     parent_inode: u64,
     name: &str,
+    defer_reclaim: bool,
     store: &Arc<dyn MetaStore>,
     object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     println!("kestrelfs-daemon:    {operation} parent={parent_inode} name=\"{name}\"");
 
     // Call MetaStore::unlink
-    match store.unlink(parent_inode, name).await {
+    match store
+        .unlink_with_lifecycle(parent_inode, name, defer_reclaim)
+        .await
+    {
         Ok(garbage_keys) => {
             delete_garbage_objects(
                 operation,
@@ -1185,12 +1221,13 @@ async fn handle_rename_request(
     );
 
     match store
-        .rename_with_flags(
+        .rename_with_lifecycle(
             req.old_parent,
             &req.old_name,
             req.new_parent,
             &req.new_name,
             req.flags,
+            req.defer_reclaim,
         )
         .await
     {

@@ -267,7 +267,20 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotADirectory`] if `parent` is not a directory.
     /// - [`MetaError::InvalidName`] if attempting to unlink "." or "..".
     /// Returns block keys confirmed unreferenced after removal.
+    #[allow(dead_code)]
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>>;
+
+    /// Removes a dirent while optionally retaining a final-link inode as an
+    /// orphan. The retained inode remains addressable by id with `nlink=0`.
+    async fn unlink_with_lifecycle(
+        &self,
+        parent: u64,
+        name: &str,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>>;
+
+    /// Reclaims a retained non-directory orphan and durably queues its GC keys.
+    async fn finalize_orphan(&self, inode: u64) -> Result<Vec<String>>;
 
     /// Renames/moves a file or directory from `(old_parent, old_name)` to `(new_parent, new_name)`.
     ///
@@ -305,6 +318,18 @@ pub trait MetaStore: Send + Sync {
         new_parent: u64,
         new_name: &str,
         flags: u32,
+    ) -> Result<Vec<String>>;
+
+    /// Rename with an explicit lifecycle decision for an overwritten final
+    /// target link. When deferred, the target survives at nlink zero.
+    async fn rename_with_lifecycle(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+        defer_reclaim: bool,
     ) -> Result<Vec<String>>;
 
     /// Returns durable GC candidates that are not referenced by any current
@@ -952,6 +977,15 @@ impl MetaStore for MemStore {
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
+        self.unlink_with_lifecycle(parent, name, false).await
+    }
+
+    async fn unlink_with_lifecycle(
+        &self,
+        parent: u64,
+        name: &str,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>> {
         // Validate name
         if name.is_empty() || name == "." || name == ".." {
             return Err(MetaError::InvalidName(format!("invalid name: {}", name)));
@@ -1018,6 +1052,13 @@ impl MetaStore for MemStore {
             return Ok(Vec::new());
         }
 
+        if !child_is_dir && defer_reclaim {
+            if let Some(child_inode) = inner.inodes.get_mut(&child_inode_id) {
+                child_inode.nlink = 0;
+            }
+            return Ok(Vec::new());
+        }
+
         // Remove the inode itself
         inner.inodes.remove(&child_inode_id);
 
@@ -1041,6 +1082,25 @@ impl MetaStore for MemStore {
         Ok(enqueue_confirmed_garbage(&mut inner, candidates))
     }
 
+    async fn finalize_orphan(&self, inode: u64) -> Result<Vec<String>> {
+        let mut inner = self.inner.write().await;
+        let target = inner.inodes.get(&inode).ok_or(MetaError::NotFound)?;
+        if target.is_dir() || target.nlink != 0 {
+            return Err(MetaError::Io);
+        }
+
+        inner.inodes.remove(&inode);
+        let candidates = inner
+            .slices
+            .remove(&inode)
+            .map(|chunks| {
+                slice_block_keys(chunks.values().flat_map(|slices| slices.iter()))
+            })
+            .unwrap_or_default();
+        inner.symlink_targets.remove(&inode);
+        Ok(enqueue_confirmed_garbage(&mut inner, candidates))
+    }
+
     async fn rename(
         &self,
         old_parent: u64,
@@ -1059,6 +1119,26 @@ impl MetaStore for MemStore {
         new_parent: u64,
         new_name: &str,
         flags: u32,
+    ) -> Result<Vec<String>> {
+        self.rename_with_lifecycle(
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            flags,
+            false,
+        )
+        .await
+    }
+
+    async fn rename_with_lifecycle(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+        defer_reclaim: bool,
     ) -> Result<Vec<String>> {
         if flags & !RENAME_NOREPLACE != 0 {
             return Err(MetaError::UnsupportedRenameFlags(flags));
@@ -1205,6 +1285,12 @@ impl MetaStore for MemStore {
                         .get_mut(&target_inode_id)
                         .expect("target inode checked above")
                         .nlink -= 1;
+                } else if defer_reclaim {
+                    inner
+                        .inodes
+                        .get_mut(&target_inode_id)
+                        .expect("target inode checked above")
+                        .nlink = 0;
                 } else {
                     inner.inodes.remove(&target_inode_id);
                     if let Some(chunks) = inner.slices.remove(&target_inode_id) {
@@ -1275,6 +1361,63 @@ impl MetaStore for MemStore {
 mod tests {
     use super::*;
     use crate::fs_model::{S_IFDIR, S_IFLNK, S_IFREG};
+
+    #[tokio::test]
+    async fn deferred_unlink_keeps_data_through_last_hardlink_until_finalize() {
+        let store = MemStore::new();
+        let inode = store.create(ROOT_INODE, "open-file", 0o644).await.unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 64,
+            written_at: current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        store.append_slice(inode, slice.clone()).await.unwrap();
+        store.link(ROOT_INODE, "open-alias", inode).await.unwrap();
+
+        assert!(store
+            .unlink_with_lifecycle(ROOT_INODE, "open-file", true)
+            .await.unwrap().is_empty());
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 1);
+        assert!(store
+            .unlink_with_lifecycle(ROOT_INODE, "open-alias", true)
+            .await.unwrap().is_empty());
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 0);
+        let retained = store.read_slices(inode, 0).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].slice_id, slice.slice_id);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+
+        assert_eq!(store.finalize_orphan(inode).await.unwrap(), vec![key.clone()]);
+        assert!(matches!(store.getattr(inode).await, Err(MetaError::NotFound)));
+        assert_eq!(store.pending_garbage().await.unwrap(), vec![key]);
+    }
+
+    #[tokio::test]
+    async fn rename_overwrite_can_retain_open_target_until_finalize() {
+        let store = MemStore::new();
+        let source = store.create(ROOT_INODE, "source", 0o644).await.unwrap();
+        let target = store.create(ROOT_INODE, "target", 0o644).await.unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 8,
+            written_at: current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        store.append_slice(target, slice).await.unwrap();
+        assert!(store
+            .rename_with_lifecycle(
+                ROOT_INODE, "source", ROOT_INODE, "target", 0, true,
+            )
+            .await.unwrap().is_empty());
+        assert_eq!(store.lookup(ROOT_INODE, "target").await.unwrap(), source);
+        assert_eq!(store.getattr(target).await.unwrap().nlink, 0);
+        assert_eq!(store.finalize_orphan(target).await.unwrap(), vec![key]);
+    }
 
     #[tokio::test]
     async fn symlink_lookup_readlink_rename_and_unlink() {

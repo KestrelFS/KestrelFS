@@ -217,6 +217,10 @@ enum Mutation {
     Unlink {
         parent: u64,
         name: String,
+        defer_reclaim: bool,
+    },
+    FinalizeOrphan {
+        inode: u64,
     },
     Rename {
         old_parent: u64,
@@ -224,6 +228,7 @@ enum Mutation {
         new_parent: u64,
         new_name: String,
         flags: u32,
+        defer_reclaim: bool,
     },
     AcknowledgeGarbage {
         keys: Vec<String>,
@@ -718,17 +723,25 @@ impl RedisMetaStore {
                 .link(*parent, name, *inode)
                 .await
                 .map(MutationOutput::Nlink),
-            Mutation::Unlink { parent, name } => {
-                mem.unlink(*parent, name).await.map(MutationOutput::Garbage)
-            }
+            Mutation::Unlink { parent, name, defer_reclaim } => mem
+                .unlink_with_lifecycle(*parent, name, *defer_reclaim)
+                .await
+                .map(MutationOutput::Garbage),
+            Mutation::FinalizeOrphan { inode } => mem
+                .finalize_orphan(*inode)
+                .await
+                .map(MutationOutput::Garbage),
             Mutation::Rename {
                 old_parent,
                 old_name,
                 new_parent,
                 new_name,
                 flags,
+                defer_reclaim,
             } => mem
-                .rename_with_flags(*old_parent, old_name, *new_parent, new_name, *flags)
+                .rename_with_lifecycle(
+                    *old_parent, old_name, *new_parent, new_name, *flags, *defer_reclaim,
+                )
                 .await
                 .map(MutationOutput::Garbage),
             Mutation::AcknowledgeGarbage { keys } => mem
@@ -945,15 +958,32 @@ impl MetaStore for RedisMetaStore {
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
+        self.unlink_with_lifecycle(parent, name, false).await
+    }
+
+    async fn unlink_with_lifecycle(
+        &self,
+        parent: u64,
+        name: &str,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>> {
         match self
             .mutate(Mutation::Unlink {
                 parent,
                 name: name.to_owned(),
+                defer_reclaim,
             })
             .await?
         {
             MutationOutput::Garbage(keys) => Ok(keys),
             _ => unreachable!("unlink mutation returned wrong output"),
+        }
+    }
+
+    async fn finalize_orphan(&self, inode: u64) -> Result<Vec<String>> {
+        match self.mutate(Mutation::FinalizeOrphan { inode }).await? {
+            MutationOutput::Garbage(keys) => Ok(keys),
+            _ => unreachable!("finalize orphan mutation returned wrong output"),
         }
     }
 
@@ -990,6 +1020,20 @@ impl MetaStore for RedisMetaStore {
         new_name: &str,
         flags: u32,
     ) -> Result<Vec<String>> {
+        self.rename_with_lifecycle(
+            old_parent, old_name, new_parent, new_name, flags, false,
+        ).await
+    }
+
+    async fn rename_with_lifecycle(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>> {
         match self
             .mutate(Mutation::Rename {
                 old_parent,
@@ -997,6 +1041,7 @@ impl MetaStore for RedisMetaStore {
                 new_parent,
                 new_name: new_name.to_owned(),
                 flags,
+                defer_reclaim,
             })
             .await?
         {
@@ -1290,6 +1335,23 @@ mod tests {
         let victim_key = victim_slice.block_key(0);
         store.append_slice(victim, victim_slice).await.unwrap();
 
+        let orphan = store.create(directory, "open-orphan", 0o644).await.unwrap();
+        let orphan_slice = Slice {
+            chunk_index: 0,
+            slice_id: Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 11,
+            written_at: 4,
+        };
+        let orphan_key = orphan_slice.block_key(0);
+        store.append_slice(orphan, orphan_slice).await.unwrap();
+        assert!(store
+            .unlink_with_lifecycle(directory, "open-orphan", true)
+            .await.unwrap().is_empty());
+        assert_eq!(peer.getattr(orphan).await.unwrap().nlink, 0);
+        assert_eq!(peer.finalize_orphan(orphan).await.unwrap(), vec![orphan_key.clone()]);
+        assert!(matches!(store.getattr(orphan).await, Err(MetaError::NotFound)));
+
         let noreplace_source = store
             .create(directory, "noreplace-source", 0o644)
             .await
@@ -1358,6 +1420,7 @@ mod tests {
         assert!(pending.contains(&newer_key));
         assert!(pending.contains(&victim_key));
         assert!(pending.contains(&older_key));
+        assert!(pending.contains(&orphan_key));
 
         let mut connection = store.connection.clone();
         let schema: String = redis::cmd("HGET")

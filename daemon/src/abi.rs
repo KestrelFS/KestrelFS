@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 14;
+pub const ABI_VERSION: u32 = 15;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -117,6 +117,8 @@ pub const OP_SYMLINK_DATA: u32 = 19;
 pub const OP_READLINK_DATA: u32 = 20;
 /// Request: create a hard link whose new name is in the bounce buffer.
 pub const OP_LINK_DATA: u32 = 21;
+/// Request: reclaim an unlinked inode after its final open handle closes.
+pub const OP_FINALIZE_ORPHAN: u32 = 22;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -330,6 +332,7 @@ impl KestrelfsEvent {
             old_name,
             new_name,
             flags: 0,
+            defer_reclaim: false,
         })
     }
 
@@ -358,9 +361,13 @@ impl KestrelfsEvent {
         let old_name_len = u16::from_le_bytes(self.payload[16..18].try_into().unwrap());
         let new_name_len = u16::from_le_bytes(self.payload[18..20].try_into().unwrap());
         let flags = u32::from_le_bytes(self.payload[20..24].try_into().unwrap());
+        let lifecycle_flags = u32::from_le_bytes(self.payload[24..28].try_into().unwrap());
 
         if flags & !RENAME_NOREPLACE != 0 {
             return Err(RenameDataDecodeError::UnsupportedRenameFlags(flags));
+        }
+        if lifecycle_flags & !LIFECYCLE_DEFER_RECLAIM != 0 {
+            return Err(RenameDataDecodeError::UnsupportedLifecycleFlags(lifecycle_flags));
         }
 
         if old_name_len as usize > RENAME_DATA_NAME_MAX {
@@ -399,6 +406,7 @@ impl KestrelfsEvent {
             old_name,
             new_name,
             flags,
+            defer_reclaim: lifecycle_flags & LIFECYCLE_DEFER_RECLAIM != 0,
         })
     }
 
@@ -730,6 +738,8 @@ pub const RENAME_NAME_MAX: usize = 7;
 pub const RENAME_DATA_NAME_MAX: usize = 255;
 /// RENAME_DATA payload flag matching Linux `RENAME_NOREPLACE`.
 pub const RENAME_NOREPLACE: u32 = 1;
+/// Defer inode/object reclamation until `OP_FINALIZE_ORPHAN`.
+pub const LIFECYCLE_DEFER_RECLAIM: u32 = 1;
 
 /// ABI v10 maximum for LOOKUP_DATA/CREATE_DATA/MKDIR_DATA/UNLINK_DATA names
 /// and READDIR_DATA entry names. Mirrors `KESTRELFS_NAME_DATA_MAX`.
@@ -927,6 +937,7 @@ pub struct RenameReq {
     pub old_name: String,
     pub new_name: String,
     pub flags: u32,
+    pub defer_reclaim: bool,
 }
 
 /// Errors [`KestrelfsEvent::decode_rename_req`] can report.
@@ -953,6 +964,8 @@ pub enum RenameDataDecodeError {
     UnsupportedFlags(u32),
     #[error("rename flags {0:#x} are unsupported")]
     UnsupportedRenameFlags(u32),
+    #[error("lifecycle flags {0:#x} are unsupported")]
+    UnsupportedLifecycleFlags(u32),
     #[error(
         "old_name_len {0} exceeds RENAME_DATA_NAME_MAX ({RENAME_DATA_NAME_MAX})"
     )]
@@ -1051,7 +1064,8 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
     data_buffer
 )];
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
-const _: () = assert!(8 + 8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(NAME_DATA_MAX <= u16::MAX as usize);
@@ -1442,6 +1456,21 @@ mod tests {
         assert_eq!(decoded.old_name, "old");
         assert_eq!(decoded.new_name, "new");
         assert_eq!(decoded.flags, RENAME_NOREPLACE);
+        assert!(!decoded.defer_reclaim);
+    }
+
+    #[test]
+    fn decode_rename_data_req_reads_lifecycle_flags_at_offset_24() {
+        let mut data = [0u8; DATA_BUFFER_SIZE];
+        data[..6].copy_from_slice(b"oldnew");
+        let mut event = KestrelfsEvent::zeroed(OP_RENAME_DATA, 80);
+        event.payload[16..18].copy_from_slice(&3u16.to_le_bytes());
+        event.payload[18..20].copy_from_slice(&3u16.to_le_bytes());
+        event.payload[24..28].copy_from_slice(&LIFECYCLE_DEFER_RECLAIM.to_le_bytes());
+
+        // SAFETY: data is a live DATA_BUFFER_SIZE allocation owned by the test.
+        let decoded = unsafe { event.decode_rename_data_req(data.as_ptr()) }.unwrap();
+        assert!(decoded.defer_reclaim);
     }
 
     #[test]

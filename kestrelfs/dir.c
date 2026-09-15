@@ -520,9 +520,12 @@ out_unlock_link:
 static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct kestrelfs_event resp = { 0 };
+	struct inode *inode = d_really_is_positive(dentry) ? d_inode(dentry) : NULL;
+	struct kestrelfs_inode_state *state = NULL;
 	u64 parent_ino = dir->i_ino;
 	const char *name = dentry->d_name.name;
 	size_t name_len = dentry->d_name.len;
+	bool defer_reclaim = false;
 	int ret;
 
 	pr_info("kestrelfs: unlink parent=%lu name=\"%s\"\n",
@@ -532,26 +535,36 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 		pr_warn("kestrelfs: unlink name too long: %zu bytes\n", name_len);
 		return -ENAMETOOLONG;
 	}
-	if (d_really_is_positive(dentry) && d_inode(dentry)->i_nlink == 1) {
-		ret = kestrelfs_cache_invalidate_inode(d_inode(dentry)->i_ino);
+	if (inode && S_ISREG(inode->i_mode)) {
+		state = inode->i_private;
+		if (!state)
+			return -EIO;
+		ret = mutex_lock_interruptible(&state->lifecycle_lock);
 		if (ret)
 			return ret;
+		defer_reclaim = inode->i_nlink == 1 && state->open_handles > 0;
+	}
+	if (inode && inode->i_nlink == 1 && !defer_reclaim) {
+		ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
+		if (ret)
+			goto out_unlock_lifecycle;
 	}
 
 	ret = kestrelfs_name_data_call(KESTRELFS_OP_UNLINK_DATA,
-				      parent_ino, 0, name, name_len, &resp);
+				      parent_ino,
+				      defer_reclaim ?
+				      KESTRELFS_LIFECYCLE_DEFER_RECLAIM : 0,
+				      name, name_len, &resp);
 	if (ret) {
 		pr_info("kestrelfs: unlink failed: %d\n", ret);
-		return ret;
+		goto out_unlock_lifecycle;
 	}
 
 	pr_info("kestrelfs: unlink removed \"%s\" from parent=%llu\n",
 		name, parent_ino);
 
 	/* Update inode metadata (VFS will handle dentry invalidation). */
-	if (d_really_is_positive(dentry)) {
-		struct inode *inode = d_inode(dentry);
-
+	if (inode) {
 		if (S_ISDIR(inode->i_mode)) {
 			clear_nlink(inode);
 			drop_nlink(dir);
@@ -562,7 +575,10 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	}
 
-	return 0;
+out_unlock_lifecycle:
+	if (state)
+		mutex_unlock(&state->lifecycle_lock);
+	return ret;
 }
 
 /*
@@ -603,6 +619,10 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	size_t old_name_len = old_dentry->d_name.len;
 	size_t new_name_len = new_dentry->d_name.len;
 	struct kestrelfs_shared_region *region;
+	struct inode *replaced = d_really_is_positive(new_dentry) ?
+		d_inode(new_dentry) : NULL;
+	struct kestrelfs_inode_state *replaced_state = NULL;
+	bool defer_reclaim = false;
 	bool source_is_dir = d_really_is_positive(old_dentry) &&
 		S_ISDIR(d_inode(old_dentry)->i_mode);
 	bool target_is_dir = d_really_is_positive(new_dentry) &&
@@ -631,15 +651,27 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
 		return -ENAMETOOLONG;
 	/* A NOREPLACE request must leave cache state untouched on EEXIST. */
-	if (d_really_is_positive(new_dentry) && !(flags & RENAME_NOREPLACE)) {
-		ret = kestrelfs_cache_invalidate_inode(d_inode(new_dentry)->i_ino);
+	if (replaced && replaced != d_inode(old_dentry) &&
+	    !(flags & RENAME_NOREPLACE) && S_ISREG(replaced->i_mode)) {
+		replaced_state = replaced->i_private;
+		if (!replaced_state)
+			return -EIO;
+		ret = mutex_lock_interruptible(&replaced_state->lifecycle_lock);
 		if (ret)
 			return ret;
+		defer_reclaim = replaced->i_nlink == 1 &&
+			replaced_state->open_handles > 0;
+	}
+	if (replaced && replaced != d_inode(old_dentry) &&
+	    !(flags & RENAME_NOREPLACE) && !defer_reclaim) {
+		ret = kestrelfs_cache_invalidate_inode(replaced->i_ino);
+		if (ret)
+			goto out_unlock_lifecycle;
 	}
 
 	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)
-		return ret;
+		goto out_unlock_lifecycle;
 
 	region = kestrelfs_shm_region();
 	if (!region) {
@@ -659,6 +691,9 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	put_unaligned_le16((u16)old_name_len, &req.payload[16]);
 	put_unaligned_le16((u16)new_name_len, &req.payload[18]);
 	put_unaligned_le32(flags, &req.payload[20]);
+	put_unaligned_le32(defer_reclaim ?
+			   KESTRELFS_LIFECYCLE_DEFER_RECLAIM : 0,
+			   &req.payload[24]);
 
 	/* Send IPC request */
 	ret = kestrelfs_ipc_sync_call(&req, &resp);
@@ -667,7 +702,7 @@ out_unlock:
 	mutex_unlock(&kestrelfs_data_ipc_lock);
 	if (ret) {
 		pr_info("kestrelfs: rename failed: %d\n", ret);
-		return ret;
+		goto out_unlock_lifecycle;
 	}
 
 	pr_info("kestrelfs: rename success\n");
@@ -675,8 +710,6 @@ out_unlock:
 	/* Update VFS metadata. VFS performs the dentry move after this callback. */
 	if (d_really_is_positive(new_dentry) &&
 	    d_inode(new_dentry) != d_inode(old_dentry)) {
-		struct inode *replaced = d_inode(new_dentry);
-
 		if (target_is_dir)
 			clear_nlink(replaced);
 		else
@@ -703,7 +736,10 @@ out_unlock:
 		inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
 	}
 
-	return 0;
+out_unlock_lifecycle:
+	if (replaced_state)
+		mutex_unlock(&replaced_state->lifecycle_lock);
+	return ret;
 }
 
 const struct inode_operations kestrelfs_dir_inode_operations = {

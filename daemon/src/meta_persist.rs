@@ -197,10 +197,26 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
-        let garbage = self.mem.unlink(parent, name).await?;
+        self.unlink_with_lifecycle(parent, name, false).await
+    }
+
+    async fn unlink_with_lifecycle(
+        &self,
+        parent: u64,
+        name: &str,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>> {
+        let garbage = self.mem
+            .unlink_with_lifecycle(parent, name, defer_reclaim).await?;
         self.sync_to_disk()
             .await
             .map_err(|_| MetaError::Io)?;
+        Ok(garbage)
+    }
+
+    async fn finalize_orphan(&self, inode: u64) -> Result<Vec<String>> {
+        let garbage = self.mem.finalize_orphan(inode).await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
         Ok(garbage)
     }
 
@@ -226,9 +242,25 @@ impl MetaStore for FileMetaStore {
         new_name: &str,
         flags: u32,
     ) -> Result<Vec<String>> {
+        self.rename_with_lifecycle(
+            old_parent, old_name, new_parent, new_name, flags, false,
+        ).await
+    }
+
+    async fn rename_with_lifecycle(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+        defer_reclaim: bool,
+    ) -> Result<Vec<String>> {
         let garbage = self
             .mem
-            .rename_with_flags(old_parent, old_name, new_parent, new_name, flags)
+            .rename_with_lifecycle(
+                old_parent, old_name, new_parent, new_name, flags, defer_reclaim,
+            )
             .await?;
         self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
         Ok(garbage)
@@ -393,6 +425,38 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(restored.getattr(inode).await.unwrap().nlink, 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_orphan_and_final_gc_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        let inode;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            inode = store.create(ROOT_INODE, "open-orphan", 0o644).await.unwrap();
+            store.append_slice(inode, slice).await.unwrap();
+            assert!(store
+                .unlink_with_lifecycle(ROOT_INODE, "open-orphan", true)
+                .await.unwrap().is_empty());
+        }
+        {
+            let restarted = FileMetaStore::new(path.clone()).await.unwrap();
+            assert_eq!(restarted.getattr(inode).await.unwrap().nlink, 0);
+            assert!(restarted.pending_garbage().await.unwrap().is_empty());
+            assert_eq!(restarted.finalize_orphan(inode).await.unwrap(), vec![key.clone()]);
+        }
+        let restarted = FileMetaStore::new(path).await.unwrap();
+        assert!(matches!(restarted.getattr(inode).await, Err(MetaError::NotFound)));
+        assert_eq!(restarted.pending_garbage().await.unwrap(), vec![key]);
     }
 
     #[tokio::test]

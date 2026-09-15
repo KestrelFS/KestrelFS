@@ -35,6 +35,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/uio.h>
+#include <linux/limits.h>
 
 #include "kestrelfs.h"
 
@@ -415,6 +416,62 @@ static loff_t kestrelfs_writable_llseek(struct file *file, loff_t offset,
 	return generic_file_llseek(file, offset, whence);
 }
 
+static int kestrelfs_regular_open(struct inode *inode, struct file *file)
+{
+	struct kestrelfs_inode_state *state = inode->i_private;
+	int ret = 0;
+
+	if (!state)
+		return -EIO;
+	mutex_lock(&state->lifecycle_lock);
+	if (state->open_handles == UINT_MAX)
+		ret = -EMFILE;
+	else
+		state->open_handles++;
+	mutex_unlock(&state->lifecycle_lock);
+	return ret;
+}
+
+/*
+ * Final close is the only reclaim trigger for a retained nlink=0 inode.
+ * evict_inode remains IPC-free, preserving bounded unmount behavior.
+ */
+static int kestrelfs_regular_release(struct inode *inode, struct file *file)
+{
+	struct kestrelfs_inode_state *state = inode->i_private;
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	int ret = 0;
+
+	if (!state)
+		return -EIO;
+
+	mutex_lock(&state->lifecycle_lock);
+	if (WARN_ON_ONCE(state->open_handles == 0)) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+	state->open_handles--;
+	if (state->open_handles != 0 || inode->i_nlink != 0)
+		goto out_unlock;
+
+	ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
+	if (ret)
+		goto out_unlock;
+
+	req.opcode = KESTRELFS_OP_FINALIZE_ORPHAN;
+	put_unaligned_le64((u64)inode->i_ino, &req.payload[0]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (!ret && resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+		ret = resp.error_code < 0 ? resp.error_code : -EIO;
+	else if (!ret && resp.opcode != KESTRELFS_OP_RESULT_OK)
+		ret = -EPROTO;
+
+out_unlock:
+	mutex_unlock(&state->lifecycle_lock);
+	return ret;
+}
+
 /*
  * kestrelfs_writable_write() - handle write(2) on writable.dat.
  *
@@ -510,6 +567,8 @@ out_unlock:
 
 const struct file_operations kestrelfs_writable_file_ops = {
 	.owner	= THIS_MODULE,
+	.open	= kestrelfs_regular_open,
+	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
 	.write	= kestrelfs_writable_write,
 	.llseek	= kestrelfs_writable_llseek,
@@ -604,6 +663,8 @@ const struct inode_operations kestrelfs_writable_inode_ops = {
  */
 const struct file_operations kestrelfs_reg_file_ops = {
 	.owner	= THIS_MODULE,
+	.open	= kestrelfs_regular_open,
+	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
 	.write	= kestrelfs_writable_write,
 	.llseek	= kestrelfs_writable_llseek,

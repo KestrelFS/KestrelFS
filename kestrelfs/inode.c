@@ -24,6 +24,7 @@
 #include <linux/statfs.h>
 #include <linux/namei.h>
 #include <linux/dcache.h>
+#include <linux/slab.h>
 
 #include "kestrelfs.h"
 
@@ -57,6 +58,8 @@ static int kestrelfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 static void kestrelfs_evict_inode(struct inode *inode)
 {
 	truncate_inode_pages_final(&inode->i_data);
+	kfree(inode->i_private);
+	inode->i_private = NULL;
 	clear_inode(inode);
 }
 
@@ -149,6 +152,15 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		inode->i_op = &kestrelfs_symlink_inode_operations;
 		set_nlink(inode, nlink);
 	} else if (S_ISREG(mode)) {
+		struct kestrelfs_inode_state *state;
+
+		state = kzalloc(sizeof(*state), GFP_KERNEL);
+		if (!state) {
+			iget_failed(inode);
+			return ERR_PTR(-ENOMEM);
+		}
+		mutex_init(&state->lifecycle_lock);
+		inode->i_private = state;
 		/* Regular file - no custom a_ops (avoid dirty_folio without writeback) */
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
