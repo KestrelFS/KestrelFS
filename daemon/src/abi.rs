@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 12;
+pub const ABI_VERSION: u32 = 13;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -329,14 +329,16 @@ impl KestrelfsEvent {
             new_parent,
             old_name,
             new_name,
+            flags: 0,
         })
     }
 
     /// Decodes an ABI v9 `KESTRELFS_OP_RENAME_DATA` request.
     ///
     /// The payload carries `old_parent@0`, `new_parent@8`, and two little-endian
-    /// `u16` lengths at offsets 16 and 18. The old and new names are adjacent at
-    /// the beginning of the shared data bounce buffer.
+    /// `u16` lengths at offsets 16 and 18, plus rename flags at offset 20. The
+    /// old and new names are adjacent at the beginning of the shared data
+    /// bounce buffer.
     ///
     /// # Safety
     ///
@@ -355,6 +357,11 @@ impl KestrelfsEvent {
         let new_parent = u64::from_le_bytes(self.payload[8..16].try_into().unwrap());
         let old_name_len = u16::from_le_bytes(self.payload[16..18].try_into().unwrap());
         let new_name_len = u16::from_le_bytes(self.payload[18..20].try_into().unwrap());
+        let flags = u32::from_le_bytes(self.payload[20..24].try_into().unwrap());
+
+        if flags & !RENAME_NOREPLACE != 0 {
+            return Err(RenameDataDecodeError::UnsupportedRenameFlags(flags));
+        }
 
         if old_name_len as usize > RENAME_DATA_NAME_MAX {
             return Err(RenameDataDecodeError::OldNameTooLong(old_name_len));
@@ -391,6 +398,7 @@ impl KestrelfsEvent {
             new_parent,
             old_name,
             new_name,
+            flags,
         })
     }
 
@@ -720,6 +728,8 @@ pub const RENAME_NAME_MAX: usize = 7;
 /// Mirrors `KESTRELFS_RENAME_DATA_NAME_MAX`: ABI v9 permits each name in an
 /// `OP_RENAME_DATA` request to contain up to POSIX `NAME_MAX` bytes.
 pub const RENAME_DATA_NAME_MAX: usize = 255;
+/// RENAME_DATA payload flag matching Linux `RENAME_NOREPLACE`.
+pub const RENAME_NOREPLACE: u32 = 1;
 
 /// ABI v10 maximum for LOOKUP_DATA/CREATE_DATA/MKDIR_DATA/UNLINK_DATA names
 /// and READDIR_DATA entry names. Mirrors `KESTRELFS_NAME_DATA_MAX`.
@@ -916,6 +926,7 @@ pub struct RenameReq {
     pub new_parent: u64,
     pub old_name: String,
     pub new_name: String,
+    pub flags: u32,
 }
 
 /// Errors [`KestrelfsEvent::decode_rename_req`] can report.
@@ -940,6 +951,8 @@ pub enum RenameDecodeError {
 pub enum RenameDataDecodeError {
     #[error("request flags {0:#x} are unsupported")]
     UnsupportedFlags(u32),
+    #[error("rename flags {0:#x} are unsupported")]
+    UnsupportedRenameFlags(u32),
     #[error(
         "old_name_len {0} exceeds RENAME_DATA_NAME_MAX ({RENAME_DATA_NAME_MAX})"
     )]
@@ -1038,7 +1051,7 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
     data_buffer
 )];
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
-const _: () = assert!(8 + 8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(NAME_DATA_MAX <= u16::MAX as usize);
@@ -1409,5 +1422,36 @@ mod tests {
                 name: name.to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn decode_rename_data_req_reads_payload_flags_at_offset_20() {
+        let mut data = [0u8; DATA_BUFFER_SIZE];
+        data[..6].copy_from_slice(b"oldnew");
+        let mut event = KestrelfsEvent::zeroed(OP_RENAME_DATA, 78);
+        event.payload[0..8].copy_from_slice(&41u64.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&42u64.to_le_bytes());
+        event.payload[16..18].copy_from_slice(&3u16.to_le_bytes());
+        event.payload[18..20].copy_from_slice(&3u16.to_le_bytes());
+        event.payload[20..24].copy_from_slice(&RENAME_NOREPLACE.to_le_bytes());
+
+        // SAFETY: data is a live DATA_BUFFER_SIZE allocation owned by the test.
+        let decoded = unsafe { event.decode_rename_data_req(data.as_ptr()) }.unwrap();
+        assert_eq!(decoded.old_parent, 41);
+        assert_eq!(decoded.new_parent, 42);
+        assert_eq!(decoded.old_name, "old");
+        assert_eq!(decoded.new_name, "new");
+        assert_eq!(decoded.flags, RENAME_NOREPLACE);
+    }
+
+    #[test]
+    fn decode_rename_data_req_rejects_unknown_payload_flags() {
+        let data = [0u8; DATA_BUFFER_SIZE];
+        let mut event = KestrelfsEvent::zeroed(OP_RENAME_DATA, 79);
+        event.payload[20..24].copy_from_slice(&2u32.to_le_bytes());
+
+        // SAFETY: data is a live DATA_BUFFER_SIZE allocation owned by the test.
+        let error = unsafe { event.decode_rename_data_req(data.as_ptr()) }.unwrap_err();
+        assert_eq!(error, RenameDataDecodeError::UnsupportedRenameFlags(2));
     }
 }

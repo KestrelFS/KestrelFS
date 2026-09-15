@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 32 硬链接已验收；下一步 Step 33 POSIX-RENAME；IPC ABI v12；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 33 `RENAME_NOREPLACE` 已验收；下一步 Step 34 POSIX-ATTR；IPC ABI v13；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -31,7 +31,8 @@
 > 已把无引用对象 key 与 metadata mutation 一起写入持久队列，daemon 启动及运行中
 > 会幂等重试删除。Step 31 已将 Redis metadata 拆为 v2 分记录 schema，并用 Lua
 > revision-CAS 原子提交字段级变更。Step 32 已支持持久化硬链接、末引用 GC 与内核
-> `.link`。真正的异步 completion 流水线与多节点失效尚未实现。详见[路线图](#路线图)、
+> `.link`。Step 33 已支持原子 `RENAME_NOREPLACE`（`EXCHANGE`/`WHITEOUT` 仍未实现）。
+> 真正的异步 completion 流水线与多节点失效尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -129,7 +130,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–32 已验收；下一步 Step 33 POSIX-RENAME（ABI v12 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–33 已验收；下一步 Step 34 POSIX-ATTR（ABI v13 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -144,13 +145,15 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v12）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v13）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
 ├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
 ├── test-step19-cache-vng.sh … test-step29-cache-evict-vng.sh
 ├── test-step32-posix-core-vng.sh   # 硬链接、持久 nlink 与末引用 GC
+├── test-step33-posix-rename-vng.sh # NOREPLACE、持久化与 VFS 错误语义
+├── test-step33-renameat2.c         # renameat2 flags 测试辅助程序
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -367,6 +370,7 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step27-ops-recovery-vng.
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step26-cache-async-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step33-posix-rename-vng.sh"
 # … Step 23/22/20/19/15 等脚本见 HANDOFF.md §7
 ```
 
@@ -409,7 +413,8 @@ offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 Ki
 ### 已知限制
 
 Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
-truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 另支持硬链接（ABI v12）。仍缺：
+truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链接，Step 33
+支持 `RENAME_NOREPLACE`（ABI v13）。仍缺：
 
 - 尚无 open-unlink 延迟回收；目录 nlink 尚不随子目录变化；symlink 目标目前要求
   UTF-8，最长 4095 字节。

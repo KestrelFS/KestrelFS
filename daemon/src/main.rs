@@ -1133,12 +1133,18 @@ async fn handle_rename_request(
     object_store: &Arc<dyn ObjectStore>,
 ) -> KestrelfsEvent {
     println!(
-        "kestrelfs-daemon:    {operation} old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\"",
-        req.old_parent, req.old_name, req.new_parent, req.new_name
+        "kestrelfs-daemon:    {operation} old_parent={} old_name=\"{}\" new_parent={} new_name=\"{}\" flags={:#x}",
+        req.old_parent, req.old_name, req.new_parent, req.new_name, req.flags
     );
 
     match store
-        .rename(req.old_parent, &req.old_name, req.new_parent, &req.new_name)
+        .rename_with_flags(
+            req.old_parent,
+            &req.old_name,
+            req.new_parent,
+            &req.new_name,
+            req.flags,
+        )
         .await
     {
         Ok(garbage_keys) => {
@@ -1265,6 +1271,7 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::NotASymlink => -libc::EINVAL,
         MetaError::IsADirectory => -libc::EPERM,
         MetaError::TooManyLinks => -libc::EMLINK,
+        MetaError::UnsupportedRenameFlags(_) => -libc::EINVAL,
         MetaError::Io => -libc::EIO,
     }
 }
@@ -2914,6 +2921,26 @@ mod tests {
         new_name: &str,
         data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
     ) -> KestrelfsEvent {
+        raw_rename_data_req_with_flags(
+            req_id,
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            0,
+            data_buffer,
+        )
+    }
+
+    fn raw_rename_data_req_with_flags(
+        req_id: u64,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+        data_buffer: &mut [u8; abi::DATA_BUFFER_SIZE],
+    ) -> KestrelfsEvent {
         let old_name = old_name.as_bytes();
         let new_name = new_name.as_bytes();
         assert!(old_name.len() <= abi::RENAME_DATA_NAME_MAX);
@@ -2929,6 +2956,7 @@ mod tests {
         event.payload[8..16].copy_from_slice(&new_parent.to_le_bytes());
         event.payload[16..18].copy_from_slice(&(old_name.len() as u16).to_le_bytes());
         event.payload[18..20].copy_from_slice(&(new_name.len() as u16).to_le_bytes());
+        event.payload[20..24].copy_from_slice(&flags.to_le_bytes());
         event
     }
 
@@ -3347,6 +3375,78 @@ mod tests {
             store.lookup(fs_model::ROOT_INODE, "source").await,
             Err(MetaError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn rename_data_noreplace_returns_eexist_without_mutation() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let source = store
+            .create(fs_model::ROOT_INODE, "source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let target = store
+            .create(fs_model::ROOT_INODE, "target", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req_with_flags(
+            705,
+            fs_model::ROOT_INODE,
+            "source",
+            fs_model::ROOT_INODE,
+            "target",
+            abi::RENAME_NOREPLACE,
+            &mut data_buffer,
+        );
+
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(response.error_code, -libc::EEXIST);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "source").await.unwrap(), source);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "target").await.unwrap(), target);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_data_noreplace_same_inode_aliases_is_successful_noop() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "source", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        store.link(fs_model::ROOT_INODE, "alias", inode).await.unwrap();
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req_with_flags(
+            706,
+            fs_model::ROOT_INODE,
+            "source",
+            fs_model::ROOT_INODE,
+            "alias",
+            abi::RENAME_NOREPLACE,
+            &mut data_buffer,
+        );
+
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "source").await.unwrap(), inode);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "alias").await.unwrap(), inode);
+        assert_eq!(store.getattr(inode).await.unwrap().nlink, 2);
     }
 
     #[tokio::test]

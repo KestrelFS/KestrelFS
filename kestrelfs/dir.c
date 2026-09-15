@@ -535,7 +535,8 @@ static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
  * kestrelfs_inode_rename - VFS ->rename() for files and directories.
  *
  * Sends KESTRELFS_OP_RENAME_DATA to daemon. Supports same-directory rename
- * and cross-directory moves with POSIX semantics (atomic replacement).
+ * and cross-directory moves with POSIX semantics (atomic replacement and
+ * RENAME_NOREPLACE).
  * Names are concatenated in the shared data bounce buffer, so each may be up
  * to KESTRELFS_RENAME_DATA_NAME_MAX bytes.
  */
@@ -558,13 +559,12 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
 		old_dir->i_ino, old_name, new_dir->i_ino, new_name, flags);
 
-	/* VFS may pass flags like RENAME_NOREPLACE, RENAME_EXCHANGE, etc.
-	 * For now, we only support basic rename (flags=0).
-	 */
-	if (flags != 0) {
+	/* EXCHANGE, WHITEOUT, and unknown flag combinations remain unsupported. */
+	if (flags & ~RENAME_NOREPLACE) {
 		pr_warn("kestrelfs: rename flags 0x%x not supported\n", flags);
 		return -EINVAL;
 	}
+	static_assert(RENAME_NOREPLACE == KESTRELFS_RENAME_NOREPLACE);
 
 	/* Validate the per-name ABI limit and combined bounce-buffer budget. */
 	if (old_name_len > KESTRELFS_RENAME_DATA_NAME_MAX) {
@@ -577,8 +577,8 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	}
 	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
 		return -ENAMETOOLONG;
-	/* An atomic replacement must make the overwritten inode uncacheable first. */
-	if (d_really_is_positive(new_dentry)) {
+	/* A NOREPLACE request must leave cache state untouched on EEXIST. */
+	if (d_really_is_positive(new_dentry) && !(flags & RENAME_NOREPLACE)) {
 		ret = kestrelfs_cache_invalidate_inode(d_inode(new_dentry)->i_ino);
 		if (ret)
 			return ret;
@@ -605,6 +605,7 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	put_unaligned_le64(new_parent_ino, &req.payload[8]);
 	put_unaligned_le16((u16)old_name_len, &req.payload[16]);
 	put_unaligned_le16((u16)new_name_len, &req.payload[18]);
+	put_unaligned_le32(flags, &req.payload[20]);
 
 	/* Send IPC request */
 	ret = kestrelfs_ipc_sync_call(&req, &resp);

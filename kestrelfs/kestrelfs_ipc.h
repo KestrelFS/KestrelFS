@@ -511,12 +511,15 @@
  *   offset  8, 8 bytes, little-endian u64: new_parent_inode_id.
  *   offset 16, 2 bytes, little-endian u16: old_name_len.
  *   offset 18, 2 bytes, little-endian u16: new_name_len.
- *   offset 20..32: reserved, must be zero.
+ *   offset 20, 4 bytes, little-endian u32: rename flags.
+ *   offset 24..32: reserved, must be zero.
  *
  * The first old_name_len bytes of shared_region.data_buffer hold old_name;
  * the following new_name_len bytes hold new_name. Neither is NUL-terminated.
  * Each name is limited to POSIX NAME_MAX (255 bytes), and their combined
- * length MUST fit in KESTRELFS_DATA_BUFFER_SIZE. Request flags MUST be zero.
+ * length MUST fit in KESTRELFS_DATA_BUFFER_SIZE. The event-header flags remain
+ * zero; the payload rename flags currently permit only
+ * KESTRELFS_RENAME_NOREPLACE.
  *
  * RESPONSE and rename semantics are identical to legacy KESTRELFS_OP_RENAME.
  * The legacy opcode remains in ABI v9 for compatibility tests; normal VFS
@@ -525,6 +528,7 @@
  * Introduced in KESTRELFS_ABI_VERSION 9.
  */
 #define KESTRELFS_RENAME_DATA_NAME_MAX	255
+#define KESTRELFS_RENAME_NOREPLACE	0x00000001U
 
 /*
  * Common ABI v10 single-name request layout
@@ -755,8 +759,12 @@ struct kestrelfs_ring_ctrl {
  *  12 - Phase 4/control-plane step 32: Added LINK_DATA (opcode 21). The destination name
  *       uses the serialized bounce buffer and supports POSIX NAME_MAX; the
  *       response returns the persistent inode link count.
+ *
+ *  13 - Phase 4/control-plane step 33: RENAME_DATA payload offset 20 now
+ *       carries rename flags. KESTRELFS_RENAME_NOREPLACE is supported;
+ *       EXCHANGE and WHITEOUT remain rejected.
  */
-#define KESTRELFS_ABI_VERSION		12
+#define KESTRELFS_ABI_VERSION		13
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -860,7 +868,7 @@ _Static_assert(KESTRELFS_DATA_BUFFER_SIZE <= (__u32)-1,
 _Static_assert(8 + 8 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"READ_DATA/WRITE_DATA request fields overflow the event payload");
 
-_Static_assert(8 + 8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+_Static_assert(8 + 8 + 2 + 2 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"RENAME_DATA request fields overflow the event payload");
 
 _Static_assert(8 + 8 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,

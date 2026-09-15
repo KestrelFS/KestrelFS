@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 32 POSIX-CORE（硬链接子集）已由 Cursor 验收并纳入本提交（IPC ABI v12、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 33 POSIX-RENAME（`RENAME_NOREPLACE`）已由 Cursor 验收并纳入本提交（IPC ABI v13、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 32 硬链接已验收；下一步 Step 33 = POSIX-RENAME（见 remaining-capabilities §8） |
+| 当前阶段 | Step 33 `RENAME_NOREPLACE` 已验收；下一步 Step 34 = POSIX-ATTR（见 remaining-capabilities §8） |
 
 ---
 
@@ -166,13 +166,17 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 30** | **metadata 同事务持久化 GC queue + 启动/运行期指数退避重试** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 31** | **Redis v2 分记录 schema + 字段级 diff + Lua revision-CAS 原子 mutation** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 32** | **硬链接：持久化 nlink、多 dirent 同 inode、末引用 GC、VFS `.link`** | **12** | **✅ 已验收** |
+| **Phase 4/控制面 Step 33** | **rename flags：原子 `RENAME_NOREPLACE`；EXCHANGE/WHITEOUT 仍拒绝** | **13** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
 
-下一步：**Step 33 POSIX-RENAME**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、158 tests 与 `STEP33_POSIX_RENAME_PASS` 确认 Step 33 已验收。
+`RENAME_DATA` payload flags 支持原子 `RENAME_NOREPLACE`；EXCHANGE/WHITEOUT 仍拒绝。ABI **v13**；format **v4**。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 12`（含 `LINK_DATA`）
+下一步：**Step 34 POSIX-ATTR**，提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 13`（含 `RENAME_DATA` flags）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -188,7 +192,7 @@ Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` �
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 12`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 13`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -203,6 +207,7 @@ Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` �
 10. Phase 3 Step 13：新增 LOOKUP/CREATE/MKDIR/UNLINK/READDIR_DATA；单名统一为 255 字节，READDIR 批量打包变长条目
 11. Phase 3 Step 14：新增 SYMLINK_DATA / READLINK_DATA；link name 与 target 通过同一 16 KiB bounce 传输，target 仅存 MetaStore
 12. Phase 4/控制面 Step 32：新增 LINK_DATA；payload 携带 parent inode、现有 inode 与 name_len，新名字位于 bounce，响应返回持久化 nlink
+13. Phase 4/控制面 Step 33：扩展 RENAME_DATA payload，offset 20 增加 u32 rename flags；支持 `RENAME_NOREPLACE`
 
 ### 5.4 已实现 Opcode 列表
 
@@ -221,7 +226,7 @@ Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` �
 | 10 | `OP_RENAME` | 重命名/移动文件或目录 | 7 |
 | 11 | `OP_WRITE_DATA` | 从 16 KiB bounce buffer 写入文件 | 8 |
 | 12 | `OP_READ_DATA` | 将文件数据读入 16 KiB bounce buffer | 8 |
-| 13 | `OP_RENAME_DATA` | 从 16 KiB bounce buffer 读取 old/new name 并重命名 | 9 |
+| 13 | `OP_RENAME_DATA` | 从 bounce 读取 old/new name；ABI v13 payload flags 支持 `RENAME_NOREPLACE` | 9（v13 扩展 flags） |
 | 14 | `OP_LOOKUP_DATA` | 从 bounce buffer 读取名字并查找 | 10 |
 | 15 | `OP_CREATE_DATA` | 从 bounce buffer 读取名字并创建文件 | 10 |
 | 16 | `OP_MKDIR_DATA` | 从 bounce buffer 读取名字并创建目录 | 10 |
@@ -264,7 +269,7 @@ Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` �
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
 | 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
 | 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
-| 10 | **rename 不支持 flags** | `kestrelfs_inode_rename()` 对 `flags != 0` 直接返回 `-EINVAL`。不支持 `RENAME_NOREPLACE` / `RENAME_EXCHANGE` / `RENAME_WHITEOUT`。 | `kestrelfs/dir.c` |
+| 10 | **rename flags 仅支持 NOREPLACE** | Step 33 支持原子 `RENAME_NOREPLACE`；`RENAME_EXCHANGE` / `RENAME_WHITEOUT` / 未知位返回 `-EINVAL`。Linux VFS 对已存在目标（包括同 inode 硬链接别名）会在 `.rename` 回调前返回 `EEXIST`；MetaStore 层同 inode 仍为成功 no-op。 | `kestrelfs/dir.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 不递归计算** | Step 32 已为非目录硬链接持久化并维护 nlink；目录 nlink 仍固定为 2，不随子目录增减而更新。 | `daemon/src/meta.rs`、`kestrelfs/inode.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
@@ -307,7 +312,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 32 验收基线 151 个）
+cargo test                    # 单元测试 + 集成测试（Step 33 验收基线 158 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1067,6 +1072,38 @@ vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
 vng 用例仅在 guest 内创建 loop cache device，并显式 `insmod`；daemon 使用独立
 `/tmp/kestrelfs-step32-$$` 且保留 `daemon.log`。未触碰宿主机模块、mount 或 zvol。
 
+### 7.27 Phase 4/控制面 Step 33 POSIX-RENAME
+
+`RENAME_DATA` payload offset 20..24 定义为 little-endian u32 flags，ABI v13 支持
+`RENAME_NOREPLACE`。Mem/File/Redis 的目标存在检查均位于原子 metadata mutation 内；
+失败返回 `EEXIST`，不改变 namespace/nlink/slice/GC queue。NOREPLACE 失败路径不触碰
+目标 inode 的 cache invalidate。
+
+Cursor 验收自检（2026-09-15）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  158 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec ./test-step33-posix-rename-vng.sh
+  STEP33_NOREPLACE_SUCCESS_PASS
+  STEP33_NOREPLACE_EEXIST_ATOMIC_PASS
+  STEP33_NOREPLACE_HARDLINK_VFS_EEXIST_NOOP_PASS
+  STEP33_UNSUPPORTED_FLAGS_PASS
+  STEP33_NOREPLACE_RESTART_PASS
+  STEP33_POSIX_RENAME_PASS (umount_ms=26)
+```
+
+Linux VFS 在 filesystem `.rename` 前执行 NOREPLACE 的目标存在检查，因此同 inode
+硬链接别名的 `renameat2(..., RENAME_NOREPLACE)` syscall 也返回 `EEXIST`，且不会进入
+KestrelFS/daemon；vng 验证两个别名与 nlink 不变。MetaStore/daemon 内部仍按要求将
+同 inode 两名处理为成功 no-op。测试全在 vng guest + loop，显式 `insmod`、独立
+data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1075,8 +1112,8 @@ vng 用例仅在 guest 内创建 loop cache device，并显式 `insmod`；daemon
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 33 POSIX-RENAME** | 至少 `RENAME_NOREPLACE`；提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | 其余 POSIX / 多节点 | open-unlink、mode·目录 nlink、CACHE-COHERENCE… |
+| 1 | **Step 34 POSIX-ATTR** | create/mkdir 尊重 mode；目录 nlink；提示词见 §8 |
+| 2 | 其余 POSIX / 多节点 | open-unlink、EXCHANGE/WHITEOUT、CACHE-COHERENCE… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1131,10 +1168,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 32 POSIX-CORE（硬链接）已由 Cursor 验收并提交
-- [x] IPC ABI = 12；cache format = v4
-- [x] Step 8–31 + Step 32 已验收状态已写清
-- [x] 下一步明确：Step 33 POSIX-RENAME（`docs/remaining-capabilities.md` §8）
+- [x] Step 33 POSIX-RENAME（`RENAME_NOREPLACE`）已由 Cursor 验收并提交
+- [x] IPC ABI = 13；cache format = v4
+- [x] Step 8–32 + Step 33 已验收状态已写清
+- [x] 下一步明确：Step 34 POSIX-ATTR（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

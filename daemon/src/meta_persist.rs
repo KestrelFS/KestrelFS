@@ -218,6 +218,22 @@ impl MetaStore for FileMetaStore {
         Ok(garbage)
     }
 
+    async fn rename_with_flags(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+    ) -> Result<Vec<String>> {
+        let garbage = self
+            .mem
+            .rename_with_flags(old_parent, old_name, new_parent, new_name, flags)
+            .await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
+        Ok(garbage)
+    }
+
     async fn pending_garbage(&self) -> Result<Vec<String>> {
         self.mem.pending_garbage().await
     }
@@ -377,6 +393,36 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(restored.getattr(inode).await.unwrap().nlink, 1);
+    }
+
+    #[tokio::test]
+    async fn rename_noreplace_failure_is_persistently_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let source;
+        let target;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            source = store.create(ROOT_INODE, "source", 0o644).await.unwrap();
+            target = store.create(ROOT_INODE, "target", 0o644).await.unwrap();
+            assert!(matches!(
+                store
+                    .rename_with_flags(
+                        ROOT_INODE,
+                        "source",
+                        ROOT_INODE,
+                        "target",
+                        crate::meta::RENAME_NOREPLACE,
+                    )
+                    .await,
+                Err(MetaError::AlreadyExists)
+            ));
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(restored.lookup(ROOT_INODE, "source").await.unwrap(), source);
+        assert_eq!(restored.lookup(ROOT_INODE, "target").await.unwrap(), target);
+        assert!(restored.pending_garbage().await.unwrap().is_empty());
     }
 
     #[tokio::test]

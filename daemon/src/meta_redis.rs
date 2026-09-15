@@ -223,6 +223,7 @@ enum Mutation {
         old_name: String,
         new_parent: u64,
         new_name: String,
+        flags: u32,
     },
     AcknowledgeGarbage {
         keys: Vec<String>,
@@ -725,8 +726,9 @@ impl RedisMetaStore {
                 old_name,
                 new_parent,
                 new_name,
+                flags,
             } => mem
-                .rename(*old_parent, old_name, *new_parent, new_name)
+                .rename_with_flags(*old_parent, old_name, *new_parent, new_name, *flags)
                 .await
                 .map(MutationOutput::Garbage),
             Mutation::AcknowledgeGarbage { keys } => mem
@@ -976,12 +978,25 @@ impl MetaStore for RedisMetaStore {
         new_parent: u64,
         new_name: &str,
     ) -> Result<Vec<String>> {
+        self.rename_with_flags(old_parent, old_name, new_parent, new_name, 0)
+            .await
+    }
+
+    async fn rename_with_flags(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+    ) -> Result<Vec<String>> {
         match self
             .mutate(Mutation::Rename {
                 old_parent,
                 old_name: old_name.to_owned(),
                 new_parent,
                 new_name: new_name.to_owned(),
+                flags,
             })
             .await?
         {
@@ -1084,6 +1099,35 @@ mod tests {
         assert!(patch.inodes_del.contains(&victim.to_string()));
         assert!(patch.slices_del.contains(&slice_field(victim, 0)));
         assert_eq!(patch.gc_add, vec![victim_key]);
+    }
+
+    #[tokio::test]
+    async fn rename_noreplace_failure_produces_no_patch_or_gc() {
+        let mem = MemStore::new();
+        let source = mem.create(ROOT_INODE, "source", 0o644).await.unwrap();
+        let target = mem.create(ROOT_INODE, "target", 0o644).await.unwrap();
+        let old = mem.snapshot().await;
+
+        assert!(matches!(
+            mem.rename_with_flags(
+                ROOT_INODE,
+                "source",
+                ROOT_INODE,
+                "target",
+                crate::meta::RENAME_NOREPLACE,
+            )
+            .await,
+            Err(MetaError::AlreadyExists)
+        ));
+        let new = mem.snapshot().await;
+        let patch = RedisPatch::between(
+            &SnapshotRecords::from_snapshot(&old).unwrap(),
+            &SnapshotRecords::from_snapshot(&new).unwrap(),
+        );
+        assert_eq!(mem.lookup(ROOT_INODE, "source").await.unwrap(), source);
+        assert_eq!(mem.lookup(ROOT_INODE, "target").await.unwrap(), target);
+        assert!(patch.is_empty());
+        assert!(mem.pending_garbage().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1207,6 +1251,51 @@ mod tests {
         };
         let victim_key = victim_slice.block_key(0);
         store.append_slice(victim, victim_slice).await.unwrap();
+
+        let noreplace_source = store
+            .create(directory, "noreplace-source", 0o644)
+            .await
+            .unwrap();
+        let noreplace_target = store
+            .create(directory, "noreplace-target", 0o644)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    directory,
+                    "noreplace-source",
+                    directory,
+                    "noreplace-target",
+                    crate::meta::RENAME_NOREPLACE,
+                )
+                .await,
+            Err(MetaError::AlreadyExists)
+        ));
+        assert_eq!(
+            peer.lookup(directory, "noreplace-source").await.unwrap(),
+            noreplace_source
+        );
+        assert_eq!(
+            peer.lookup(directory, "noreplace-target").await.unwrap(),
+            noreplace_target
+        );
+        store
+            .link(directory, "noreplace-alias", noreplace_source)
+            .await
+            .unwrap();
+        store
+            .rename_with_flags(
+                directory,
+                "noreplace-source",
+                directory,
+                "noreplace-alias",
+                crate::meta::RENAME_NOREPLACE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(peer.getattr(noreplace_source).await.unwrap().nlink, 2);
+
         let source = store.create(directory, "source", 0o644).await.unwrap();
         assert_eq!(
             store

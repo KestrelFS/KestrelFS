@@ -94,6 +94,9 @@ pub enum MetaError {
     /// Incrementing the inode's persistent link count would overflow.
     #[error("too many hard links")]
     TooManyLinks,
+    /// A rename flag other than the currently supported NOREPLACE bit was used.
+    #[error("unsupported rename flags: {0:#x}")]
+    UnsupportedRenameFlags(u32),
     /// I/O error during persistence operations (FileMetaStore).
     #[error("I/O error")]
     Io,
@@ -102,6 +105,10 @@ pub enum MetaError {
 /// Convenience alias, matching the `Result<T>` naming used throughout
 /// the rest of the daemon's modules (e.g. `std::io::Result`).
 pub type Result<T> = std::result::Result<T, MetaError>;
+
+/// Atomic rename must fail with [`MetaError::AlreadyExists`] when the target
+/// exists. This value intentionally matches Linux `RENAME_NOREPLACE`.
+pub const RENAME_NOREPLACE: u32 = 1;
 
 /// `MetaStore` - async abstraction over the POSIX metadata backing
 /// store.
@@ -271,18 +278,31 @@ pub trait MetaStore: Send + Sync {
     ///
     /// - [`MetaError::NotFound`] if source does not exist or parent directories missing
     /// - [`MetaError::NotADirectory`] if either parent is not a directory
-    /// - [`MetaError::AlreadyExists`] if target exists and is a non-empty directory
+    /// - [`MetaError::AlreadyExists`] if NOREPLACE is set and a different target exists
     /// - [`MetaError::InvalidName`] if attempting to rename "." or ".."
     /// - [`MetaError::NotEmpty`] if target is a non-empty directory
     ///
     /// Implementation must prevent renaming a directory into its own subtree.
     /// On replacement, returns block keys confirmed unreferenced afterward.
+    #[allow(dead_code)]
     async fn rename(
         &self,
         old_parent: u64,
         old_name: &str,
         new_parent: u64,
         new_name: &str,
+    ) -> Result<Vec<String>>;
+
+    /// Rename with Linux-compatible flags. Only [`RENAME_NOREPLACE`] is
+    /// currently supported; implementations must perform its target-existence
+    /// check in the same atomic metadata mutation as the rename itself.
+    async fn rename_with_flags(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
     ) -> Result<Vec<String>>;
 
     /// Returns durable GC candidates that are not referenced by any current
@@ -982,6 +1002,22 @@ impl MetaStore for MemStore {
         new_parent: u64,
         new_name: &str,
     ) -> Result<Vec<String>> {
+        self.rename_with_flags(old_parent, old_name, new_parent, new_name, 0)
+            .await
+    }
+
+    async fn rename_with_flags(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: u32,
+    ) -> Result<Vec<String>> {
+        if flags & !RENAME_NOREPLACE != 0 {
+            return Err(MetaError::UnsupportedRenameFlags(flags));
+        }
+
         // Validate names
         if old_name.is_empty() || old_name == "." || old_name == ".." {
             return Err(MetaError::InvalidName(format!("invalid old_name: {}", old_name)));
@@ -1061,6 +1097,9 @@ impl MetaStore for MemStore {
             // inode is a successful no-op: neither directory entry changes.
             if target_inode_id == source_inode_id {
                 return Ok(Vec::new());
+            }
+            if flags & RENAME_NOREPLACE != 0 {
+                return Err(MetaError::AlreadyExists);
             }
             let target_inode = inner.inodes.get(&target_inode_id).ok_or(MetaError::NotFound)?;
 
@@ -1721,6 +1760,79 @@ mod tests {
         assert_eq!(store.getattr(target).await.unwrap().nlink, 2);
         store.lookup(ROOT_INODE, "target-alias").await.unwrap();
         store.lookup(ROOT_INODE, "target-alias-2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_noreplace_is_atomic_and_same_inode_is_a_noop() {
+        let store = MemStore::new();
+        let source = store
+            .create(ROOT_INODE, "noreplace-source", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let victim = store
+            .create(ROOT_INODE, "noreplace-victim", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let victim_slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: current_unix_time(),
+        };
+        store.append_slice(victim, victim_slice).await.unwrap();
+
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "noreplace-source",
+                    ROOT_INODE,
+                    "noreplace-victim",
+                    RENAME_NOREPLACE,
+                )
+                .await,
+            Err(MetaError::AlreadyExists)
+        ));
+        assert_eq!(
+            store.lookup(ROOT_INODE, "noreplace-source").await.unwrap(),
+            source
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "noreplace-victim").await.unwrap(),
+            victim
+        );
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+
+        assert_eq!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "noreplace-source",
+                    ROOT_INODE,
+                    "noreplace-new",
+                    RENAME_NOREPLACE,
+                )
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(store.lookup(ROOT_INODE, "noreplace-new").await.unwrap(), source);
+
+        store.link(ROOT_INODE, "noreplace-alias", source).await.unwrap();
+        store
+            .rename_with_flags(
+                ROOT_INODE,
+                "noreplace-new",
+                ROOT_INODE,
+                "noreplace-alias",
+                RENAME_NOREPLACE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.getattr(source).await.unwrap().nlink, 2);
+        assert_eq!(store.lookup(ROOT_INODE, "noreplace-new").await.unwrap(), source);
+        assert_eq!(store.lookup(ROOT_INODE, "noreplace-alias").await.unwrap(), source);
     }
 
     #[tokio::test]
