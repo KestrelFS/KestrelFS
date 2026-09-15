@@ -34,7 +34,7 @@
 > `.link`。Step 33 已支持原子 `RENAME_NOREPLACE`；Step 34 已补齐 create/mkdir mode 与
 > 持久化目录 nlink。Step 35 通过 Redis durable revision 轮询与 ABI v14
 > daemon→kernel ioctl 保守清空本地 cache，形成远端 mutation 最小闭环。
-> Step 36 已验收  以显式 open 计数、nlink=0 orphan 与 last-close GC 支持
+> Step 36 已以显式 open 计数、nlink=0 orphan 与 last-close GC 支持
 > open-unlink（`EXCHANGE`/`WHITEOUT`、chmod 仍未实现）。真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
