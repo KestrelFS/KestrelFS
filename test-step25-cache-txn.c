@@ -18,6 +18,8 @@
 #define JOURNAL_MAGIC UINT64_C(0x4e52554f4a53464b)
 #define JOURNAL_VERSION 1U
 #define JOURNAL_PREPARED 1U
+#define EVICT_BATCH_MAGIC UINT32_C(0x48435442)
+#define EVICT_BATCH_MAX 64U
 
 enum journal_operation {
 	JOURNAL_FILL = 1,
@@ -46,10 +48,19 @@ struct disk_journal {
 	uint32_t checksum;
 };
 
+struct disk_evict_batch {
+	uint32_t magic;
+	uint32_t count;
+	uint32_t slots[EVICT_BATCH_MAX];
+};
+
 _Static_assert(sizeof(struct disk_index_entry) == 32, "index ABI");
 _Static_assert(sizeof(struct disk_journal) == BLOCK_SIZE, "journal ABI");
 _Static_assert(offsetof(struct disk_journal, checksum) == BLOCK_SIZE - 4,
 	       "journal checksum offset");
+_Static_assert(sizeof(struct disk_evict_batch) <=
+	       sizeof(((struct disk_journal *)0)->reserved),
+	       "eviction batch journal extension");
 
 static uint32_t crc32_ieee(const void *buffer, size_t length)
 {
@@ -129,6 +140,65 @@ int main(int argc, char **argv)
 	char *end;
 	int fd;
 
+	if (argc == 6 && !strcmp(argv[1], "prepare-batch")) {
+		struct disk_evict_batch *batch =
+			(void *)journal.reserved;
+		unsigned long count;
+		unsigned long cleared;
+		unsigned long i;
+
+		slot = strtoul(argv[3], &end, 10);
+		if (*end || slot > UINT32_MAX)
+			return EXIT_FAILURE;
+		count = strtoul(argv[4], &end, 10);
+		if (*end || count < 2 || count > EVICT_BATCH_MAX ||
+		    count - 1 > (unsigned long)UINT32_MAX - slot)
+			return EXIT_FAILURE;
+		cleared = strtoul(argv[5], &end, 10);
+		if (*end || cleared > count)
+			return EXIT_FAILURE;
+		fd = open(argv[2], O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			perror("open");
+			return EXIT_FAILURE;
+		}
+		journal.magic = htole64(JOURNAL_MAGIC);
+		journal.version = htole32(JOURNAL_VERSION);
+		journal.state = htole32(JOURNAL_PREPARED);
+		journal.sequence = htole64(UINT64_C(0x290000000) + slot);
+		journal.operation = htole32(JOURNAL_EVICT);
+		journal.slot = htole32((uint32_t)slot);
+		io_full(fd, &journal.old_entry, sizeof(journal.old_entry),
+			INDEX_OFFSET + (off_t)slot * sizeof(journal.old_entry), 0);
+		if (!memcmp(&journal.old_entry, &empty, sizeof(empty))) {
+			fprintf(stderr, "first batch slot is empty\n");
+			close(fd);
+			return EXIT_FAILURE;
+		}
+		batch->magic = htole32(EVICT_BATCH_MAGIC);
+		batch->count = htole32((uint32_t)count);
+		for (i = 0; i < count; i++)
+			batch->slots[i] = htole32((uint32_t)(slot + i));
+		journal.checksum = htole32(crc32_ieee(
+			&journal, offsetof(struct disk_journal, checksum)));
+		io_full(fd, &journal, sizeof(journal), JOURNAL_OFFSET, 1);
+		if (fsync(fd)) {
+			perror("fsync journal");
+			close(fd);
+			return EXIT_FAILURE;
+		}
+		for (i = 0; i < cleared; i++)
+			io_full(fd, &empty, sizeof(empty),
+				INDEX_OFFSET + (off_t)(slot + i) * sizeof(empty), 1);
+		if (fsync(fd)) {
+			perror("fsync partial batch");
+			close(fd);
+			return EXIT_FAILURE;
+		}
+		close(fd);
+		return EXIT_SUCCESS;
+	}
+
 	if (argc == 4 && !strcmp(argv[1], "check-zero")) {
 		slot = strtoul(argv[3], &end, 10);
 		if (*end)
@@ -148,8 +218,9 @@ int main(int argc, char **argv)
 	if (argc != 6 || strcmp(argv[1], "prepare")) {
 		fprintf(stderr,
 			"usage: %s prepare DEVICE OP SLOT before|after\n"
+			"       %s prepare-batch DEVICE FIRST_SLOT COUNT CLEARED\n"
 			"       %s check-zero DEVICE SLOT\n",
-			argv[0], argv[0]);
+			argv[0], argv[0], argv[0]);
 		return EXIT_FAILURE;
 	}
 	operation = parse_operation(argv[3]);

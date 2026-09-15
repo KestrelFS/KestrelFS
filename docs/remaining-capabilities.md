@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-15，Cursor（验收 Step 28；选定 Step 29 = CACHE-EVICT）
+> 最后更新：2026-09-15，Codex（Step 29 CACHE-EVICT 实现与自检完成，待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -25,7 +25,7 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–4 | … / CACHE-VFS | Step 24–28 | **ACCEPTED** | 正确性、运维、VFS 读路径最小闭环 |
-| 5 | CACHE-EVICT | Step 29 批量驱逐 / 热点保护 | **DECIDED** | 满盘连续 fill 的 metadata flush 成本仍高 |
+| 5 | CACHE-EVICT | Step 29 批量驱逐 / 热点保护 | **REVIEW** | 16-victim batch、index-page 合并写与崩溃恢复待验收 |
 | 6–8 | DIST-* / POSIX-CORE | 分布式与语义 | PROPOSED | 须 Cursor 明示 |
 | 9 | CACHE-COHERENCE | 多节点失效 | PROPOSED | 共享部署正确性 |
 | — | CACHE-WRITE | 写缓存 | **DEFERRED** | 默认只读 fill cache |
@@ -43,8 +43,10 @@ Codex **只实现 §8 当前提示词**。
 
 ### CACHE-EVICT — Step 29
 
-- 状态：`DECIDED`
-- 缺口：逐块同步 journal/index flush；热度不跨重启；无批量 victim 回收。
+- 状态：`REVIEW`
+- 实现：默认 16-victim batch journal；按 index page 合并清零；批量崩溃恢复；
+  单批最多总槽位 1/16 以保护 MRU 尾部。
+- 剩余限制：热度不跨重启；分散 victim 每页仍一次同步写；fill/invalidate 仍逐次 journal。
 - 范围：见 §8。
 
 ### CACHE-WRITE / COHERENCE
@@ -64,6 +66,8 @@ DIST-*、POSIX、OPS-CONFIG、TEST-PERF 仍为 `PROPOSED`。
 | 2026-09-15 | Codex | CACHE-VFS | 实现与自检 | **REVIEW** |
 | 2026-09-15 | Cursor | CACHE-VFS | Step 28 验收 | **ACCEPTED**；跨段 copy_to_iter 可接受 |
 | 2026-09-15 | Cursor | CACHE-EVICT | 选定 Step 29 | **DECIDED**；见 §8 |
+| 2026-09-15 | Codex | CACHE-EVICT | Step 29 开工 | **IMPLEMENTING**；仅执行 §8 |
+| 2026-09-15 | Codex | CACHE-EVICT | 实现与自检完成 | **REVIEW**；见 §9 |
 
 ## 7. 不应顺手扩大
 
@@ -114,6 +118,34 @@ write-back、多节点失效、Redis/S3 生产化、自动 wipe、真正异步 c
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-15 — Step 29 CACHE-EVICT（Codex REVIEW）
+
+- 方案：保持 IPC ABI v11 / cache format v4。`cache_evict_batch` 默认 16（合法 1–64），
+  实际单批最多总槽位 1/16；选择 LRU 头部，因此刚 touch 的 MRU 尾部不会被小批量
+  扫掉。一次 v4 PREPARED journal 在 reserved 前部记录整批 slot，同一 4 KiB index
+  page 上的清零合并成一次 read/modify/write/flush；journal 清零提交后才从
+  rhashtable/list/bitmap 释放槽位，随后 fill 才能复用。
+- 崩溃/并发不变量：合法半提交 batch journal 重载时清完整批为 miss；torn journal
+  CRC fail closed，index page 若波及非 victim 则 entry CRC fail closed。evict 全程持
+  cache rwsem 写侧，必须等待 pinned-page reader 的 BIO/CRC/unpin 完成，不会复用
+  DMA 中 slot。旧单-entry journal 继续兼容；离线 admin 已能识别 batch journal。
+- 可观测性：新增只读 `cache_eviction_batches`、`cache_eviction_batch_slots`、
+  `cache_eviction_index_writes`。专项小 cache 实测 16 victims 只产生 1 个合并 index
+  page write。
+- 测试：`cargo test` 137 passed；clippy `--all-targets -- -D warnings` 通过；
+  `make -C kestrelfs` 与 `make -C tools` 零警告。vng 专项输出
+  `STEP29_BATCH_EVICTION_PASS victims=16 index_writes=1`、
+  `STEP29_MRU_PROTECTION_PASS`、`STEP29_RELOAD_PASS`、
+  `STEP29_BATCH_RECOVERY_PASS`、`STEP29_CACHE_EVICT_PASS`（umount 253 ms）。
+  Step 28/27/26/25/24/23/22/21/20/19/15 回归均输出对应 PASS。
+- 测试波动：数次 vng 在 guest 脚本启动前 exit 255；一次 Step 25 guest daemon
+  重启出现 `Transport endpoint is not connected`。均未形成代码失败，立即完整重跑
+  后通过。全部 insmod/mount/cache 仅在 vng guest+loop，未触碰宿主机设备。
+- 风险/限制：batch 合并收益取决于 victim slot 是否落在相同 index page；分散时
+  仍按页同步写。LRU recency 仍不持久化且无租户/分区隔离；fill/invalidate 仍逐条
+  journal。未实现 write-back、多节点失效、Redis/S3 生产化、自动 wipe、真正异步
+  completion 或跨 iovec scatter-gather BIO。
 
 ### 2026-09-15 — Step 28 CACHE-VFS（Cursor ACCEPTED）
 

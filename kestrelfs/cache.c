@@ -10,6 +10,7 @@
  * intent-journal page: an interrupted index transaction is recovered to a
  * safe miss before the index is restored.  Step 26 lets cache-hit readers hold
  * a shared rwsem across their BIO, while mutations retain exclusive ownership.
+ * Step 29 batches LRU retirement and coalesces victim clears by index page.
  * Cache failures never replace the authoritative daemon/ObjectStore path.
  */
 
@@ -60,6 +61,10 @@
 	(KESTRELFS_CACHE_BLOCK_SIZE >> SECTOR_SHIFT)
 /* Bound GUP and BIO resources while still batching normal readahead-sized IO. */
 #define KESTRELFS_CACHE_DIRECT_MAX_BYTES	(128U * 1024U)
+#define KESTRELFS_CACHE_EVICT_BATCH_DEFAULT	16U
+#define KESTRELFS_CACHE_EVICT_BATCH_MAX	64U
+#define KESTRELFS_CACHE_EVICT_BATCH_FRACTION	16U
+#define KESTRELFS_CACHE_EVICT_BATCH_MAGIC	0x48435442U /* "BTCH" LE */
 
 struct kestrelfs_cache_disk_index_entry {
 	__le64 inode_id;
@@ -110,6 +115,13 @@ struct kestrelfs_cache_disk_journal {
 	__le32 checksum;
 };
 
+/* Optional v4 journal extension stored inside disk_journal.reserved. */
+struct kestrelfs_cache_disk_evict_batch {
+	__le32 magic;
+	__le32 count;
+	__le32 slots[KESTRELFS_CACHE_EVICT_BATCH_MAX];
+};
+
 static_assert(sizeof(struct kestrelfs_cache_disk_index_entry) == 32);
 static_assert(offsetof(struct kestrelfs_cache_disk_index_entry,
 		       entry_checksum) == 28);
@@ -126,6 +138,8 @@ static_assert(sizeof(struct kestrelfs_cache_disk_journal) ==
 static_assert(offsetof(struct kestrelfs_cache_disk_journal, old_entry) == 32);
 static_assert(offsetof(struct kestrelfs_cache_disk_journal, new_entry) == 64);
 static_assert(offsetof(struct kestrelfs_cache_disk_journal, checksum) == 4092);
+static_assert(sizeof(struct kestrelfs_cache_disk_evict_batch) <=
+	      sizeof(((struct kestrelfs_cache_disk_journal *)0)->reserved));
 static_assert(KESTRELFS_CACHE_SUPERBLOCK_SIZE <= PAGE_SIZE);
 
 struct kestrelfs_cache_index_key {
@@ -176,6 +190,11 @@ module_param(cache_parallel_reads, bool, 0444);
 MODULE_PARM_DESC(cache_parallel_reads,
 		 "allow cache-hit readers to issue BIOs concurrently (default Y)");
 
+static unsigned int cache_evict_batch = KESTRELFS_CACHE_EVICT_BATCH_DEFAULT;
+module_param(cache_evict_batch, uint, 0444);
+MODULE_PARM_DESC(cache_evict_batch,
+		 "LRU victims retired when a full cache needs space (1-64, default 16)");
+
 /* Read-only observability for vng correctness/performance tests. */
 static unsigned long kestrelfs_cache_direct_hit_blocks;
 module_param_named(cache_direct_hit_blocks,
@@ -199,6 +218,24 @@ static unsigned long kestrelfs_cache_evictions;
 module_param_named(cache_evictions, kestrelfs_cache_evictions, ulong, 0444);
 MODULE_PARM_DESC(cache_evictions,
 		 "cache blocks retired for slot reuse since module load");
+
+static unsigned long kestrelfs_cache_eviction_batches;
+module_param_named(cache_eviction_batches,
+		   kestrelfs_cache_eviction_batches, ulong, 0444);
+MODULE_PARM_DESC(cache_eviction_batches,
+		 "full-cache batch eviction transactions since module load");
+
+static unsigned long kestrelfs_cache_eviction_batch_slots;
+module_param_named(cache_eviction_batch_slots,
+		   kestrelfs_cache_eviction_batch_slots, ulong, 0444);
+MODULE_PARM_DESC(cache_eviction_batch_slots,
+		 "victim slots retired by batch eviction transactions");
+
+static unsigned long kestrelfs_cache_eviction_index_writes;
+module_param_named(cache_eviction_index_writes,
+		   kestrelfs_cache_eviction_index_writes, ulong, 0444);
+MODULE_PARM_DESC(cache_eviction_index_writes,
+		 "coalesced index-page writes issued by batch eviction");
 
 static unsigned long kestrelfs_cache_checksum_failures;
 module_param_named(cache_checksum_failures,
@@ -818,6 +855,89 @@ out:
 	return ret;
 }
 
+static void kestrelfs_cache_sort_slots(u32 *slots, u32 count)
+{
+	u32 i;
+
+	for (i = 1; i < count; i++) {
+		u32 slot = slots[i];
+		u32 pos = i;
+
+		while (pos && slots[pos - 1] > slot) {
+			slots[pos] = slots[pos - 1];
+			pos--;
+		}
+		slots[pos] = slot;
+	}
+}
+
+/*
+ * Clear several entries with one read/modify/write per affected 4 KiB index
+ * page. The caller has already persisted a journal covering every slot.
+ */
+static int kestrelfs_cache_clear_index_slots(u32 *slots, u32 count,
+					      unsigned long *page_writes)
+{
+	u64 byte_offset;
+	sector_t sector;
+	void *block;
+	u32 i = 0;
+	int ret = 0;
+
+	if (!count || count > KESTRELFS_CACHE_EVICT_BATCH_MAX)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		if (slots[i] >= kestrelfs_cache_index_capacity())
+			return -EINVAL;
+	}
+	kestrelfs_cache_sort_slots(slots, count);
+	block = kmalloc(KESTRELFS_CACHE_BLOCK_SIZE, GFP_KERNEL);
+	if (!block)
+		return -ENOMEM;
+
+	i = 0;
+	while (i < count) {
+		u32 first = i;
+
+		byte_offset = KESTRELFS_CACHE_INDEX_START_BYTES +
+			      (u64)slots[i] *
+			      sizeof(struct kestrelfs_cache_disk_index_entry);
+		sector = round_down(byte_offset,
+				    (u64)KESTRELFS_CACHE_BLOCK_SIZE) >>
+			 SECTOR_SHIFT;
+		ret = kestrelfs_cache_rw_block(block, sector, false);
+		if (ret)
+			break;
+		while (i < count) {
+			u64 current_offset = KESTRELFS_CACHE_INDEX_START_BYTES +
+				(u64)slots[i] *
+				sizeof(struct kestrelfs_cache_disk_index_entry);
+			sector_t current_sector = round_down(
+				current_offset,
+				(u64)KESTRELFS_CACHE_BLOCK_SIZE) >> SECTOR_SHIFT;
+
+			if (current_sector != sector)
+				break;
+			memset((u8 *)block +
+			       current_offset % KESTRELFS_CACHE_BLOCK_SIZE,
+			       0, sizeof(struct kestrelfs_cache_disk_index_entry));
+			i++;
+		}
+		ret = kestrelfs_cache_rw_block(block, sector, true);
+		if (ret)
+			break;
+		if (page_writes)
+			(*page_writes)++;
+		if (WARN_ON_ONCE(i == first)) {
+			ret = -EIO;
+			break;
+		}
+	}
+
+	kfree(block);
+	return ret;
+}
+
 static bool kestrelfs_cache_disk_entry_empty(
 	const struct kestrelfs_cache_disk_index_entry *disk)
 {
@@ -863,6 +983,63 @@ static const char *kestrelfs_cache_journal_operation_name(u32 operation)
 	}
 }
 
+static bool kestrelfs_cache_journal_batch_valid(
+	const struct kestrelfs_cache_disk_journal *journal)
+{
+	const struct kestrelfs_cache_disk_evict_batch *batch =
+		(const void *)journal->reserved;
+	u32 operation = le32_to_cpu(journal->operation);
+	u32 count;
+	u32 i;
+	u32 j;
+
+	if (!memchr_inv(journal->reserved, 0, sizeof(journal->reserved)))
+		return true;
+	if (operation != KESTRELFS_CACHE_JOURNAL_EVICT ||
+	    le32_to_cpu(batch->magic) != KESTRELFS_CACHE_EVICT_BATCH_MAGIC)
+		return false;
+	count = le32_to_cpu(batch->count);
+	if (count < 2 || count > KESTRELFS_CACHE_EVICT_BATCH_MAX ||
+	    le32_to_cpu(batch->slots[0]) != le32_to_cpu(journal->slot))
+		return false;
+	for (i = 0; i < count; i++) {
+		u32 slot = le32_to_cpu(batch->slots[i]);
+
+		if (slot >= kestrelfs_cache_slot_count)
+			return false;
+		for (j = 0; j < i; j++) {
+			if (slot == le32_to_cpu(batch->slots[j]))
+				return false;
+		}
+	}
+	for (; i < KESTRELFS_CACHE_EVICT_BATCH_MAX; i++) {
+		if (batch->slots[i])
+			return false;
+	}
+	return !memchr_inv(journal->reserved + sizeof(*batch), 0,
+			   sizeof(journal->reserved) - sizeof(*batch));
+}
+
+static u32 kestrelfs_cache_journal_slots(
+	const struct kestrelfs_cache_disk_journal *journal,
+	u32 slots[KESTRELFS_CACHE_EVICT_BATCH_MAX])
+{
+	const struct kestrelfs_cache_disk_evict_batch *batch =
+		(const void *)journal->reserved;
+	u32 count = 1;
+	u32 i;
+
+	if (le32_to_cpu(batch->magic) == KESTRELFS_CACHE_EVICT_BATCH_MAGIC)
+		count = le32_to_cpu(batch->count);
+	if (count == 1) {
+		slots[0] = le32_to_cpu(journal->slot);
+		return count;
+	}
+	for (i = 0; i < count; i++)
+		slots[i] = le32_to_cpu(batch->slots[i]);
+	return count;
+}
+
 static bool kestrelfs_cache_journal_valid(
 	const struct kestrelfs_cache_disk_journal *journal)
 {
@@ -882,6 +1059,7 @@ static bool kestrelfs_cache_journal_valid(
 	       (fill || removal) &&
 	       le32_to_cpu(journal->checksum) ==
 			kestrelfs_cache_journal_checksum(journal) &&
+	       kestrelfs_cache_journal_batch_valid(journal) &&
 	       ((fill &&
 		 kestrelfs_cache_disk_entry_empty(&journal->old_entry) &&
 		 kestrelfs_cache_disk_entry_valid(&journal->new_entry)) ||
@@ -917,6 +1095,54 @@ static int kestrelfs_cache_journal_begin(
 		kestrelfs_cache_journal_checksum(journal));
 
 	/* A failed write may still be partial; block later transactions. */
+	kestrelfs_cache_journal_active = true;
+	ret = kestrelfs_cache_rw_block(journal,
+				       KESTRELFS_CACHE_JOURNAL_START_LBA, true);
+	kfree(journal);
+	return ret;
+}
+
+static int kestrelfs_cache_journal_begin_evict_batch(
+	struct kestrelfs_cache_index_entry **victims, u32 count)
+{
+	struct kestrelfs_cache_disk_evict_batch *batch;
+	struct kestrelfs_cache_disk_journal *journal;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
+	u32 i;
+	int ret;
+
+	if (!count || count > KESTRELFS_CACHE_EVICT_BATCH_MAX)
+		return -EINVAL;
+	if (count == 1) {
+		struct kestrelfs_cache_disk_index_entry old_entry;
+
+		kestrelfs_cache_entry_to_disk(victims[0], &old_entry);
+		return kestrelfs_cache_journal_begin(
+			KESTRELFS_CACHE_JOURNAL_EVICT, victims[0]->slot,
+			&old_entry, &empty);
+	}
+	if (kestrelfs_cache_journal_active)
+		return -EIO;
+	journal = kzalloc(sizeof(*journal), GFP_KERNEL);
+	if (!journal)
+		return -ENOMEM;
+	if (!++kestrelfs_cache_journal_sequence)
+		kestrelfs_cache_journal_sequence = 1;
+	journal->magic = cpu_to_le64(KESTRELFS_CACHE_JOURNAL_MAGIC);
+	journal->version = cpu_to_le32(KESTRELFS_CACHE_JOURNAL_VERSION);
+	journal->state = cpu_to_le32(KESTRELFS_CACHE_JOURNAL_PREPARED);
+	journal->sequence = cpu_to_le64(kestrelfs_cache_journal_sequence);
+	journal->operation = cpu_to_le32(KESTRELFS_CACHE_JOURNAL_EVICT);
+	journal->slot = cpu_to_le32(victims[0]->slot);
+	kestrelfs_cache_entry_to_disk(victims[0], &journal->old_entry);
+	batch = (void *)journal->reserved;
+	batch->magic = cpu_to_le32(KESTRELFS_CACHE_EVICT_BATCH_MAGIC);
+	batch->count = cpu_to_le32(count);
+	for (i = 0; i < count; i++)
+		batch->slots[i] = cpu_to_le32(victims[i]->slot);
+	journal->checksum = cpu_to_le32(
+		kestrelfs_cache_journal_checksum(journal));
+
 	kestrelfs_cache_journal_active = true;
 	ret = kestrelfs_cache_rw_block(journal,
 				       KESTRELFS_CACHE_JOURNAL_START_LBA, true);
@@ -960,9 +1186,10 @@ static int kestrelfs_cache_journal_replace(
 static int kestrelfs_cache_recover_journal(void)
 {
 	struct kestrelfs_cache_disk_journal *journal;
-	struct kestrelfs_cache_disk_index_entry empty = { 0 };
+	u32 slots[KESTRELFS_CACHE_EVICT_BATCH_MAX];
 	u64 sequence;
 	u32 operation;
+	u32 count;
 	u32 slot;
 	int ret;
 
@@ -987,21 +1214,22 @@ static int kestrelfs_cache_recover_journal(void)
 	sequence = le64_to_cpu(journal->sequence);
 	operation = le32_to_cpu(journal->operation);
 	slot = le32_to_cpu(journal->slot);
+	count = kestrelfs_cache_journal_slots(journal, slots);
 	kestrelfs_cache_journal_sequence =
 		max(kestrelfs_cache_journal_sequence, sequence);
 	kestrelfs_cache_journal_active = true;
 
 	/* PREPARED is intentionally recovered to an empty slot, never replayed. */
-	ret = kestrelfs_cache_rw_index_entry(slot, &empty, true);
+	ret = kestrelfs_cache_clear_index_slots(slots, count, NULL);
 	if (ret)
 		goto out;
 	ret = kestrelfs_cache_journal_clear();
 	if (ret)
 		goto out;
 	kestrelfs_cache_journal_recoveries++;
-	pr_info("kestrelfs: recovered incomplete cache %s transaction sequence=%llu slot=%u to miss\n",
+	pr_info("kestrelfs: recovered incomplete cache %s transaction sequence=%llu slot=%u count=%u to miss\n",
 		kestrelfs_cache_journal_operation_name(operation),
-		(unsigned long long)sequence, slot);
+		(unsigned long long)sequence, slot, count);
 out:
 	kfree(journal);
 	return ret;
@@ -1209,41 +1437,77 @@ static void kestrelfs_cache_retire_corrupt(u64 inode_id, u64 file_offset,
 }
 
 /*
- * Retire the least-recently-used entry before its data slot is overwritten.
- * Clearing and flushing the persistent index first is the key invariant: a
- * crash can lose the replacement, but can never restore the evicted key after
- * its data block has been reused.
+ * Retire several LRU entries before any data slot is overwritten. One durable
+ * journal names the whole batch, then victim clears are coalesced by 4 KiB
+ * index page. Only after the journal commit are slots exposed as free. A crash
+ * can therefore lose later fills, but cannot restore a key whose slot was
+ * reused. The cache write lock also waits for every pinned-page reader before
+ * this function can select or recycle a victim.
  */
-static int kestrelfs_cache_evict_lru(unsigned long *reclaimed_slot)
+static int kestrelfs_cache_evict_lru_batch(unsigned long *reclaimed_slot)
 {
-	struct kestrelfs_cache_disk_index_entry old_entry;
-	struct kestrelfs_cache_disk_index_entry empty = { 0 };
+	struct kestrelfs_cache_index_entry *victims[
+		KESTRELFS_CACHE_EVICT_BATCH_MAX];
 	struct kestrelfs_cache_index_entry *victim;
+	u32 slots[KESTRELFS_CACHE_EVICT_BATCH_MAX];
+	u32 max_batch;
+	u32 count = 0;
+	u32 removed = 0;
+	u32 i;
+	unsigned long page_writes = 0;
+	int first_remove_error = 0;
 	int ret;
 
 	if (list_empty(&kestrelfs_cache_entries))
 		return -ENOSPC;
-	victim = list_first_entry(&kestrelfs_cache_entries,
-				  struct kestrelfs_cache_index_entry, list);
+	max_batch = clamp_t(u32, cache_evict_batch, 1,
+			    KESTRELFS_CACHE_EVICT_BATCH_MAX);
+	max_batch = min(max_batch,
+			max_t(u32, kestrelfs_cache_slot_count /
+				      KESTRELFS_CACHE_EVICT_BATCH_FRACTION, 1));
+	list_for_each_entry(victim, &kestrelfs_cache_entries, list) {
+		victims[count] = victim;
+		slots[count] = victim->slot;
+		if (++count == max_batch)
+			break;
+	}
 
-	kestrelfs_cache_entry_to_disk(victim, &old_entry);
-	ret = kestrelfs_cache_journal_replace(
-		KESTRELFS_CACHE_JOURNAL_EVICT, victim->slot, &old_entry, &empty);
+	ret = kestrelfs_cache_journal_begin_evict_batch(victims, count);
 	if (ret)
 		return ret;
-	ret = rhashtable_remove_fast(&kestrelfs_cache_index, &victim->node,
-				     kestrelfs_cache_index_params);
-	if (ret) {
-		pr_err("kestrelfs: failed to remove evicted cache key: %d\n",
-		       ret);
+	ret = kestrelfs_cache_clear_index_slots(slots, count, &page_writes);
+	if (ret)
 		return ret;
+	ret = kestrelfs_cache_journal_clear();
+	if (ret)
+		return ret;
+
+	for (i = 0; i < count; i++) {
+		victim = victims[i];
+		ret = rhashtable_remove_fast(&kestrelfs_cache_index,
+					     &victim->node,
+					     kestrelfs_cache_index_params);
+		if (ret) {
+			pr_err("kestrelfs: failed to remove batch-evicted cache key: %d\n",
+			       ret);
+			if (!first_remove_error)
+				first_remove_error = ret;
+			continue;
+		}
+		victim->hashed = false;
+		if (!removed)
+			*reclaimed_slot = victim->slot;
+		__clear_bit(victim->slot, kestrelfs_cache_slots);
+		list_del(&victim->list);
+		kfree(victim);
+		removed++;
 	}
-	victim->hashed = false;
-	*reclaimed_slot = victim->slot;
-	__clear_bit(victim->slot, kestrelfs_cache_slots);
-	list_del(&victim->list);
-	kfree(victim);
-	kestrelfs_cache_evictions++;
+	if (!removed)
+		return first_remove_error ?: -EIO;
+	kestrelfs_cache_evictions += removed;
+	kestrelfs_cache_eviction_batches++;
+	kestrelfs_cache_eviction_batch_slots += removed;
+	kestrelfs_cache_eviction_index_writes += page_writes;
 	return 0;
 }
 
@@ -1272,7 +1536,7 @@ static int kestrelfs_cache_fill_block(u64 inode_id, u64 file_offset,
 	slot = find_first_zero_bit(kestrelfs_cache_slots,
 				   kestrelfs_cache_slot_count);
 	if (slot >= kestrelfs_cache_slot_count) {
-		ret = kestrelfs_cache_evict_lru(&slot);
+		ret = kestrelfs_cache_evict_lru_batch(&slot);
 		if (ret)
 			goto out;
 	}
@@ -1599,10 +1863,19 @@ int kestrelfs_cache_init(void)
 		pr_info("kestrelfs: NVMe cache disabled (no cache_device)\n");
 		return 0;
 	}
+	if (!cache_evict_batch ||
+	    cache_evict_batch > KESTRELFS_CACHE_EVICT_BATCH_MAX) {
+		pr_err("kestrelfs: cache_evict_batch must be between 1 and %u\n",
+		       KESTRELFS_CACHE_EVICT_BATCH_MAX);
+		return -EINVAL;
+	}
 	kestrelfs_cache_direct_hit_blocks = 0;
 	kestrelfs_cache_copy_hit_blocks = 0;
 	kestrelfs_cache_direct_fallbacks = 0;
 	kestrelfs_cache_evictions = 0;
+	kestrelfs_cache_eviction_batches = 0;
+	kestrelfs_cache_eviction_batch_slots = 0;
+	kestrelfs_cache_eviction_index_writes = 0;
 	kestrelfs_cache_checksum_failures = 0;
 	kestrelfs_cache_journal_recoveries = 0;
 	kestrelfs_cache_active_hit_readers = 0;
@@ -1651,11 +1924,14 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	down_write(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu eviction_batches=%lu eviction_batch_slots=%lu eviction_index_writes=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
 		kestrelfs_cache_evictions,
+		kestrelfs_cache_eviction_batches,
+		kestrelfs_cache_eviction_batch_slots,
+		kestrelfs_cache_eviction_index_writes,
 		kestrelfs_cache_checksum_failures,
 		kestrelfs_cache_journal_recoveries,
 		kestrelfs_cache_parallel_hit_peak);

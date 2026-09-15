@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–28）
+## 当前边界（Step 18–29）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -72,6 +72,14 @@ partial/unaligned、kernel-backed iter 或 pin/BIO 构造失败时，读取完�
 并经 `copy_to_iter` 分发。READ_DATA miss 也用 `copy_to_iter` 写入同一 iterator。
 IPC ABI 仍为 v11，cache format 仍为 v4。
 
+Step 29 在 format v4 journal 的保留区加入向后安全的 batch-evict 扩展：cache
+首次满盘时默认选择 16 个 LRU 头（且单批最多为总槽位的 1/16），一份 PREPARED
+journal 记录整批 slot，再把同一 4 KiB index page 上的多个清零合并成一次
+read/modify/write/flush。journal 提交后才从内存 hash/LRU/bitmap 释放槽位，随后一次
+fill 使用其中一个，其余供连续 fill 直接使用。LRU 尾部的近期热点不会进入小批量
+victim 集合；rwsem 写侧仍等待 pinned-page reader 完成。IPC ABI v11、superblock、
+index entry 和 cache format v4 均未改变。
+
 ## 缓存设备
 
 缓存后端必须是 Linux 块设备节点，例如：
@@ -132,6 +140,12 @@ dataset 时必须使用不同 digest。
 `cache_direct_fallbacks`、`cache_evictions`、`cache_checksum_failures` 和
 `cache_journal_recoveries` 可从 sysfs 读取；它们不是稳定用户 ABI。
 
+`cache_evict_batch` 默认为 16，合法范围 1–64；实际单批还限制为总槽位的 1/16
+（至少 1），避免小 cache 被一次扫空。`cache_eviction_batches`、
+`cache_eviction_batch_slots` 和 `cache_eviction_index_writes` 分别观测批次数、已退休
+victim 数和合并后的 index-page 写次数，同样不是稳定用户 ABI。设为 1 可退回
+Step 23 的单 victim 行为。
+
 `cache_parallel_reads` 默认为 1；设为 0 会让 hit 也取得写侧，用于同一 build 的
 串行/并行 A/B，不改变盘上格式。另有只读观测值 `cache_active_hit_readers` 与
 `cache_parallel_hit_peak`，分别表示当前和本次加载以来的峰值 hit reader 数；它们
@@ -174,7 +188,10 @@ entry_crc32:u32` 组成；entry CRC 覆盖其前 28 字节，全零条目表示�
 
 journal 页布局也是 little-endian：`magic:u64("KFSJOURN") + version:u32(1) +
 state:u32(PREPARED) + sequence:u64 + operation:u32 + slot:u32 + old_entry:32B +
-new_entry:32B + reserved + crc32:u32`。CRC 覆盖前 4092 字节，reserved 必须全零；
+new_entry:32B + reserved + crc32:u32`。CRC 覆盖前 4092 字节。一般事务的 reserved
+必须全零；Step 29 的多 victim evict 可在其前部编码
+`magic:u32("BTCH") + count:u32 + slots[count]:u32[]`，未使用部分仍必须全零，count
+范围 2–64 且 slot 不得重复；单 victim evict 继续使用全零 reserved。
 fill 要求 old 为空/new 有效，invalidate、evict、retire-corrupt 要求 old 有效/new
 为空。全零页表示当前无事务。单页足够是因为所有 cache metadata mutation 都取得
 `kestrelfs_cache_lock` 写侧，任一时刻最多一个事务；并行 hit 只持有读侧，不能修改
@@ -243,11 +260,13 @@ miss 时 daemon 仍通过 `READ_DATA` 把远端数据放入 bounce。fill 对 EO
 计算完整 4 KiB data CRC，然后按 `PREPARED journal → data block → index entry →
 zero journal` 的顺序逐步写入并 flush；journal 清零成功是持久化提交点，之后才把
 entry 发布到内存 bitmap/LRU。非对齐 read 的首个 partial block 不填充；EOF
-尾块补零后可填充。填充失败不影响已经成功的远端读取。cache 满时 Step 23 回收
-LRU 头部；Step 25 将该清除包进 `PREPARED journal → zero index → zero journal`，
-成功后才从 rhashtable/list/bitmap 移除并允许 slot 复用。随后的 replacement fill
-是独立事务。任一步骤失败最多保留旧 entry、留下未索引空槽或在恢复时产生 miss，
-不会恢复旧 key 后读取新 key 的字节。
+尾块补零后可填充。填充失败不影响已经成功的远端读取。cache 满时 Step 29 批量
+选择 LRU 头部，并执行 `batch PREPARED journal → 按 index page 合并 zero entries →
+zero journal`；成功后才从 rhashtable/list/bitmap 移除整批并允许 slot 复用。随后的
+replacement fill 是独立事务。合法的半提交 batch journal 会在重载时再次清空整批
+slot；若某个 index page torn 并波及无关 entry，其 entry CRC 会使设备 fail closed。
+任一步骤失败最多保留旧 entry、留下未索引空槽或在恢复时产生 miss，不会恢复旧
+key 后读取新 key 的字节。
 
 所有可能改变或删除文件字节的操作都在 daemon mutation 之前同步清空该 inode
 的全部索引（保守失效，尚未缩小到范围）：
@@ -279,8 +298,11 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
 - hit data BIO 失败退化为远端 miss；fill 失败忽略。初始化时 superblock/index
   恢复不确定则 fail closed，不让该设备以可疑索引继续加载。
 - 失效写失败会拒绝 mutation；这是“宁可写失败、不可脏命中”的选择。
-- Step 23 是 block 粒度、单锁内存 LRU；重启后只恢复 generation insertion order，
-  不持久化精确 hit recency，也没有分区配额、热点保护或批量 metadata 回收。
+- Step 29 是 block 粒度、单锁内存 LRU 的小批量回收；重启后仍只恢复 generation
+  insertion order，不持久化精确 hit recency，也没有分区配额或租户级热点隔离。
+  batch 可减少连续满盘 fill 的 eviction transaction 与 index-page flush 数，但 fill
+  自身及 invalidate 仍各自使用同步 journal；victim 分散到多个 index page 时每页
+  仍需一次同步写。
 - v4 的逐 data block CRC 可局部退休坏数据，index entry CRC 在恢复时 fail closed；
   superblock 和单页 journal 也有 CRC。合法 `PREPARED` 总是恢复为清空 slot 的
   安全 miss；torn journal/superblock 拒绝设备。CRC32 不是密码学完整性保护，仍
@@ -421,3 +443,22 @@ cache。2026-09-15 自检输出 `STEP28_IOVEC_PASS`、`STEP28_UNALIGNED_PASS`、
 `STEP28_EOF_PASS`、`STEP28_DAEMON_FREE_HIT_PASS direct_delta=3 copy_delta=5`、
 `STEP28_CACHE_VFS_PASS`，umount 83 ms。Step 27/26/25/24/23/22/21/20/19/15
 回归均通过；所有 cache/mount 操作只在 vng guest+loop 执行。
+
+## Step 29 批量驱逐验证
+
+`test-step29-cache-evict-vng.sh` 在 vng guest+loop 中以 `cache_size_mib=3` 建立
+256 个 data slot，并显式传 `cache_evict_batch=16`。脚本用 1 MiB 文件 A 填满
+cache，命中 A[0] 将其移到 MRU 尾部，再读取 16-block 文件 B。它要求一次 batch
+事务退休 16 个 victim，且这些连续 slot 的清零合并为一次 index-page 写；对应
+sysfs 断言为 `cache_evictions=16`、`cache_eviction_batches=1`、
+`cache_eviction_batch_slots=16`、`cache_eviction_index_writes=1`。
+
+随后脚本停止 daemon，验证 B 与 MRU A[0]/A 尾块仍命中、旧 LRU A[1] 已 miss；
+rmmod/insmod 后再次停止 daemon，重复新数据 hit 与旧 victim miss，并确认恢复
+256 个 entry。脚本再离线构造 16-victim PREPARED journal、仅清 8 个 index，要求
+admin 报告 `journal_batch_count=16` / recovery-required；模块恢复整批为 miss，未涉及
+热点仍命中。2026-09-15 工作树自检输出 `STEP29_BATCH_EVICTION_PASS`、
+`STEP29_MRU_PROTECTION_PASS`、`STEP29_RELOAD_PASS`、
+`STEP29_BATCH_RECOVERY_PASS`、`STEP29_CACHE_EVICT_PASS`，umount 253 ms。全部模块、挂载和 cache_device 操作只在
+vng guest 内执行；脚本显式 insmod、使用 loop、合法 namespace、独立 data-dir，
+并保留 daemon.log。

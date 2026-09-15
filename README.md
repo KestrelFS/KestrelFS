@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Phase 4 Step 27 已验收；Step 28 `read_iter` / iov_iter 缓存读待 Cursor 验收；IPC ABI v11；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Phase 4 Step 28 已验收；Step 29 批量 cache eviction 待 Cursor 验收；IPC ABI v11；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据原型、`LocalFsObjectStore`、
@@ -26,9 +26,10 @@
 > miss 填充、同步内核 BIO 命中、rewrite/truncate/unlink/rename-overwrite 失效、
 > namespace SHA-256 绑定、对齐连续 hit 直达 pinned user pages、满盘 block-LRU、
 > data/index CRC32、v4 单页 intent journal（半提交恢复为安全 miss），以及多个
-> cache-hit 调用者并行等待同步 BIO，以及 Step 27 离线只读诊断/双确认 metadata
-> wipe。Step 28 待验收工作树把动态文件切到 `read_iter`，让 read/pread/readv/preadv
-> 共用 iov_iter cache/miss 路径；真正的异步 completion 流水线与多节点失效尚未实现。
+> cache-hit 调用者并行等待同步 BIO、Step 27 离线只读诊断/双确认 metadata wipe，
+> 以及 Step 28 `read_iter` / iov_iter 读路径。Step 29 待验收工作树一次 journal 可
+> 退休一批 LRU victim，并按 index page 合并清零，降低满盘连续 fill 的 metadata
+> flush 次数；真正的异步 completion 流水线与多节点失效尚未实现。
 > 详见[路线图](#路线图)、`HANDOFF.md` 与
 > `docs/remaining-capabilities.md`。
 
@@ -95,10 +96,11 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
 **数据面（内核，C）。** 树外 Linux 内核模块：
 
 - 注册 VFS 文件系统类型，实现挂载与文件服务所需的 inode/dentry/file 操作。
-- 拥有本地 NVMe SSD 缓存边界。Step 20–28：索引持久化、miss 填充、namespace
+- 拥有本地 NVMe SSD 缓存边界。Step 20–29：索引持久化、miss 填充、namespace
   校验、对齐 hit 直达用户页、LRU 回收、CRC 校验、v4 intent journal，以及共享
   读锁下的并行同步 BIO 命中；离线工具可 inspect 并在双确认后重置 metadata；
-  `read_iter` 让普通和 vectored read 共用结构化 iov 路径。
+  `read_iter` 让普通和 vectored read 共用结构化 iov 路径；满盘时可批量退休 LRU
+  victim 并合并同一 index page 的清零写。
   详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
 - 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
@@ -126,7 +128,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 27 已验收；Step 28 CACHE-VFS 待 Cursor 验收（format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 28 已验收；Step 29 CACHE-EVICT 待 Cursor 验收（format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -146,7 +148,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
 ├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
-├── test-step19-cache-vng.sh … test-step28-cache-vfs-vng.sh
+├── test-step19-cache-vng.sh … test-step29-cache-evict-vng.sh
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -405,8 +407,9 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名（ABI v11）。仍缺�
 - Redis 元数据仍是单 key 全量快照原型；S3 delete 失败同样可泄漏。
 - Phase 4 仍是单节点原型：v4 绑定 namespace；CRC32 非密码学；半提交可安全
   miss，但无双 superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO
-  仍同步等待，mutation 会等待在途 reader；无多节点远端失效；journal 为每次
-  index 变更增加 prepare/clear flush 成本。
+  仍同步等待，mutation 会等待在途 reader；无多节点远端失效。Step 29 可用一次
+  journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
+  prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 28 已覆盖 read/pread/readv/preadv；pinned BIO 只在单个当前 iovec 段内合并，
   跨段或非对齐范围仍用 `copy_to_iter`。尚无 page-cache/readahead/splice 全覆盖。
 - Step 27 wipe 只清零前 2 MiB cache metadata，让旧 data slot 不再可寻址；它不是

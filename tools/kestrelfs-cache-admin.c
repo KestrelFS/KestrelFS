@@ -28,6 +28,8 @@
 #define CACHE_INDEX_OFFSET (2U * CACHE_BLOCK_SIZE)
 #define CACHE_INDEX_CAPACITY ((CACHE_METADATA_BYTES - CACHE_INDEX_OFFSET) / 32U)
 #define CACHE_DATA_START_LBA (CACHE_METADATA_BYTES / CACHE_SECTOR_SIZE)
+#define EVICT_BATCH_MAGIC UINT32_C(0x48435442)
+#define EVICT_BATCH_MAX 64U
 #define WIPE_CONFIRM_ENV "KESTRELFS_CACHE_WIPE_CONFIRM"
 #define WIPE_CONFIRM_FLAG "--yes-really-wipe"
 
@@ -80,6 +82,12 @@ struct disk_journal {
 	uint32_t checksum;
 };
 
+struct disk_evict_batch {
+	uint32_t magic;
+	uint32_t count;
+	uint32_t slots[EVICT_BATCH_MAX];
+};
+
 struct cache_key {
 	uint64_t inode_id;
 	uint64_t file_offset;
@@ -110,6 +118,9 @@ _Static_assert(offsetof(struct disk_journal, new_entry) == 64,
 	       "journal new entry offset");
 _Static_assert(offsetof(struct disk_journal, checksum) == 4092,
 	       "journal checksum offset");
+_Static_assert(sizeof(struct disk_evict_batch) <=
+	       sizeof(((struct disk_journal *)0)->reserved),
+	       "eviction batch journal extension");
 
 static uint32_t crc32_ieee(const void *buffer, size_t length)
 {
@@ -318,11 +329,42 @@ static const char *journal_operation_name(uint32_t operation)
 static int journal_layout_ok(const struct disk_journal *journal,
 			     uint64_t slot_count)
 {
+	const struct disk_evict_batch *batch =
+		(const void *)journal->reserved;
 	uint32_t operation = le32toh(journal->operation);
+	uint32_t batch_count = 1;
+	uint32_t i;
+	uint32_t j;
 	int fill = operation == JOURNAL_FILL;
 	int removal = operation == JOURNAL_INVALIDATE ||
 		      operation == JOURNAL_EVICT ||
 		      operation == JOURNAL_RETIRE_CORRUPT;
+	int batch_ok = all_zero(journal->reserved, sizeof(journal->reserved));
+
+	if (!batch_ok && operation == JOURNAL_EVICT &&
+	    le32toh(batch->magic) == EVICT_BATCH_MAGIC) {
+		batch_count = le32toh(batch->count);
+		batch_ok = batch_count >= 2 && batch_count <= EVICT_BATCH_MAX &&
+			   le32toh(batch->slots[0]) == le32toh(journal->slot);
+		for (i = 0; batch_ok && i < batch_count; i++) {
+			uint32_t slot = le32toh(batch->slots[i]);
+
+			if (slot >= slot_count)
+				batch_ok = 0;
+			for (j = 0; batch_ok && j < i; j++) {
+				if (slot == le32toh(batch->slots[j]))
+					batch_ok = 0;
+			}
+		}
+		for (; batch_ok && i < EVICT_BATCH_MAX; i++) {
+			if (batch->slots[i])
+				batch_ok = 0;
+		}
+		if (batch_ok)
+			batch_ok = all_zero(journal->reserved + sizeof(*batch),
+					    sizeof(journal->reserved) -
+					    sizeof(*batch));
+	}
 
 	return le64toh(journal->magic) == JOURNAL_MAGIC &&
 	       le32toh(journal->version) == JOURNAL_VERSION &&
@@ -330,7 +372,7 @@ static int journal_layout_ok(const struct disk_journal *journal,
 	       le64toh(journal->sequence) &&
 	       le32toh(journal->slot) < slot_count &&
 	       (fill || removal) &&
-	       all_zero(journal->reserved, sizeof(journal->reserved)) &&
+	       batch_ok &&
 	       ((fill && index_entry_empty(&journal->old_entry) &&
 		 index_entry_layout_ok(&journal->new_entry) &&
 		 index_entry_crc_ok(&journal->new_entry)) ||
@@ -520,6 +562,11 @@ static int inspect_device(const char *path)
 		printf("journal_operation=%s\n",
 		       journal_operation_name(le32toh(journal.operation)));
 		printf("journal_slot=%" PRIu32 "\n", le32toh(journal.slot));
+		if (le32toh(((struct disk_evict_batch *)(void *)journal.reserved)->magic) ==
+		    EVICT_BATCH_MAGIC)
+			printf("journal_batch_count=%" PRIu32 "\n",
+			       le32toh(((struct disk_evict_batch *)(void *)
+				journal.reserved)->count));
 	}
 
 	if (inspect_index(fd, slot_count, &index)) {
