@@ -121,6 +121,8 @@ pub const S_IFDIR: FileMode = 0o040000;
 pub const S_IFREG: FileMode = 0o100000;
 /// `S_IFLNK` from `<linux/stat.h>` - symbolic-link file type bits.
 pub const S_IFLNK: FileMode = 0o120000;
+/// Permission and special mode bits accepted from create/mkdir callers.
+pub const MODE_PERMISSIONS_MASK: FileMode = 0o7777;
 
 /// Maximum UTF-8 byte length stored for a symbolic-link target. This mirrors
 /// the ABI limit and leaves one byte for the NUL terminator returned to VFS.
@@ -155,10 +157,8 @@ pub struct Inode {
     pub uid: u32,
     /// Owning group ID.
     pub gid: u32,
-    /// Hard link count. Always `1` for regular files in this
-    /// bootstrap model (no hard link support yet); `2` is the POSIX
-    /// convention for an otherwise-empty directory (`.` and the
-    /// parent's entry pointing back at it).
+    /// Persistent link count. Non-directories count hard-link dirents;
+    /// directories use the POSIX convention `2 + immediate subdirectories`.
     pub nlink: u32,
     /// Last modification time, Unix epoch seconds. Deliberately a
     /// single timestamp (no separate `atime`/`ctime`) for this
@@ -184,10 +184,16 @@ impl Inode {
 
     /// Builds a regular file's `Inode`.
     pub fn new_file(inode_id: u64, size: u64, mtime: u64) -> Self {
+        Self::new_file_with_mode(inode_id, size, mtime, 0o644)
+    }
+
+    /// Builds a regular file while forcing the file type independently from
+    /// the caller-supplied permission/special bits.
+    pub fn new_file_with_mode(inode_id: u64, size: u64, mtime: u64, mode: FileMode) -> Self {
         Inode {
             inode_id,
             size,
-            mode: S_IFREG | 0o644,
+            mode: S_IFREG | (mode & MODE_PERMISSIONS_MASK),
             uid: 0,
             gid: 0,
             nlink: 1,
@@ -195,11 +201,13 @@ impl Inode {
         }
     }
 
-    pub fn new_dir(inode_id: u64, mtime: u64) -> Self {
+    /// Builds a directory while forcing the directory type independently from
+    /// the caller-supplied permission/special bits.
+    pub fn new_dir_with_mode(inode_id: u64, mtime: u64, mode: FileMode) -> Self {
         Inode {
             inode_id,
             size: 0,
-            mode: S_IFDIR | 0o755,
+            mode: S_IFDIR | (mode & MODE_PERMISSIONS_MASK),
             uid: 0,
             gid: 0,
             nlink: 2,

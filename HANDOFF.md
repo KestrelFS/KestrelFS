@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 33 POSIX-RENAME（`RENAME_NOREPLACE`）已由 Cursor 验收并纳入本提交（IPC ABI v13、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 34 POSIX-ATTR（create/mkdir mode + 目录 nlink）已由 Cursor 验收并纳入本提交（IPC ABI v13、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 33 `RENAME_NOREPLACE` 已验收；下一步 Step 34 = POSIX-ATTR（见 remaining-capabilities §8） |
+| 当前阶段 | Step 34 POSIX-ATTR 已验收；下一步 Step 35 = CACHE-COHERENCE（见 remaining-capabilities §8） |
 
 ---
 
@@ -121,6 +121,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step32-posix-core-vng.sh # Step 32 硬链接/重启/nlink/末引用 GC 回归
 ├── test-step33-posix-rename-vng.sh # Step 33 RENAME_NOREPLACE / EEXIST 原子性
 ├── test-step33-renameat2.c       # renameat2 小助手（供 Step 33 vng 使用）
+├── test-step34-posix-attr-vng.sh # Step 34 mode/目录 nlink/重启恢复回归
+├── test-step34-posix-attr.c      # open/mkdir 原始 mode 测试辅助程序
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -169,6 +171,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 31** | **Redis v2 分记录 schema + 字段级 diff + Lua revision-CAS 原子 mutation** | **11（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 32** | **硬链接：持久化 nlink、多 dirent 同 inode、末引用 GC、VFS `.link`** | **12** | **✅ 已验收** |
 | **Phase 4/控制面 Step 33** | **rename flags：原子 `RENAME_NOREPLACE`；EXCHANGE/WHITEOUT 仍拒绝** | **13** | **✅ 已验收** |
+| **Phase 4/控制面 Step 34** | **create/mkdir mode + 持久化目录 nlink + VFS 属性刷新** | **13（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -176,7 +179,10 @@ Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` �
 Cursor 对照代码、158 tests 与 `STEP33_POSIX_RENAME_PASS` 确认 Step 33 已验收。
 `RENAME_DATA` payload flags 支持原子 `RENAME_NOREPLACE`；EXCHANGE/WHITEOUT 仍拒绝。ABI **v13**；format **v4**。
 
-下一步：**Step 34 POSIX-ATTR**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、162 tests 与 `STEP34_POSIX_ATTR_PASS` 确认 Step 34 已验收。
+create/mkdir 持久化 `0o7777` 权限位；目录 nlink=`2+子目录数`。ABI **v13**；format **v4**。
+
+下一步：**Step 35 CACHE-COHERENCE**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 13`（含 `RENAME_DATA` flags）
 
@@ -272,10 +278,10 @@ Cursor 对照代码、158 tests 与 `STEP33_POSIX_RENAME_PASS` 确认 Step 33 �
 | 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
 | 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
 | 10 | **rename flags 仅支持 NOREPLACE** | Step 33 支持原子 `RENAME_NOREPLACE`；`RENAME_EXCHANGE` / `RENAME_WHITEOUT` / 未知位返回 `-EINVAL`。Linux VFS 对已存在目标（包括同 inode 硬链接别名）会在 `.rename` 回调前返回 `EEXIST`；MetaStore 层同 inode 仍为成功 no-op。 | `kestrelfs/dir.c`、`daemon/src/meta.rs` |
-| 11 | **目录 nlink 不递归计算** | Step 32 已为非目录硬链接持久化并维护 nlink；目录 nlink 仍固定为 2，不随子目录增减而更新。 | `daemon/src/meta.rs`、`kestrelfs/inode.c` |
+| 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
-| 14 | **create() 忽略 kernel 传入的 mode** | `MemStore::create()` 内部用 `Inode::new_file()` 的默认 mode（`S_IFREG | 0o644`），忽略 kernel 传入的 mode 参数。 | `daemon/src/meta.rs` `create()` |
+| 14 | **尚无 chmod/chown 属性 mutation** | Step 34 已让 create/mkdir 持久化传入的 `0o7777` 位并由操作强制文件类型；创建后的 chmod/chown 与完整时间属性修改仍未实现。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
 | 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
@@ -314,7 +320,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 33 验收基线 158 个）
+cargo test                    # 单元测试 + 集成测试（Step 34 验收基线 162 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1106,6 +1112,44 @@ KestrelFS/daemon；vng 验证两个别名与 nlink 不变。MetaStore/daemon 内
 同 inode 两名处理为成功 no-op。测试全在 vng guest + loop，显式 `insmod`、独立
 data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
 
+### 7.28 Phase 4/控制面 Step 34 POSIX-ATTR
+
+复用 ABI v13 的 create/mkdir mode 与 LOOKUP/CREATE/GETATTR attribute 字段，cache
+format 仍为 v4。MetaStore 屏蔽调用者的文件类型位、保留 `0o7777`，并由操作强制
+regular file/directory 类型。目录 nlink 的持久不变量为
+`2 + immediate_subdirectory_count`：mkdir/rmdir、同目录 rename 覆盖空目录及跨目录
+移动/覆盖目录在同一次 MemStore mutation 中预计算后更新；FileMetaStore 随 JSON
+快照落盘，Redis v2 随 Lua revision-CAS patch 原子提交。普通文件创建/硬链接不改变
+父目录 nlink。
+
+内核 create 使用 daemon 返回的完整 mode；mkdir/rmdir/rename 同步维护当前 VFS inode
+nlink；目录 `.getattr` 通过已有 `OP_GETATTR` 刷新 MetaStore 权威 mode/nlink，因此
+root 在 daemon 重启和重新挂载后也能恢复正确计数。
+
+Cursor 验收自检（2026-09-15）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  162 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec ./test-step34-posix-attr-vng.sh
+  STEP34_FILE_MODE_PASS
+  STEP34_MKDIR_MODE_NLINK_PASS
+  STEP34_RENAME_DIR_NLINK_PASS
+  STEP34_ATTR_RESTART_PASS
+  STEP34_DIR_NLINK_CLEANUP_PASS
+  STEP34_POSIX_ATTR_PASS (umount_ms=25)
+```
+
+Step 34 脚本显式 `insmod`，仅在 vng guest 创建 loop，使用独立
+`/tmp/kestrelfs-step34-$$` 并将 daemon 输出保留到 daemon.log；未触碰宿主机模块、
+mount 或 zvol。尚未实现 chmod/chown/时间属性 mutation；open-unlink、
+EXCHANGE/WHITEOUT 等范围也未扩大。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1114,8 +1158,8 @@ data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 34 POSIX-ATTR** | create/mkdir 尊重 mode；目录 nlink；提示词见 §8 |
-| 2 | 其余 POSIX / 多节点 | open-unlink、EXCHANGE/WHITEOUT、CACHE-COHERENCE… |
+| 1 | **Step 35 CACHE-COHERENCE** | 多节点 / 远端 mutation 的本地 cache 失效；见 §8 |
+| 2 | 其余 POSIX | open-unlink、EXCHANGE/WHITEOUT、chmod… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1170,10 +1214,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 33 POSIX-RENAME（`RENAME_NOREPLACE`）已由 Cursor 验收并提交
+- [x] Step 34 POSIX-ATTR（mode + 目录 nlink）已由 Cursor 验收并提交
 - [x] IPC ABI = 13；cache format = v4
-- [x] Step 8–32 + Step 33 已验收状态已写清
-- [x] 下一步明确：Step 34 POSIX-ATTR（`docs/remaining-capabilities.md` §8）
+- [x] Step 8–33 + Step 34 已验收状态已写清
+- [x] 下一步明确：Step 35 CACHE-COHERENCE（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

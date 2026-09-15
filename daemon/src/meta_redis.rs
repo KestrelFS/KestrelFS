@@ -1028,7 +1028,7 @@ impl MetaStore for RedisMetaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::ROOT_INODE;
+    use crate::fs_model::{ROOT_INODE, S_IFDIR, S_IFREG};
     use uuid::Uuid;
 
     #[test]
@@ -1195,8 +1195,23 @@ mod tests {
         let prefix = format!("kestrelfs:test:{}", Uuid::new_v4());
         let store = RedisMetaStore::new(&url, &prefix).await.unwrap();
 
-        let directory = store.mkdir(ROOT_INODE, "redis-dir", 0o755).await.unwrap();
+        let directory = store.mkdir(ROOT_INODE, "redis-dir", 0o1711).await.unwrap();
         let peer = RedisMetaStore::new(&url, &prefix).await.unwrap();
+        assert_eq!(peer.getattr(directory).await.unwrap().mode, S_IFDIR | 0o1711);
+        assert_eq!(peer.getattr(directory).await.unwrap().nlink, 2);
+        assert_eq!(peer.getattr(ROOT_INODE).await.unwrap().nlink, 3);
+
+        let other_directory = store.mkdir(ROOT_INODE, "redis-other", 0o750).await.unwrap();
+        store.mkdir(directory, "redis-child", 0o700).await.unwrap();
+        assert_eq!(peer.getattr(directory).await.unwrap().nlink, 3);
+        store
+            .rename(directory, "redis-child", other_directory, "moved-child")
+            .await
+            .unwrap();
+        assert_eq!(peer.getattr(directory).await.unwrap().nlink, 2);
+        assert_eq!(peer.getattr(other_directory).await.unwrap().nlink, 3);
+        assert_eq!(peer.getattr(ROOT_INODE).await.unwrap().nlink, 4);
+
         let (left, right) = tokio::join!(
             store.create(directory, "concurrent-left", 0o644),
             peer.create(directory, "concurrent-right", 0o644)
@@ -1205,7 +1220,12 @@ mod tests {
         store.lookup(directory, "concurrent-left").await.unwrap();
         store.lookup(directory, "concurrent-right").await.unwrap();
 
-        let file = store.create(directory, "data", 0o644).await.unwrap();
+        let file = store.create(directory, "data", 0o2640).await.unwrap();
+        assert_eq!(peer.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);
+        let persistent_mode_file = store
+            .create(directory, "mode-persist", 0o2750)
+            .await
+            .unwrap();
         assert_eq!(store.link(directory, "data-alias", file).await.unwrap(), 2);
         assert_eq!(peer.lookup(directory, "data-alias").await.unwrap(), file);
         assert_eq!(peer.getattr(file).await.unwrap().nlink, 2);
@@ -1348,6 +1368,14 @@ mod tests {
         assert_eq!(
             restarted.readlink(restored_link).await.unwrap(),
             "../target-with-redis"
+        );
+        assert_eq!(restarted.getattr(directory).await.unwrap().mode, S_IFDIR | 0o1711);
+        assert_eq!(restarted.getattr(directory).await.unwrap().nlink, 2);
+        assert_eq!(restarted.getattr(other_directory).await.unwrap().nlink, 3);
+        assert_eq!(restarted.getattr(ROOT_INODE).await.unwrap().nlink, 4);
+        assert_eq!(
+            restarted.getattr(persistent_mode_file).await.unwrap().mode,
+            S_IFREG | 0o2750
         );
         assert_eq!(restarted.lookup(directory, "victim").await.unwrap(), source);
         assert_eq!(restarted.pending_garbage().await.unwrap(), pending);

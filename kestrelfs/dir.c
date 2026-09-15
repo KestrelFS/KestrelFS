@@ -124,6 +124,46 @@ out_unlock:
 	return ret;
 }
 
+/* Refresh directory attributes from the authoritative MetaStore. This also
+ * keeps the special root inode's persisted nlink visible after remount.
+ */
+static int kestrelfs_inode_getattr(struct mnt_idmap *idmap,
+				   const struct path *path, struct kstat *stat,
+				   u32 request_mask, unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	struct timespec64 mtime;
+	u64 size;
+	u64 mtime_sec;
+	u32 mode;
+	u32 nlink;
+	int ret;
+
+	req.opcode = KESTRELFS_OP_GETATTR;
+	put_unaligned_le64(inode->i_ino, &req.payload[0]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret)
+		return ret;
+
+	size = get_unaligned_le64(&resp.payload[0]);
+	mode = get_unaligned_le32(&resp.payload[8]);
+	nlink = get_unaligned_le32(&resp.payload[20]);
+	mtime_sec = get_unaligned_le64(&resp.payload[24]);
+	if (!S_ISDIR(mode) || nlink < 2)
+		return -EIO;
+
+	inode->i_mode = mode;
+	i_size_write(inode, size);
+	set_nlink(inode, nlink);
+	mtime.tv_sec = mtime_sec;
+	mtime.tv_nsec = 0;
+	inode_set_mtime_to_ts(inode, mtime);
+	generic_fillattr(idmap, request_mask, inode, stat);
+	return 0;
+}
+
 /*
  * kestrelfs_inode_lookup - VFS ->lookup() for directories.
  * 
@@ -217,7 +257,7 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 		return -ENAMETOOLONG;
 	}
 
-	create_mode = S_IFREG | (mode & 0777);
+	create_mode = S_IFREG | (mode & 07777);
 	ret = kestrelfs_name_data_call(KESTRELFS_OP_CREATE_DATA,
 				      dir->i_ino, create_mode,
 				      name, name_len, &resp);
@@ -245,6 +285,7 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 
 	/* Instantiate dentry */
 	d_instantiate(dentry, inode);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 
 	return 0;
 }
@@ -416,6 +457,8 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	/* Instantiate dentry */
 	d_instantiate(dentry, inode);
+	inc_nlink(dir);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 
 	return 0;
 }
@@ -505,10 +548,16 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 	pr_info("kestrelfs: unlink removed \"%s\" from parent=%llu\n",
 		name, parent_ino);
 
-	/* Update inode metadata (VFS will handle dentry invalidation) */
+	/* Update inode metadata (VFS will handle dentry invalidation). */
 	if (d_really_is_positive(dentry)) {
 		struct inode *inode = d_inode(dentry);
-		drop_nlink(inode);
+
+		if (S_ISDIR(inode->i_mode)) {
+			clear_nlink(inode);
+			drop_nlink(dir);
+		} else {
+			drop_nlink(inode);
+		}
 		inode_set_ctime_current(inode);
 		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	}
@@ -554,6 +603,10 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	size_t old_name_len = old_dentry->d_name.len;
 	size_t new_name_len = new_dentry->d_name.len;
 	struct kestrelfs_shared_region *region;
+	bool source_is_dir = d_really_is_positive(old_dentry) &&
+		S_ISDIR(d_inode(old_dentry)->i_mode);
+	bool target_is_dir = d_really_is_positive(new_dentry) &&
+		S_ISDIR(d_inode(new_dentry)->i_mode);
 	int ret;
 
 	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
@@ -621,12 +674,25 @@ out_unlock:
 
 	/* Update VFS metadata. VFS performs the dentry move after this callback. */
 	if (d_really_is_positive(new_dentry) &&
-	    d_inode(new_dentry) != d_inode(old_dentry) &&
-	    !S_ISDIR(d_inode(new_dentry)->i_mode)) {
+	    d_inode(new_dentry) != d_inode(old_dentry)) {
 		struct inode *replaced = d_inode(new_dentry);
 
-		drop_nlink(replaced);
+		if (target_is_dir)
+			clear_nlink(replaced);
+		else
+			drop_nlink(replaced);
 		inode_set_ctime_current(replaced);
+	}
+	if (old_dir == new_dir) {
+		if (target_is_dir)
+			drop_nlink(old_dir);
+	} else {
+		if (source_is_dir)
+			drop_nlink(old_dir);
+		if (source_is_dir && !target_is_dir)
+			inc_nlink(new_dir);
+		else if (!source_is_dir && target_is_dir)
+			drop_nlink(new_dir);
 	}
 	if (d_really_is_positive(old_dentry)) {
 		struct inode *inode = d_inode(old_dentry);
@@ -641,6 +707,7 @@ out_unlock:
 }
 
 const struct inode_operations kestrelfs_dir_inode_operations = {
+	.getattr	= kestrelfs_inode_getattr,
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
 	.link		= kestrelfs_inode_link,

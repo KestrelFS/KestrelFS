@@ -3083,7 +3083,7 @@ mod tests {
             abi::OP_MKDIR_DATA,
             800,
             fs_model::ROOT_INODE,
-            0o755,
+            0o1711,
             &long_dir,
             &mut data_buffer,
         );
@@ -3097,12 +3097,16 @@ mod tests {
         assert_eq!(mkdir_response.opcode, abi::OP_RESULT_OK);
         let dir_inode =
             u64::from_le_bytes(mkdir_response.payload[0..8].try_into().unwrap());
+        let dir_attrs = store.getattr(dir_inode).await.unwrap();
+        assert_eq!(dir_attrs.mode, fs_model::S_IFDIR | 0o1711);
+        assert_eq!(dir_attrs.nlink, 2);
+        assert_eq!(store.getattr(fs_model::ROOT_INODE).await.unwrap().nlink, 3);
 
         let create = raw_name_data_req(
             abi::OP_CREATE_DATA,
             801,
             dir_inode,
-            fs_model::S_IFREG | 0o644,
+            fs_model::S_IFDIR | 0o2640,
             &old_name,
             &mut data_buffer,
         );
@@ -3114,6 +3118,14 @@ mod tests {
         )
         .await;
         assert_eq!(create_response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(create_response.payload[16..20].try_into().unwrap()),
+            fs_model::S_IFREG | 0o2640
+        );
+        assert_eq!(
+            u32::from_le_bytes(create_response.payload[28..32].try_into().unwrap()),
+            1
+        );
         let file_inode =
             u64::from_le_bytes(create_response.payload[0..8].try_into().unwrap());
 
@@ -3136,6 +3148,10 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(lookup_response.payload[0..8].try_into().unwrap()),
             file_inode
+        );
+        assert_eq!(
+            u32::from_le_bytes(lookup_response.payload[16..20].try_into().unwrap()),
+            fs_model::S_IFREG | 0o2640
         );
 
         let readdir = raw_readdir_data_req(803, dir_inode, 0);
@@ -3186,6 +3202,14 @@ mod tests {
         )
         .await;
         assert_eq!(lookup_dir_response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(lookup_dir_response.payload[16..20].try_into().unwrap()),
+            fs_model::S_IFDIR | 0o1711
+        );
+        assert_eq!(
+            u32::from_le_bytes(lookup_dir_response.payload[28..32].try_into().unwrap()),
+            2
+        );
 
         let lookup_new = raw_name_data_req(
             abi::OP_LOOKUP_DATA,
@@ -3203,6 +3227,10 @@ mod tests {
         )
         .await;
         assert_eq!(lookup_new_response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u32::from_le_bytes(lookup_new_response.payload[16..20].try_into().unwrap()),
+            fs_model::S_IFREG | 0o2640
+        );
 
         let readdir = raw_readdir_data_req(807, dir_inode, 0);
         let readdir_response = build_response_with_data(

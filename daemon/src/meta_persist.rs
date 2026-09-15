@@ -279,7 +279,7 @@ impl MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{ROOT_INODE, S_IFLNK, S_IFREG};
+    use crate::fs_model::{ROOT_INODE, S_IFDIR, S_IFLNK, S_IFREG};
     use crate::meta::{REMOTE_TXT_INODE, WRITABLE_DAT_INODE};
     use tempfile::TempDir;
 
@@ -393,6 +393,33 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(restored.getattr(inode).await.unwrap().nlink, 1);
+    }
+
+    #[tokio::test]
+    async fn modes_and_directory_nlinks_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let file;
+        let left;
+        let right;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            file = store.create(ROOT_INODE, "mode-file", 0o2640).await.unwrap();
+            left = store.mkdir(ROOT_INODE, "left", 0o1711).await.unwrap();
+            right = store.mkdir(ROOT_INODE, "right", 0o750).await.unwrap();
+            store.mkdir(left, "child", 0o700).await.unwrap();
+            store
+                .rename(left, "child", right, "moved-child")
+                .await
+                .unwrap();
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(restored.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);
+        assert_eq!(restored.getattr(left).await.unwrap().mode, S_IFDIR | 0o1711);
+        assert_eq!(restored.getattr(left).await.unwrap().nlink, 2);
+        assert_eq!(restored.getattr(right).await.unwrap().nlink, 3);
+        assert_eq!(restored.getattr(ROOT_INODE).await.unwrap().nlink, 4);
     }
 
     #[tokio::test]

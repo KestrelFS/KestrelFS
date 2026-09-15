@@ -183,8 +183,8 @@ pub trait MetaStore: Send + Sync {
     #[allow(dead_code)]
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>>;
 
-    /// Creates a new file (regular file) under `parent` with the given
-    /// `name` and `mode`. Returns the newly allocated inode id.
+    /// Creates a new regular file under `parent`. The operation forces the
+    /// file type and preserves `mode & 0o7777`. Returns its inode id.
     ///
     /// # Errors
     ///
@@ -237,8 +237,9 @@ pub trait MetaStore: Send + Sync {
     /// - [`MetaError::NotADirectory`] if `inode` is not a directory.
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>>;
 
-    /// Creates a new directory under `parent` with the given `name` and `mode`.
-    /// Returns the newly allocated inode id.
+    /// Creates a new directory under `parent`, forcing the directory type and
+    /// preserving `mode & 0o7777`. The parent's directory link count grows by
+    /// one. Returns the newly allocated inode id.
     ///
     /// # Errors
     ///
@@ -257,7 +258,8 @@ pub trait MetaStore: Send + Sync {
     ///
     /// For non-directories: removes one dirent and decrements `nlink`; only the
     /// final reference removes the inode, slices, and symlink target.
-    /// For directories: only succeeds if the directory is empty (no children).
+    /// For directories: only succeeds if empty and decrements the parent's
+    /// directory link count.
     ///
     /// # Errors
     ///
@@ -422,6 +424,24 @@ fn enqueue_confirmed_garbage(
     let garbage = confirmed_garbage_keys(inner, candidates);
     inner.pending_garbage.extend(garbage.iter().cloned());
     garbage
+}
+
+/// Applies an immediate-subdirectory delta to a directory's POSIX link count.
+/// A valid directory never drops below the `.`/`..` baseline of two links.
+fn directory_nlink_after_delta(current: u32, delta: i32) -> Result<u32> {
+    let next = if delta >= 0 {
+        current
+            .checked_add(delta as u32)
+            .ok_or(MetaError::TooManyLinks)?
+    } else {
+        current
+            .checked_sub(delta.unsigned_abs())
+            .ok_or(MetaError::Io)?
+    };
+    if next < 2 {
+        return Err(MetaError::Io);
+    }
+    Ok(next)
 }
 
 /// Fixed inode id for the bootstrap `remote.txt` entry seeded by
@@ -651,11 +671,7 @@ impl MetaStore for MemStore {
         // Allocate new inode
         let new_inode_id = self.allocate_inode_id();
         let now = current_unix_time();
-        let new_inode = Inode::new_file(new_inode_id, 0, now);
-        // Note: new_file() already sets mode to S_IFREG | 0o644.
-        // The passed `mode` parameter from the kernel includes file type bits (S_IFREG | perm).
-        // For now we use new_file()'s default. Future: parse mode to support directories.
-        let _ = mode; // Suppress unused variable warning
+        let new_inode = Inode::new_file_with_mode(new_inode_id, 0, now, mode);
 
         // Insert inode and directory entry
         inner.inodes.insert(new_inode_id, new_inode);
@@ -845,6 +861,10 @@ impl MetaStore for MemStore {
         if !parent_inode.is_dir() {
             return Err(MetaError::NotADirectory);
         }
+        let parent_nlink = parent_inode
+            .nlink
+            .checked_add(1)
+            .ok_or(MetaError::TooManyLinks)?;
 
         // Check if name already exists
         if let Some(entries) = inner.dir_entries.get(&parent) {
@@ -856,10 +876,7 @@ impl MetaStore for MemStore {
         // Allocate new inode
         let new_inode_id = self.allocate_inode_id();
         let now = current_unix_time();
-        let new_inode = Inode::new_dir(new_inode_id, now);
-        // Note: new_dir() already sets mode to S_IFDIR | 0o755.
-        // The passed `mode` parameter could be used to customize permissions.
-        let _ = mode; // Suppress unused variable warning for now
+        let new_inode = Inode::new_dir_with_mode(new_inode_id, now, mode);
 
         // Insert inode and directory entry
         inner.inodes.insert(new_inode_id, new_inode);
@@ -871,6 +888,10 @@ impl MetaStore for MemStore {
 
         // Initialize empty dir_entries for the new directory
         inner.dir_entries.insert(new_inode_id, HashMap::new());
+        if let Some(parent_inode) = inner.inodes.get_mut(&parent) {
+            parent_inode.nlink = parent_nlink;
+            parent_inode.mtime = now;
+        }
 
         Ok(new_inode_id)
     }
@@ -936,6 +957,7 @@ impl MetaStore for MemStore {
         if !parent_inode.is_dir() {
             return Err(MetaError::NotADirectory);
         }
+        let parent_nlink = parent_inode.nlink;
 
         // Find the child in parent's directory entries
         let child_inode_id = inner
@@ -952,6 +974,16 @@ impl MetaStore for MemStore {
             .ok_or(MetaError::NotFound)?;
         let child_is_dir = child_inode.is_dir();
         let child_nlink = child_inode.nlink;
+        let parent_nlink_after = if child_is_dir {
+            Some(
+                parent_nlink
+                    .checked_sub(1)
+                    .filter(|nlink| *nlink >= 2)
+                    .ok_or(MetaError::Io)?,
+            )
+        } else {
+            None
+        };
 
         // If it's a directory, check if it's empty
         if child_is_dir {
@@ -991,6 +1023,13 @@ impl MetaStore for MemStore {
             })
             .unwrap_or_default();
         inner.symlink_targets.remove(&child_inode_id);
+
+        if let Some(parent_nlink_after) = parent_nlink_after {
+            if let Some(parent_inode) = inner.inodes.get_mut(&parent) {
+                parent_inode.nlink = parent_nlink_after;
+                parent_inode.mtime = current_unix_time();
+            }
+        }
 
         Ok(enqueue_confirmed_garbage(&mut inner, candidates))
     }
@@ -1055,9 +1094,10 @@ impl MetaStore for MemStore {
             .inodes
             .get(&source_inode_id)
             .ok_or(MetaError::NotFound)?;
+        let source_is_dir = source_inode.is_dir();
 
         // Check if we're renaming a directory into its own subtree
-        if source_inode.is_dir() {
+        if source_is_dir {
             // Walk up from new_parent to check if it's a descendant of source
             let mut check_parent = new_parent;
             loop {
@@ -1091,26 +1131,61 @@ impl MetaStore for MemStore {
             .get(&new_parent)
             .and_then(|entries| entries.get(new_name).copied());
 
+        if target_exists == Some(source_inode_id) {
+            return Ok(Vec::new());
+        }
+        if target_exists.is_some() && flags & RENAME_NOREPLACE != 0 {
+            return Err(MetaError::AlreadyExists);
+        }
+
+        let target_is_dir = if let Some(target_inode_id) = target_exists {
+            let target_inode = inner
+                .inodes
+                .get(&target_inode_id)
+                .ok_or(MetaError::NotFound)?;
+            if target_inode.is_dir()
+                && inner
+                    .dir_entries
+                    .get(&target_inode_id)
+                    .is_some_and(|entries| !entries.is_empty())
+            {
+                return Err(MetaError::NotEmpty);
+            }
+            target_inode.is_dir()
+        } else {
+            false
+        };
+
+        let old_parent_nlink = inner
+            .inodes
+            .get(&old_parent)
+            .ok_or(MetaError::NotFound)?
+            .nlink;
+        let new_parent_nlink = inner
+            .inodes
+            .get(&new_parent)
+            .ok_or(MetaError::NotFound)?
+            .nlink;
+        let (old_parent_nlink_after, new_parent_nlink_after) = if old_parent == new_parent {
+            (
+                directory_nlink_after_delta(old_parent_nlink, -(target_is_dir as i32))?,
+                None,
+            )
+        } else {
+            (
+                directory_nlink_after_delta(old_parent_nlink, -(source_is_dir as i32))?,
+                Some(directory_nlink_after_delta(
+                    new_parent_nlink,
+                    source_is_dir as i32 - target_is_dir as i32,
+                )?),
+            )
+        };
+
         let mut candidates = HashSet::new();
         if let Some(target_inode_id) = target_exists {
-            // POSIX rename between two names already referring to the same
-            // inode is a successful no-op: neither directory entry changes.
-            if target_inode_id == source_inode_id {
-                return Ok(Vec::new());
-            }
-            if flags & RENAME_NOREPLACE != 0 {
-                return Err(MetaError::AlreadyExists);
-            }
             let target_inode = inner.inodes.get(&target_inode_id).ok_or(MetaError::NotFound)?;
 
-            // POSIX semantics: can replace regular file, but not non-empty directory
-            if target_inode.is_dir() {
-                // Check if target directory is empty
-                if let Some(target_entries) = inner.dir_entries.get(&target_inode_id) {
-                    if !target_entries.is_empty() {
-                        return Err(MetaError::NotEmpty);
-                    }
-                }
+            if target_is_dir {
                 // Remove empty target directory
                 inner.dir_entries.remove(&target_inode_id);
                 inner.inodes.remove(&target_inode_id);
@@ -1155,10 +1230,13 @@ impl MetaStore for MemStore {
 
         if let Some(old_parent_inode) = inner.inodes.get_mut(&old_parent) {
             old_parent_inode.mtime = now;
+            old_parent_inode.nlink = old_parent_nlink_after;
         }
         if old_parent != new_parent {
             if let Some(new_parent_inode) = inner.inodes.get_mut(&new_parent) {
                 new_parent_inode.mtime = now;
+                new_parent_inode.nlink = new_parent_nlink_after
+                    .expect("cross-directory rename computed new parent nlink");
             }
         }
 
@@ -1189,7 +1267,7 @@ impl MetaStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{S_IFLNK, S_IFREG};
+    use crate::fs_model::{S_IFDIR, S_IFLNK, S_IFREG};
 
     #[tokio::test]
     async fn symlink_lookup_readlink_rename_and_unlink() {
@@ -1407,6 +1485,85 @@ mod tests {
             .await
             .expect("lookup must succeed");
         assert_eq!(looked_up, new_inode);
+    }
+
+    #[tokio::test]
+    async fn create_and_mkdir_preserve_permissions_but_force_file_type() {
+        let store = MemStore::new();
+        let file = store
+            .create(ROOT_INODE, "mode-file", S_IFDIR | 0o2640)
+            .await
+            .unwrap();
+        let directory = store
+            .mkdir(ROOT_INODE, "mode-dir", S_IFREG | 0o1711)
+            .await
+            .unwrap();
+
+        assert_eq!(store.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);
+        assert_eq!(
+            store.getattr(directory).await.unwrap().mode,
+            crate::fs_model::S_IFDIR | 0o1711
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_nlink_tracks_mkdir_rmdir_and_cross_directory_rename() {
+        let store = MemStore::new();
+        assert_eq!(store.getattr(ROOT_INODE).await.unwrap().nlink, 2);
+
+        let left = store.mkdir(ROOT_INODE, "left", 0o755).await.unwrap();
+        let right = store.mkdir(ROOT_INODE, "right", 0o755).await.unwrap();
+        assert_eq!(store.getattr(ROOT_INODE).await.unwrap().nlink, 4);
+
+        let child = store.mkdir(left, "child", 0o700).await.unwrap();
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 3);
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 2);
+
+        let file = store.create(left, "file", 0o640).await.unwrap();
+        store.link(left, "file-alias", file).await.unwrap();
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 3);
+
+        store
+            .rename(left, "child", right, "moved-child")
+            .await
+            .unwrap();
+        assert_eq!(store.lookup(right, "moved-child").await.unwrap(), child);
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 2);
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 3);
+
+        store
+            .rename(right, "moved-child", right, "renamed-child")
+            .await
+            .unwrap();
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 3);
+        store.unlink(right, "renamed-child").await.unwrap();
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 2);
+    }
+
+    #[tokio::test]
+    async fn directory_nlink_accounts_for_rename_over_empty_directory() {
+        let store = MemStore::new();
+        let left = store.mkdir(ROOT_INODE, "left", 0o755).await.unwrap();
+        let right = store.mkdir(ROOT_INODE, "right", 0o755).await.unwrap();
+        store.mkdir(left, "source", 0o755).await.unwrap();
+        store.mkdir(right, "target", 0o755).await.unwrap();
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 3);
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 3);
+
+        store
+            .rename(left, "source", right, "target")
+            .await
+            .unwrap();
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 2);
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 3);
+
+        store.mkdir(right, "other", 0o755).await.unwrap();
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 4);
+        store
+            .rename(right, "target", right, "other")
+            .await
+            .unwrap();
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 3);
     }
 
     #[tokio::test]
