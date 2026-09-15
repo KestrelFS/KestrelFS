@@ -10,6 +10,7 @@
 //! - All directory entries (HashMap<u64, HashMap<String, u64>>)
 //! - All slices (HashMap<u64, HashMap<u32, Vec<Slice>>>)
 //! - All symbolic-link targets (HashMap<u64, String>)
+//! - Object keys pending idempotent GC deletion (HashSet<String>)
 //!
 //! # Atomicity
 //!
@@ -33,7 +34,7 @@
 //!
 //! A production system would use Redis/TiKV instead (see meta.rs module docs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -58,6 +59,9 @@ pub(crate) struct MetaSnapshot {
     /// Default keeps ABI-v10-era snapshots loadable after symlink support lands.
     #[serde(default)]
     symlink_targets: HashMap<u64, String>,
+    /// Default keeps pre-Step-30 snapshots loadable with an empty GC queue.
+    #[serde(default)]
+    pending_garbage: HashSet<String>,
     next_inode_id: u64,
 }
 
@@ -207,6 +211,15 @@ impl MetaStore for FileMetaStore {
             .map_err(|_| MetaError::Io)?;
         Ok(garbage)
     }
+
+    async fn pending_garbage(&self) -> Result<Vec<String>> {
+        self.mem.pending_garbage().await
+    }
+
+    async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()> {
+        self.mem.acknowledge_garbage(keys).await?;
+        self.sync_to_disk().await.map_err(|_| MetaError::Io)
+    }
 }
 
 impl MemStore {
@@ -218,6 +231,7 @@ impl MemStore {
             dir_entries: inner.dir_entries.clone(),
             slices: inner.slices.clone(),
             symlink_targets: inner.symlink_targets.clone(),
+            pending_garbage: inner.pending_garbage.clone(),
             next_inode_id: self.next_inode_id.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -233,6 +247,7 @@ impl MemStore {
                 dir_entries: snapshot.dir_entries,
                 slices: snapshot.slices,
                 symlink_targets: snapshot.symlink_targets,
+                pending_garbage: snapshot.pending_garbage,
             }),
             next_inode_id: AtomicU64::new(snapshot.next_inode_id),
         }
@@ -329,6 +344,42 @@ mod tests {
         let found = store2.lookup(ROOT_INODE, "truncate.txt").await.unwrap();
         let inode = store2.getattr(found).await.unwrap();
         assert_eq!(inode.size, 1024);
+    }
+
+    #[tokio::test]
+    async fn garbage_queue_survives_reload_and_ack_is_persistent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 64,
+            written_at: current_unix_time(),
+        };
+        let key = slice.block_key(0);
+
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            let inode = store.create(ROOT_INODE, "queued-gc", 0o644).await.unwrap();
+            store.append_slice(inode, slice).await.unwrap();
+            assert_eq!(
+                store.unlink(ROOT_INODE, "queued-gc").await.unwrap(),
+                vec![key.clone()]
+            );
+        }
+
+        {
+            let restarted = FileMetaStore::new(path.clone()).await.unwrap();
+            assert_eq!(restarted.pending_garbage().await.unwrap(), vec![key.clone()]);
+            restarted
+                .acknowledge_garbage(std::slice::from_ref(&key))
+                .await
+                .unwrap();
+        }
+
+        let restarted = FileMetaStore::new(path).await.unwrap();
+        assert!(restarted.pending_garbage().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -272,6 +272,16 @@ pub trait MetaStore: Send + Sync {
         new_parent: u64,
         new_name: &str,
     ) -> Result<Vec<String>>;
+
+    /// Returns durable GC candidates that are not referenced by any current
+    /// slice. Implementations must commit candidates in the same metadata
+    /// transaction that removes their final reference.
+    async fn pending_garbage(&self) -> Result<Vec<String>>;
+
+    /// Removes successfully deleted object keys from the durable GC queue.
+    /// Repeated acknowledgements are valid so ObjectStore delete + queue ack
+    /// form an at-least-once, crash-safe protocol.
+    async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()>;
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -336,6 +346,9 @@ pub(crate) struct MemStoreInner {
     pub(crate) slices: HashMap<u64, HashMap<u32, Vec<Slice>>>,
     /// Symbolic-link inode id -> uninterpreted UTF-8 target string.
     pub(crate) symlink_targets: HashMap<u64, String>,
+    /// Object keys made unreachable by a committed metadata mutation but not
+    /// yet acknowledged as deleted from ObjectStore.
+    pub(crate) pending_garbage: HashSet<String>,
 }
 
 fn slice_block_keys<'a>(slices: impl Iterator<Item = &'a Slice>) -> HashSet<String> {
@@ -364,6 +377,18 @@ fn confirmed_garbage_keys(
     let referenced = referenced_block_keys(inner);
     let mut garbage: Vec<_> = candidates.difference(&referenced).cloned().collect();
     garbage.sort();
+    garbage
+}
+
+/// Confirms candidates against all live slices and durably associates them
+/// with the metadata mutation before the mutation's caller can observe
+/// success.
+fn enqueue_confirmed_garbage(
+    inner: &mut MemStoreInner,
+    candidates: HashSet<String>,
+) -> Vec<String> {
+    let garbage = confirmed_garbage_keys(inner, candidates);
+    inner.pending_garbage.extend(garbage.iter().cloned());
     garbage
 }
 
@@ -457,6 +482,7 @@ impl MemStore {
                 dir_entries,
                 slices,
                 symlink_targets: HashMap::new(),
+                pending_garbage: HashSet::new(),
             }),
             next_inode_id: AtomicU64::new(WRITABLE_DAT_INODE + 1),
         }
@@ -739,7 +765,7 @@ impl MetaStore for MemStore {
         inode_meta.size = new_size;
         inode_meta.mtime = current_unix_time();
 
-        Ok(confirmed_garbage_keys(&inner, candidates))
+        Ok(enqueue_confirmed_garbage(&mut inner, candidates))
     }
 
     async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
@@ -873,7 +899,7 @@ impl MetaStore for MemStore {
             .unwrap_or_default();
         inner.symlink_targets.remove(&child_inode_id);
 
-        Ok(confirmed_garbage_keys(&inner, candidates))
+        Ok(enqueue_confirmed_garbage(&mut inner, candidates))
     }
 
     async fn rename(
@@ -1010,7 +1036,27 @@ impl MetaStore for MemStore {
             }
         }
 
-        Ok(confirmed_garbage_keys(&inner, candidates))
+        Ok(enqueue_confirmed_garbage(&mut inner, candidates))
+    }
+
+    async fn pending_garbage(&self) -> Result<Vec<String>> {
+        let inner = self.inner.read().await;
+        let referenced = referenced_block_keys(&inner);
+        let mut pending: Vec<_> = inner
+            .pending_garbage
+            .difference(&referenced)
+            .cloned()
+            .collect();
+        pending.sort();
+        Ok(pending)
+    }
+
+    async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        for key in keys {
+            inner.pending_garbage.remove(key);
+        }
+        Ok(())
     }
 }
 
@@ -1074,10 +1120,22 @@ mod tests {
         store.append_slice(second, shared).await.unwrap();
 
         assert!(store.unlink(ROOT_INODE, "shared-first").await.unwrap().is_empty());
+        assert!(store.pending_garbage().await.unwrap().is_empty());
         assert_eq!(
             store.unlink(ROOT_INODE, "shared-second").await.unwrap(),
-            vec![key]
+            vec![key.clone()]
         );
+        assert_eq!(store.pending_garbage().await.unwrap(), vec![key.clone()]);
+        store
+            .acknowledge_garbage(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        // Ack is intentionally idempotent for crash-after-delete recovery.
+        store
+            .acknowledge_garbage(std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert!(store.pending_garbage().await.unwrap().is_empty());
     }
 
     #[tokio::test]

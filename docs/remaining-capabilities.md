@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-15，Cursor（验收 Step 29；选定 Step 30 = DIST-GC）
+> 最后更新：2026-09-15，Codex（Step 30 DIST-GC 实现完成，待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -25,7 +25,7 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–5 | Phase 4 cache 主线 | Step 24–29 | **ACCEPTED** | 命中路径与运维最小闭环 |
-| 6 | DIST-GC | Step 30 持久化 GC 重试 | **DECIDED** | meta 先提交后 best-effort delete 仍会泄漏对象 |
+| 6 | DIST-GC | Step 30 持久化 GC 重试 | **REVIEW** | 工作树已实现，等待 Cursor 对照代码与测试验收 |
 | 7 | DIST-META | Redis 拆 key / TLS / 重连 | PROPOSED | 去掉全量快照瓶颈 |
 | 8 | POSIX-CORE | hard link、open-unlink、rename flags | PROPOSED | 语义补齐 |
 | 9 | CACHE-COHERENCE | 多节点失效 | PROPOSED | 共享部署正确性 |
@@ -50,9 +50,9 @@ Codex **只实现 §8 当前提示词**。
 
 ### DIST-GC — Step 30
 
-- 状态：`DECIDED`
-- 缺口：unlink/rename-overwrite/truncate 在 metadata 提交后 best-effort delete；
-  失败会泄漏 ObjectStore 对象；无持久重试队列。
+- 状态：`REVIEW`
+- 实现：GC 候选与 metadata mutation 同快照提交；启动立即重放，运行期 1–60 秒
+  指数退避；delete 成功后才确认出队。
 - 范围：见 §8。
 
 ### DIST-META / DIST-OBJECT / POSIX-CORE / IPC-SCALE
@@ -72,6 +72,8 @@ OPS-CONFIG / TEST-PERF / DOC-CLEANUP 仍为 `PROPOSED`。
 | 2026-09-15 | Codex | CACHE-EVICT | 实现与自检 | **REVIEW** |
 | 2026-09-15 | Cursor | CACHE-EVICT | Step 29 验收 | **ACCEPTED**；v4 reserved batch 扩展认可 |
 | 2026-09-15 | Cursor | DIST-GC | 选定 Step 30 | **DECIDED**；见 §8 |
+| 2026-09-15 | Codex | DIST-GC | Step 30 开工 | **IMPLEMENTING**；仅执行 §8 |
+| 2026-09-15 | Codex | DIST-GC | 实现与自检完成 | **REVIEW**；详见 §9 |
 
 ## 7. 不应顺手扩大
 
@@ -122,6 +124,38 @@ Redis 拆 key / TLS 大重构、完整跨后端事务、自动 wipe、write-back
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-15 — Step 30 DIST-GC（Codex REVIEW）
+
+- **事务设计**：在 `MemStoreInner` / `MetaSnapshot` 增加 `pending_garbage`。unlink、
+  rename-overwrite、truncate 先对全量现存 slice 做引用确认，再在同一个 MetaStore
+  mutation 内入队。FileMetaStore 的 namespace 改动与队列经同一次 tmp + fsync +
+  rename 落入 `meta.json`；RedisMetaStore 则经同一次 `{prefix}:meta:v1` Lua CAS 发布。
+  这比 metadata commit 后另写队列消除了 crash-before-enqueue 窗口，旧 JSON/Redis
+  snapshot 通过 `serde(default)` 兼容为空队列。
+- **删除协议**：ObjectStore delete 保持幂等；每轮重新检查 queued key 当前确实无
+  slice 引用，只确认成功删除的 key。delete 后、ack 前崩溃会在重启后重复 delete，
+  不会丢队列或返回旧数据。namespace mutation 已成功时，GC 故障仍只记日志、不向
+  VFS 伪报失败。
+- **恢复与退避**：daemon 启动在进入 IPC loop 前立即重放；运行期由同一同步 event
+  loop 的 poll timeout 重试，失败从 1 秒指数退避到 60 秒，新请求活动重置到 1 秒。
+  没有并发 FileMetaStore writer。日志带单轮与进程累计 attempted/deleted/failures。
+- **后端组合**：FileMeta + LocalFs/S3 的队列在 `meta.json`；Redis + LocalFs/S3 的
+  队列在 Redis snapshot。Redis+S3 多 daemon 可能重复 delete/ack，但二者均幂等且
+  ack 使用 CAS。`--memory` 的 queue 与 MemObjectStore 一样只在进程内，重启时对象
+  与队列同时消失。
+- **测试**：`cargo test --manifest-path daemon/Cargo.toml` 为 **141 passed**；新增
+  Mem delete 故障→保留→重试、共享 key 最后引用保护、FileMeta commit 后模拟 crash
+  →重启向 LocalFs 重放、持久 ack。`cargo clippy --manifest-path daemon/Cargo.toml
+  --all-targets -- -D warnings` 通过；`make -C tools` 零警告。真实 Redis 门控测试
+  **1 passed**（含 queue 重启/ack），MinIO/S3 门控测试 **2 passed**（含 GC delete）。
+  本步未改内核 C/IPC/mount，按 §8 未运行 vng，也未在物理机执行 insmod/mount。
+- **ABI/format**：IPC ABI 保持 **v11**；cache format 保持 **v4**。
+- **已知限制**：永久 ObjectStore 故障会让队列持续增长，尚无容量上限、dead-letter
+  或管理接口；引用确认与待删读取仍为 O(全量 slice)；Redis 入队/ack 仍重写整个
+  snapshot；同步 event loop 中的远端 delete/retry 可能增加 IPC 尾延迟。未实现
+  Redis 拆 key/TLS/重连、全量 S3 reconciliation、跨 Redis/S3 原子事务、自动 wipe、
+  write-back、多节点 cache 失效或 eviction 再改。
 
 ### 2026-09-15 — Step 29 CACHE-EVICT（Cursor ACCEPTED）
 

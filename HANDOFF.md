@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Phase 4 Step 29（CACHE-EVICT：批量 LRU / index-page 合并写）已由 Cursor 验收并纳入本提交（IPC ABI v11、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Phase 4/控制面 Step 30（DIST-GC：持久化 GC 队列 + 退避重试）已由 Cursor 验收并纳入本提交（IPC ABI v11、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Phase 4 Step 29 已验收（batch eviction）；下一步 Step 30 = DIST-GC（见 remaining-capabilities §8） |
+| 当前阶段 | Step 30 DIST-GC 已验收；下一步 Step 31 = DIST-META（见 remaining-capabilities §8） |
 
 ---
 
@@ -58,7 +58,7 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice），ObjectStore 管理块数据。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
 - **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
@@ -162,10 +162,11 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4 Step 27** | **离线 v4 inspect + 块设备双确认 metadata wipe + reformat/refill** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 28** | **regular file read_iter + iov_iter cache/miss 路径 + 安全跨段 fallback** | **11（未变）** | **✅ 已验收** |
 | **Phase 4 Step 29** | **批量 LRU victim journal + 同页 index 合并清零 + MRU 保护/崩溃恢复** | **11（未变）** | **✅ 已验收** |
+| **Phase 4/控制面 Step 30** | **metadata 同事务持久化 GC queue + 启动/运行期指数退避重试** | **11（未变）** | **✅ 已验收** |
 
-Cursor 对照代码、137 tests、`STEP29_CACHE_EVICT_PASS` 及 Step 28–15 vng 回归确认 Step 29 已验收。
-16-victim / 1 index-page write、MRU 保护、batch 半提交恢复均对齐；ABI **v11**；format **v4**。
-下一步：**Step 30 DIST-GC**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、141 tests、FileMeta 崩溃重放与 Redis/S3 门控测确认 Step 30 已验收。
+同事务入队 + 读队列时过滤仍引用 key + delete 后 ack；ABI **v11**；format **v4**。
+下一步：**Step 31 DIST-META**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 11`（活跃名字/数据/symlink 路径使用 bounce buffer）
 
@@ -251,7 +252,7 @@ Cursor 对照代码、137 tests、`STEP29_CACHE_EVICT_PASS` 及 Step 28–15 vng
 | 1 | **旧 CHUNK opcode 仍受小 payload 限制** | `WRITE_CHUNK` 仍最多 12 字节、`READ_CHUNK` 仍最多 32 字节，仅为兼容既有测试保留；普通文件内核路径已切换到 16 KiB bounce buffer 的 `WRITE_DATA` / `READ_DATA`，单次 read/write 会在内核内循环完成。 | `kestrelfs_ipc.h`、`kestrelfs/file.c` |
 | 2 | **旧 RENAME 仍为每名 ≤7 字节** | opcode 10 仅为兼容既有测试保留；普通 VFS rename 已切到 opcode 13 `RENAME_DATA`，单名上限 255 字节，两个名字依次位于 bounce buffer。 | `kestrelfs_ipc.h` RENAME / RENAME_DATA 布局 |
 | 3 | **旧名字 opcode 仍有短 payload 上限** | opcode 1/6/7/8/9 仅为兼容既有测试保留；普通 VFS 的 lookup/create/readdir/mkdir/unlink 已切换到 ABI v10 DATA opcode，统一支持 255 字节名字。 | `kestrelfs_ipc.h` 各 legacy / DATA opcode 布局 |
-| 4 | **GC 为安全的提交后 best-effort** | unlink、rename 覆盖和 truncate 先提交/持久化元数据，再删除经全局 slice 引用扫描确认无引用的 block。delete 失败只记录日志并保留泄漏，不把已经生效的命名空间操作伪装成失败；当前没有持久化重试队列。 | `daemon/src/meta.rs`、`daemon/src/main.rs` `delete_garbage_objects()` |
+| 4 | **GC 为持久化 at-least-once 删除** | Step 30 让 unlink、rename 覆盖和 truncate 在提交 metadata 时一并持久化无引用 block key；delete 成功后才确认出队，失败不回滚命名空间并在启动/运行期重试。永久后端故障会使队列增长，尚无容量上限/dead-letter/管理接口。 | `daemon/src/meta.rs`、`daemon/src/meta_persist.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 5 | **new_inode() 而非 iget5_locked()** | 曾尝试 `iget5_locked()` 做严格 inode 缓存，导致 umount 时内核死循环（commit `7787a6a`）。已回退为 `new_inode()` + `insert_inode_hash()`。**不要轻易重试 iget5_locked 方案**，除非彻底解决 I_FREEING 竞态。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
 | 6 | **同一 ino 可能有多实例 inode** | 使用 `new_inode()` 意味着每次 lookup 都创建新 inode 对象（而非复用哈希表中已有实例）。dentry cache 保证路径唯一性，但同一文件通过不同路径访问时内核中可能有多个 inode 对象。 | 同上 |
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
@@ -263,13 +264,13 @@ Cursor 对照代码、137 tests、`STEP29_CACHE_EVICT_PASS` 及 Step 28–15 vng
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
 | 14 | **create() 忽略 kernel 传入的 mode** | `MemStore::create()` 内部用 `Inode::new_file()` 的默认 mode（`S_IFREG | 0o644`），忽略 kernel 传入的 mode 参数。 | `daemon/src/meta.rs` `create()` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
-| 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 很多时成本较高；未来 Redis/S3 后端需要引用计数或持久化 GC 队列。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` |
+| 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
 | 17 | **未实现 open-unlink 延迟回收** | 当前没有 open handle/refcount ABI；unlink 会立即移除 inode/slice 并回收块，已打开 fd 在 unlink 后继续读写的完整 POSIX 语义尚未建模。 | `daemon/src/meta.rs` `unlink()` |
 | 18 | **RedisMetaStore 是全量快照原型** | 每次读 GET/反序列化整份 JSON；每次写还要全量序列化并 Lua CAS，冲突最多重试 64 次。优点是 rename、inode 分配、slice 裁剪和 GC keys 与元数据在单 key 上线性化；大规模部署需拆 key/索引或采用服务端 Lua 数据模型。 | `daemon/src/meta_redis.rs` |
 | 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
 | 20 | **Redis 快照损坏/丢失时 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，Redis key 已存在但 JSON 非法时 daemon 启动失败；运行中 key 被外部删除时 metadata 操作返回 EIO，避免静默创建新文件系统。 | `daemon/src/meta_redis.rs` |
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
-| 22 | **S3 delete 仍是提交后 best-effort** | Step 15 在 metadata 提交后调用 S3 DeleteObject；成功会真删对象，缺失对象视为成功。网络/权限失败只记录泄漏，不回滚已生效的 unlink/rename/truncate，也没有持久化重试队列。 | `daemon/src/object_store_s3.rs`、`daemon/src/main.rs` |
+| 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 30 将候选存入所选 File/Redis MetaStore；S3 DeleteObject 成功或对象已缺失后确认出队，网络/权限失败按 1–60 秒退避重试且不回滚命名空间。Redis+S3 的共享快照允许多个 daemon 看到同一队列，幂等 delete/CAS ack 可容忍重复处理；尚无跨 Redis/S3 原子事务或队列限流。 | `daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 | 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 28 已用 `read_iter` / `iov_iter` 覆盖普通 read/pread/readv/preadv。完整、对齐且位于单个当前用户 iovec 段的连续 4 KiB blocks 最多合并 128 KiB 并直达 pinned pages；跨段、partial/unaligned、kernel-backed iter 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_iter`。没有真正异步 completion、跨 iovec scatter-gather BIO、page-cache/readahead 或 splice 全覆盖；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
@@ -300,7 +301,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（当前 137 个）
+cargo test                    # 单元测试 + 集成测试（Step 30 工作树当前 141 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -964,6 +965,38 @@ clippy `-D warnings`、内核模块和 tools 均零警告。vng 有若干次 gue
 exit 255，另有一次 Step 25 daemon 重启时 `Transport endpoint is not connected`，
 均立即完整重跑通过。全程未在物理机执行 insmod/mount/cache-device 操作。
 
+### 7.24 Phase 4/控制面 Step 30 DIST-GC 验证
+
+GC queue 是 MetaStore 快照的一部分。unlink、rename-overwrite、truncate 在移除最后
+slice 引用的同一次 mutation 中把 key 加入 `pending_garbage`：FileMetaStore 使用
+同一次 tmp + fsync + rename，RedisMetaStore 使用同一次单 key Lua CAS。delete 成功后
+才以第二次 metadata mutation 确认出队，因此进程在 metadata commit 后或 delete/ack
+之间退出，重启都只会产生安全的幂等重试。
+
+daemon 启动时立即执行一轮；运行期由原同步 event loop 的有限 poll timeout 驱动，
+失败从 1 秒指数退避到 60 秒，新 IPC 活动会重置为 1 秒。这样不引入并发
+FileMetaStore writer；日志输出每轮及进程累计 attempted/deleted/failures 计数。
+
+本步没有修改 `kestrelfs/*.c`、IPC 或 mount 行为，因此按 §8 规则未启动 vng，且没有
+执行任何物理机 insmod/mount/cache-device 操作。2026-09-15 自检：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  141 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C tools
+  Nothing to be done for 'all'; 0 warnings
+REDIS_URL=... cargo test redis_url_gated_full_semantics_and_restart -- --nocapture
+  1 passed; 0 failed
+S3_ENDPOINT=... cargo test s3_environment_gated -- --nocapture
+  2 passed; 0 failed
+```
+
+新增测试覆盖 MemObjectStore 首次 delete 故障后保留队列并成功重试、共享 block 只在
+最后引用移除后入队、FileMetaStore 模拟 commit 后 crash 并在重启时向 LocalFs
+重放、ack 再重启仍为空，以及真实 Redis queue 重启/ack 与 MinIO DeleteObject。
+
 ---
 
 ## 8. 路线图（未做）
@@ -972,8 +1005,8 @@ exit 255，另有一次 Step 25 daemon 重启时 `Transport endpoint is not conn
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 30 DIST-GC** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | 分布式 / POSIX | DIST-META → POSIX…（见 remaining-capabilities §2） |
+| 1 | **Step 31 DIST-META** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | POSIX / 多节点 | POSIX-CORE → CACHE-COHERENCE… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1028,10 +1061,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 29 CACHE-EVICT 已由 Cursor 验收并提交
+- [x] Step 30 DIST-GC 已由 Cursor 验收并提交
 - [x] IPC ABI = 11；cache format = v4
-- [x] Step 8–28 + Phase 4 Step 29 已验收状态已写清
-- [x] 下一步明确：Step 30 DIST-GC（`docs/remaining-capabilities.md` §8）
+- [x] Step 8–29 + Step 30 已验收状态已写清
+- [x] 下一步明确：Step 31 DIST-META（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

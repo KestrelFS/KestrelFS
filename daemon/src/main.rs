@@ -68,9 +68,27 @@ use device::KestrelDevice;
 use fs_model::{Inode, Slice};
 use meta::{MetaError, MetaStore};
 use object_store::ObjectStore;
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const GC_RETRY_BASE: Duration = Duration::from_secs(1);
+const GC_RETRY_MAX: Duration = Duration::from_secs(60);
+static GC_PASSES: AtomicU64 = AtomicU64::new(0);
+static GC_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+static GC_DELETED: AtomicU64 = AtomicU64::new(0);
+static GC_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn next_gc_retry_delay(current: Duration, retry_needed: bool) -> Duration {
+    if retry_needed {
+        current.saturating_mul(2).min(GC_RETRY_MAX)
+    } else {
+        GC_RETRY_BASE
+    }
+}
 
 /// KestrelFS control-plane daemon.
 ///
@@ -282,6 +300,17 @@ fn main() -> io::Result<()> {
 
     println!("kestrelfs-daemon: MetaStore initialized (seeded: /, /remote.txt, /writable.dat)");
 
+    // A metadata mutation and its GC candidates are committed together. Run
+    // one pass before serving requests so a queue left by a previous crash is
+    // retried immediately; later retries are driven by event_loop's poll
+    // timeout without adding a concurrent FileMetaStore writer.
+    runtime.block_on(delete_garbage_objects(
+        "startup",
+        None,
+        &store,
+        &object_store,
+    ));
+
     println!("kestrelfs-daemon: entering poll() event loop, waiting for REQ events ...");
 
     event_loop(&dev, &runtime, &store, &object_store)
@@ -307,17 +336,25 @@ fn event_loop(
         revents: 0,
     };
 
+    let mut retry_delay = GC_RETRY_BASE;
+    let mut retry_at = Instant::now() + retry_delay;
+
     loop {
         pfd.revents = 0;
 
+        let now = Instant::now();
+        let timeout = retry_at
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+
         // SAFETY: `&mut pfd` points at a single valid `libc::pollfd`
-        // on the stack, matching the `nfds = 1` argument. `-1` as the
-        // timeout requests an indefinite block, matching this
-        // function's documented "wait forever" behavior. `poll()`
-        // itself performs no memory access beyond reading/writing
+        // on the stack, matching the `nfds = 1` argument. The bounded
+        // timeout lets the same thread service durable GC retries while
+        // idle. `poll()` itself performs no memory access beyond reading/writing
         // through this one pointer, which is safe C-ABI FFI as long
         // as the pointer and count agree, which they do here.
-        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, -1) };
+        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -337,13 +374,32 @@ fn event_loop(
             )));
         }
 
-        if pfd.revents & libc::POLLIN == 0 {
+        if pfd.revents & libc::POLLIN != 0 {
+            drain_and_respond(dev, runtime, store, object_store);
+            // New mutations attempt GC inline. If that attempt failed, retry
+            // promptly rather than inheriting an older long backoff. Taking
+            // the earlier deadline (instead of assigning now + base) avoids
+            // starving retry under a continuous request stream.
+            retry_delay = GC_RETRY_BASE;
+            retry_at = retry_at.min(Instant::now() + retry_delay);
+        }
+
+        if Instant::now() >= retry_at {
+            let outcome = runtime.block_on(delete_garbage_objects(
+                "retry",
+                None,
+                store,
+                object_store,
+            ));
+            retry_delay = next_gc_retry_delay(retry_delay, outcome.retry_needed);
+            retry_at = Instant::now() + retry_delay;
+        }
+
+        if pfd.revents & libc::POLLIN == 0 && ret > 0 {
             // Spurious wakeup (or POLLHUP with nothing readable);
             // nothing to drain, go back to sleep.
             continue;
         }
-
-        drain_and_respond(dev, runtime, store, object_store);
     }
 }
 
@@ -955,7 +1011,13 @@ async fn handle_unlink_request(
     // Call MetaStore::unlink
     match store.unlink(parent_inode, name).await {
         Ok(garbage_keys) => {
-            delete_garbage_objects(operation, garbage_keys, object_store).await;
+            delete_garbage_objects(
+                operation,
+                Some(&garbage_keys),
+                store,
+                object_store,
+            )
+            .await;
             println!(
                 "kestrelfs-daemon:    OP_UNLINK removed \"{}\" from parent={}",
                 name, parent_inode
@@ -1046,7 +1108,13 @@ async fn handle_rename_request(
         .await
     {
         Ok(garbage_keys) => {
-            delete_garbage_objects(operation, garbage_keys, object_store).await;
+            delete_garbage_objects(
+                operation,
+                Some(&garbage_keys),
+                store,
+                object_store,
+            )
+            .await;
             println!(
                 "kestrelfs-daemon:    {operation} success: \"{}\" -> \"{}\"",
                 req.old_name, req.new_name
@@ -1060,25 +1128,87 @@ async fn handle_rename_request(
     }
 }
 
-/// Deletes keys only after MetaStore has committed the mutation that made them
-/// unreachable. GC failures are logged but do not turn a completed namespace
-/// mutation into a false VFS failure; leaking an object is safer than deleting
-/// before commit or reporting an error that cannot be retried by pathname.
-/// The event loop is sequential and normal writes allocate fresh UUIDs, so a
-/// confirmed-dead key cannot gain a new reference between confirmation and
-/// this delete step.
+#[derive(Default)]
+struct GcPassOutcome {
+    retry_needed: bool,
+}
+
+/// Runs one at-least-once GC pass. Candidates were committed into MetaStore's
+/// durable queue in the same transaction that removed their last reference.
+/// Each pass revalidates the queue against all current slices, deletes objects
+/// idempotently, then acknowledges only successful deletes. A crash between
+/// delete and acknowledgement causes a harmless repeated delete after restart.
 async fn delete_garbage_objects(
     operation: &str,
-    garbage_keys: Vec<String>,
+    requested_keys: Option<&[String]>,
+    store: &Arc<dyn MetaStore>,
     object_store: &Arc<dyn ObjectStore>,
-) {
-    for key in garbage_keys {
-        match object_store.delete(&key).await {
-            Ok(()) => println!("kestrelfs-daemon:    {operation} GC deleted {key}"),
-            Err(error) => eprintln!(
-                "kestrelfs-daemon:    {operation} GC leaked {key}: {error}"
-            ),
+) -> GcPassOutcome {
+    let pass = GC_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+    let pending = match store.pending_garbage().await {
+        Ok(keys) => keys,
+        Err(error) => {
+            let failures = GC_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "kestrelfs-daemon:    DIST-GC pass={pass} source={operation} queue read failed: {error}; total_failures={failures}"
+            );
+            return GcPassOutcome { retry_needed: true };
         }
+    };
+    let requested: Option<HashSet<&str>> = requested_keys
+        .map(|keys| keys.iter().map(String::as_str).collect());
+    let eligible: Vec<_> = pending
+        .into_iter()
+        .filter(|key| {
+            requested
+                .as_ref()
+                .is_none_or(|keys| keys.contains(key.as_str()))
+        })
+        .collect();
+    if eligible.is_empty() {
+        return GcPassOutcome::default();
+    }
+
+    let attempted = eligible.len();
+    let mut acknowledged = Vec::new();
+    let mut delete_failures = 0u64;
+    for key in eligible {
+        GC_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+        match object_store.delete(&key).await {
+            Ok(()) => acknowledged.push(key),
+            Err(error) => {
+                delete_failures += 1;
+                eprintln!(
+                    "kestrelfs-daemon:    DIST-GC source={operation} delete failed for {key}: {error}"
+                );
+            }
+        }
+    }
+
+    let mut ack_failed = false;
+    let mut acknowledged_count = 0usize;
+    if !acknowledged.is_empty() {
+        if let Err(error) = store.acknowledge_garbage(&acknowledged).await {
+            ack_failed = true;
+            eprintln!(
+                "kestrelfs-daemon:    DIST-GC source={operation} queue ack failed after {} idempotent delete(s): {error}",
+                acknowledged.len()
+            );
+        } else {
+            acknowledged_count = acknowledged.len();
+            GC_DELETED.fetch_add(acknowledged.len() as u64, Ordering::Relaxed);
+        }
+    }
+    let failures = delete_failures + u64::from(ack_failed);
+    GC_FAILURES.fetch_add(failures, Ordering::Relaxed);
+    println!(
+        "kestrelfs-daemon:    DIST-GC pass={pass} source={operation} attempted={attempted} acknowledged={acknowledged_count} failed={failures}; totals attempted={} deleted={} failures={}",
+        GC_ATTEMPTED.load(Ordering::Relaxed),
+        GC_DELETED.load(Ordering::Relaxed),
+        GC_FAILURES.load(Ordering::Relaxed)
+    );
+    GcPassOutcome {
+        retry_needed: failures != 0,
     }
 }
 
@@ -1561,7 +1691,13 @@ async fn handle_truncate(
             return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
         }
     };
-    delete_garbage_objects("OP_TRUNCATE", garbage_keys, object_store).await;
+    delete_garbage_objects(
+        "OP_TRUNCATE",
+        Some(&garbage_keys),
+        store,
+        object_store,
+    )
+    .await;
 
     println!(
         "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> success",
@@ -1683,10 +1819,61 @@ async fn read_from_slices(
 mod tests {
     use super::*;
     use crate::meta_persist::FileMetaStore;
-    use crate::object_store::LocalFsObjectStore;
+    use crate::object_store::{LocalFsObjectStore, ObjectStoreError};
     use crate::object_store_s3::S3ObjectStore;
     use meta::{MemStore, REMOTE_TXT_INODE};
+    use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct FailOnceObjectStore {
+        inner: object_store::MemObjectStore,
+        failures_left: Arc<AtomicUsize>,
+    }
+
+    impl FailOnceObjectStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::MemObjectStore::new(),
+                failures_left: Arc::new(AtomicUsize::new(1)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailOnceObjectStore {
+        async fn get(&self, key: &str) -> object_store::Result<Vec<u8>> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: String, value: Vec<u8>) -> object_store::Result<()> {
+            self.inner.put(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> object_store::Result<()> {
+            if self.failures_left.swap(0, Ordering::SeqCst) != 0 {
+                return Err(ObjectStoreError::Io("injected delete failure".to_string()));
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    #[test]
+    fn gc_retry_delay_backs_off_and_caps() {
+        assert_eq!(
+            next_gc_retry_delay(GC_RETRY_BASE, true),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_gc_retry_delay(Duration::from_secs(32), true),
+            GC_RETRY_MAX
+        );
+        assert_eq!(next_gc_retry_delay(GC_RETRY_MAX, true), GC_RETRY_MAX);
+        assert_eq!(
+            next_gc_retry_delay(Duration::from_secs(16), false),
+            GC_RETRY_BASE
+        );
+    }
 
     #[test]
     fn cli_selects_metadata_and_object_backends() {
@@ -3461,6 +3648,106 @@ mod tests {
             Err(object_store::ObjectStoreError::NotFound(_))
         ));
         assert!(!temp_dir.path().join(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn mem_gc_delete_failure_is_queued_and_retried_idempotently() {
+        let flaky = FailOnceObjectStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(flaky.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let inode = store
+            .create(fs_model::ROOT_INODE, "gc-retry", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: meta::current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        flaky.put(key.clone(), vec![42; 32]).await.unwrap();
+        store.append_slice(inode, slice).await.unwrap();
+        let garbage = store
+            .unlink(fs_model::ROOT_INODE, "gc-retry")
+            .await
+            .unwrap();
+
+        let first = delete_garbage_objects(
+            "TEST_FAIL_ONCE",
+            Some(&garbage),
+            &store,
+            &object_store,
+        )
+        .await;
+        assert!(first.retry_needed);
+        assert!(flaky.get(&key).await.is_ok());
+        assert_eq!(store.pending_garbage().await.unwrap(), vec![key.clone()]);
+
+        let second = delete_garbage_objects("TEST_RETRY", None, &store, &object_store).await;
+        assert!(!second.retry_needed);
+        assert!(matches!(flaky.get(&key).await, Err(ObjectStoreError::NotFound(_))));
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+
+        // A post-ack pass is a no-op, proving repeated recovery is safe.
+        let third = delete_garbage_objects("TEST_IDEMPOTENT", None, &store, &object_store).await;
+        assert!(!third.retry_needed);
+    }
+
+    #[tokio::test]
+    async fn file_meta_restart_replays_gc_queue_into_localfs() {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_path = temp_dir.path().join("meta.json");
+        let local_store = LocalFsObjectStore::new(temp_dir.path()).await.unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(local_store.clone());
+        let key;
+
+        {
+            let store: Arc<dyn MetaStore> =
+                Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+            let inode = store
+                .create(
+                    fs_model::ROOT_INODE,
+                    "crash-before-delete",
+                    fs_model::S_IFREG | 0o644,
+                )
+                .await
+                .unwrap();
+            let slice = Slice {
+                chunk_index: 0,
+                slice_id: uuid::Uuid::new_v4(),
+                chunk_offset: 0,
+                length: 48,
+                written_at: meta::current_unix_time(),
+            };
+            key = slice.block_key(0);
+            local_store.put(key.clone(), vec![7; 48]).await.unwrap();
+            store.append_slice(inode, slice).await.unwrap();
+            store
+                .unlink(fs_model::ROOT_INODE, "crash-before-delete")
+                .await
+                .unwrap();
+            assert_eq!(store.pending_garbage().await.unwrap(), vec![key.clone()]);
+            // Drop without calling delete_garbage_objects: this models a crash
+            // immediately after the atomic metadata+queue commit.
+        }
+
+        let restarted: Arc<dyn MetaStore> =
+            Arc::new(FileMetaStore::new(metadata_path.clone()).await.unwrap());
+        assert_eq!(restarted.pending_garbage().await.unwrap(), vec![key.clone()]);
+        assert!(local_store.get(&key).await.is_ok());
+        let outcome =
+            delete_garbage_objects("TEST_STARTUP", None, &restarted, &object_store).await;
+        assert!(!outcome.retry_needed);
+        assert!(matches!(
+            local_store.get(&key).await,
+            Err(ObjectStoreError::NotFound(_))
+        ));
+        drop(restarted);
+
+        let restarted = FileMetaStore::new(metadata_path).await.unwrap();
+        assert!(restarted.pending_garbage().await.unwrap().is_empty());
     }
 
     #[tokio::test]

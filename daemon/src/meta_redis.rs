@@ -81,6 +81,9 @@ enum Mutation {
         new_parent: u64,
         new_name: String,
     },
+    AcknowledgeGarbage {
+        keys: Vec<String>,
+    },
 }
 
 enum MutationOutput {
@@ -205,6 +208,10 @@ impl RedisMetaStore {
                 .rename(*old_parent, old_name, *new_parent, new_name)
                 .await
                 .map(MutationOutput::Garbage),
+            Mutation::AcknowledgeGarbage { keys } => mem
+                .acknowledge_garbage(keys)
+                .await
+                .map(|()| MutationOutput::Unit),
         }
     }
 
@@ -353,6 +360,22 @@ impl MetaStore for RedisMetaStore {
             _ => unreachable!("rename mutation returned wrong output"),
         }
     }
+
+    async fn pending_garbage(&self) -> Result<Vec<String>> {
+        self.load_mem().await?.pending_garbage().await
+    }
+
+    async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()> {
+        match self
+            .mutate(Mutation::AcknowledgeGarbage {
+                keys: keys.to_vec(),
+            })
+            .await?
+        {
+            MutationOutput::Unit => Ok(()),
+            _ => unreachable!("acknowledge_garbage mutation returned wrong output"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,7 +449,7 @@ mod tests {
         store.append_slice(file, newer).await.unwrap();
         let truncate_gc = store.truncate(file, 80).await.unwrap();
         assert!(!truncate_gc.contains(&older_key));
-        assert_eq!(truncate_gc, vec![newer_key]);
+        assert_eq!(truncate_gc, vec![newer_key.clone()]);
 
         let victim = store.create(directory, "victim", 0o644).await.unwrap();
         let victim_slice = Slice {
@@ -444,12 +467,17 @@ mod tests {
                 .rename(directory, "source", directory, "victim")
                 .await
                 .unwrap(),
-            vec![victim_key]
+            vec![victim_key.clone()]
         );
         assert_eq!(
             store.unlink(directory, "data").await.unwrap(),
-            vec![older_key]
+            vec![older_key.clone()]
         );
+
+        let pending = store.pending_garbage().await.unwrap();
+        assert!(pending.contains(&newer_key));
+        assert!(pending.contains(&victim_key));
+        assert!(pending.contains(&older_key));
 
         drop(store);
         let restarted = RedisMetaStore::new(&url, &prefix).await.unwrap();
@@ -459,6 +487,9 @@ mod tests {
             "../target-with-redis"
         );
         assert_eq!(restarted.lookup(directory, "victim").await.unwrap(), source);
+        assert_eq!(restarted.pending_garbage().await.unwrap(), pending);
+        restarted.acknowledge_garbage(&pending).await.unwrap();
+        assert!(restarted.pending_garbage().await.unwrap().is_empty());
 
         let mut connection = restarted.connection.clone();
         let deleted: i32 = redis::cmd("DEL")
