@@ -763,8 +763,13 @@ struct kestrelfs_ring_ctrl {
  *  13 - Phase 4/control-plane step 33: RENAME_DATA payload offset 20 now
  *       carries rename flags. KESTRELFS_RENAME_NOREPLACE is supported;
  *       EXCHANGE and WHITEOUT remain rejected.
+ *
+ *  14 - Phase 4/control-plane step 35: Added the daemon-to-kernel
+ *       KESTRELFS_IOC_INVALIDATE_CACHE_ALL command. Shared-memory and event
+ *       layouts are unchanged; the bump prevents an older daemon from
+ *       silently running without the coherence control command.
  */
-#define KESTRELFS_ABI_VERSION		13
+#define KESTRELFS_ABI_VERSION		14
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -834,6 +839,14 @@ struct kestrelfs_shared_region {
  * without hardcoding the constant on both sides.
  */
 #define KESTRELFS_IOC_GET_REGION_SIZE	_IOR(KESTRELFS_IOC_MAGIC, 3, __u64)
+
+/*
+ * KESTRELFS_IOC_INVALIDATE_CACHE_ALL - daemon requests a durable,
+ * conservative retirement of every local cache entry after observing a
+ * shared-MetaStore revision change. No argument is required. Failure leaves
+ * the current cache disabled so stale bytes cannot be returned.
+ */
+#define KESTRELFS_IOC_INVALIDATE_CACHE_ALL _IO(KESTRELFS_IOC_MAGIC, 4)
 
 /* ------------------------------------------------------------------
  * Compile-time layout guarantees (checked under BOTH kernel-C and

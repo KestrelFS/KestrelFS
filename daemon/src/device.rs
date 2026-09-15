@@ -215,6 +215,21 @@ impl KestrelDevice {
         Ok(())
     }
 
+    /// Durably retires every entry in the kernel-owned local cache. Redis
+    /// metadata coherence uses this conservative operation when its shared
+    /// revision changes; no cache bytes or metadata are passed through the
+    /// shared bounce buffer.
+    pub fn invalidate_cache_all(&self) -> io::Result<()> {
+        // SAFETY: `self.fd` is live and INVALIDATE_CACHE_ALL is an `_IO`
+        // command with no userspace pointer. The kernel serializes the cache
+        // mutation against hit/fill/invalidate paths.
+        let ret = unsafe { libc::ioctl(self.fd, ioctl::INVALIDATE_CACHE_ALL as _) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Returns the raw file descriptor, for use in a `libc::pollfd`
     /// (see `main.rs`'s event loop).
     pub fn as_raw_fd(&self) -> RawFd {

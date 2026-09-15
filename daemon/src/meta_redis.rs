@@ -1023,6 +1023,19 @@ impl MetaStore for RedisMetaStore {
             _ => unreachable!("acknowledge_garbage mutation returned wrong output"),
         }
     }
+
+    async fn coherence_revision(&self) -> Result<Option<u64>> {
+        let mut connection = self.connection.clone();
+        let control: HashMap<String, String> = redis::cmd("HGETALL")
+            .arg(&self.keys.control)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| Self::report_backend_error("coherence revision read failed", error))?;
+        let (revision, _) = Self::parse_control(&control).map_err(|error| {
+            Self::report_backend_error("coherence control record invalid", error)
+        })?;
+        Ok(Some(revision))
+    }
 }
 
 #[cfg(test)]
@@ -1194,10 +1207,15 @@ mod tests {
 
         let prefix = format!("kestrelfs:test:{}", Uuid::new_v4());
         let store = RedisMetaStore::new(&url, &prefix).await.unwrap();
+        let initial_revision = store.coherence_revision().await.unwrap().unwrap();
 
         let directory = store.mkdir(ROOT_INODE, "redis-dir", 0o1711).await.unwrap();
         let peer = RedisMetaStore::new(&url, &prefix).await.unwrap();
-        assert_eq!(peer.getattr(directory).await.unwrap().mode, S_IFDIR | 0o1711);
+        assert!(peer.coherence_revision().await.unwrap().unwrap() > initial_revision);
+        assert_eq!(
+            peer.getattr(directory).await.unwrap().mode,
+            S_IFDIR | 0o1711
+        );
         assert_eq!(peer.getattr(directory).await.unwrap().nlink, 2);
         assert_eq!(peer.getattr(ROOT_INODE).await.unwrap().nlink, 3);
 

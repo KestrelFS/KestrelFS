@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 34 POSIX-ATTR（create/mkdir mode + 目录 nlink）已由 Cursor 验收并纳入本提交（IPC ABI v13、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 35 CACHE-COHERENCE（Redis revision→全 cache 失效）已由 Cursor 验收并纳入本提交（IPC ABI v14、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 34 POSIX-ATTR 已验收；下一步 Step 35 = CACHE-COHERENCE（见 remaining-capabilities §8） |
+| 当前阶段 | Step 35 CACHE-COHERENCE 已验收；下一步 Step 36 = POSIX-LIFECYCLE（见 remaining-capabilities §8） |
 
 ---
 
@@ -58,9 +58,9 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 35 每 100 ms 探测该 durable revision，变化或探测失败时通知内核保守全失效。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或多节点失效。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 35 由 Redis daemon 经 ABI v14 ioctl 请求 v4-journal 保护的全 cache 失效，形成最小远端 mutation 闭环。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -123,6 +123,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step33-renameat2.c       # renameat2 小助手（供 Step 33 vng 使用）
 ├── test-step34-posix-attr-vng.sh # Step 34 mode/目录 nlink/重启恢复回归
 ├── test-step34-posix-attr.c      # open/mkdir 原始 mode 测试辅助程序
+├── test-step35-cache-coherence-vng.sh # Step 35 Redis revision→全 cache 失效回归
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -172,6 +173,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 32** | **硬链接：持久化 nlink、多 dirent 同 inode、末引用 GC、VFS `.link`** | **12** | **✅ 已验收** |
 | **Phase 4/控制面 Step 33** | **rename flags：原子 `RENAME_NOREPLACE`；EXCHANGE/WHITEOUT 仍拒绝** | **13** | **✅ 已验收** |
 | **Phase 4/控制面 Step 34** | **create/mkdir mode + 持久化目录 nlink + VFS 属性刷新** | **13（未变）** | **✅ 已验收** |
+| **Phase 4/控制面 Step 35** | **Redis durable revision 轮询 + ABI v14 全 cache 持久失效** | **14** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -182,9 +184,12 @@ Cursor 对照代码、158 tests 与 `STEP33_POSIX_RENAME_PASS` 确认 Step 33 �
 Cursor 对照代码、162 tests 与 `STEP34_POSIX_ATTR_PASS` 确认 Step 34 已验收。
 create/mkdir 持久化 `0o7777` 权限位；目录 nlink=`2+子目录数`。ABI **v13**；format **v4**。
 
-下一步：**Step 35 CACHE-COHERENCE**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、164 tests 与 `STEP35_CACHE_COHERENCE_PASS` 确认 Step 35 已验收。
+Redis daemon 轮询 durable revision，经 ABI v14 ioctl 做 v4-journal 全 cache 失效。ABI **v14**；format **v4**。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 13`（含 `RENAME_DATA` flags）
+下一步：**Step 36 POSIX-LIFECYCLE**，提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 14`（含 `INVALIDATE_CACHE_ALL`）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -200,7 +205,7 @@ create/mkdir 持久化 `0o7777` 权限位；目录 nlink=`2+子目录数`。ABI 
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 13`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 14`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -216,6 +221,7 @@ create/mkdir 持久化 `0o7777` 权限位；目录 nlink=`2+子目录数`。ABI 
 11. Phase 3 Step 14：新增 SYMLINK_DATA / READLINK_DATA；link name 与 target 通过同一 16 KiB bounce 传输，target 仅存 MetaStore
 12. Phase 4/控制面 Step 32：新增 LINK_DATA；payload 携带 parent inode、现有 inode 与 name_len，新名字位于 bounce，响应返回持久化 nlink
 13. Phase 4/控制面 Step 33：扩展 RENAME_DATA payload，offset 20 增加 u32 rename flags；支持 `RENAME_NOREPLACE`
+14. Phase 4/控制面 Step 35：新增 daemon→kernel `KESTRELFS_IOC_INVALIDATE_CACHE_ALL`；共享内存与 opcode 布局未变
 
 ### 5.4 已实现 Opcode 列表
 
@@ -294,7 +300,7 @@ create/mkdir 持久化 `0o7777` 权限位；目录 nlink=`2+子目录数`。ABI 
 | 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 28 已用 `read_iter` / `iov_iter` 覆盖普通 read/pread/readv/preadv。完整、对齐且位于单个当前用户 iovec 段的连续 4 KiB blocks 最多合并 128 KiB 并直达 pinned pages；跨段、partial/unaligned、kernel-backed iter 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_iter`。没有真正异步 completion、跨 iovec scatter-gather BIO、page-cache/readahead 或 splice 全覆盖；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
 | 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前 v4 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2/v3 不自动迁移；Step 27 工具只提供显式 metadata wipe。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
-| 27 | **多节点失效仍未闭环** | namespace identity 只防止不同 logical filesystem 混用 cache，不处理同 namespace 的远端 mutation。当前只观察本机 VFS mutation，其他节点或直接 Redis mutation 不会通知本内核失效。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 27 | **远端 cache coherence 仍是最终一致、粗粒度原型** | Step 35 在 Redis 模式每 100 ms 轮询全 namespace revision；变化或 probe 失败即经 ABI v14 ioctl 用 v4 journal 保守清空全部本地 entry，daemon 启动也先清空恢复索引。远端提交到下一次 probe 前仍有短暂旧 hit 窗口；daemon 离线期间没有 lease，且任一 metadata mutation 都会整盘失效，尚无按 inode/range pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
 | 28 | **batch block-LRU 热度仍只在内存** | Step 29 默认一次退休 16 个 LRU victim（至多总槽位 1/16），用一份 journal 并按 index page 合并清零；连续 fill 可消费预回收槽位，MRU 尾部受到小批量保护。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后仍按 generation 恢复 insertion-order 近似。没有分区配额/租户热点隔离；victim 分散时仍需每个 index page 一次同步写，fill/invalidate 仍逐次 journal。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
 
@@ -320,7 +326,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 34 验收基线 162 个）
+cargo test                    # 单元测试 + 集成测试（Step 35 验收基线 164 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1150,6 +1156,44 @@ Step 34 脚本显式 `insmod`，仅在 vng guest 创建 loop，使用独立
 mount 或 zvol。尚未实现 chmod/chown/时间属性 mutation；open-unlink、
 EXCHANGE/WHITEOUT 等范围也未扩大。
 
+### 7.29 Phase 4/控制面 Step 35 CACHE-COHERENCE
+
+选择 daemon 驱动的保守失效：Redis v2 `control.revision` 是每次 Lua mutation 都会
+原子递增的 durable namespace 版本。Redis daemon 每 100 ms 读取该字段；revision
+变化或 probe 失败时，通过 ABI v14 新增的
+`KESTRELFS_IOC_INVALIDATE_CACHE_ALL` 请求内核退休所有本地 cache entry。daemon
+启动时在连接 MetaStore 和进入服务循环前也执行一次全失效，防止离线期间发生远端
+mutation 后复用旧持久索引。MemStore/FileMetaStore 返回 `None`，不启用轮询。
+
+全失效与 hit/fill/invalidate/evict 共用 cache rwsem 写侧，并先推进 mutation epoch；
+每条 entry 继续使用 v4 invalidate intent journal，提交后才从 hash/LRU/bitmap 释放。
+若任一持久化退休失败，内核立即销毁其余内存索引并禁用本次模块生命周期的 cache，
+宁可全部 miss 而不返回可能过期的数据。共享内存、opcode、payload 和 cache format
+均未改变；仅 ioctl 合约令 IPC ABI v13 → v14。只读 sysfs 计数
+`cache_coherence_invalidations` 记录成功的 daemon 全失效次数。
+
+Cursor 验收自检（2026-09-15）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  164 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 ./test-step35-cache-coherence-vng.sh"
+  STEP35_READER_CACHE_HIT_PASS hits_delta=1
+  STEP35_REMOTE_REVISION_INVALIDATE_PASS
+  STEP35_DAEMON_FREE_NEW_HIT_PASS
+  STEP35_CACHE_COHERENCE_PASS (umount_ms=24)
+```
+
+Step 35 脚本只在 vng guest 创建 loop、显式 `insmod`、传合法 namespace，并使用
+独立 `/tmp/kestrelfs-step35-$$` 与保留的 daemon.log。宿主机未执行模块、mount 或
+cache-device 操作。已知限制：100 ms 最终一致窗口、整盘失效粗粒度、非 Redis 后端
+不启用轮询。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1158,8 +1202,8 @@ EXCHANGE/WHITEOUT 等范围也未扩大。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 35 CACHE-COHERENCE** | 多节点 / 远端 mutation 的本地 cache 失效；见 §8 |
-| 2 | 其余 POSIX | open-unlink、EXCHANGE/WHITEOUT、chmod… |
+| 1 | **Step 36 POSIX-LIFECYCLE** | open-unlink 延迟回收；见 §8 |
+| 2 | 其余 POSIX / DIST | EXCHANGE/WHITEOUT、chmod、DIST-OBJECT… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1214,10 +1258,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 34 POSIX-ATTR（mode + 目录 nlink）已由 Cursor 验收并提交
-- [x] IPC ABI = 13；cache format = v4
-- [x] Step 8–33 + Step 34 已验收状态已写清
-- [x] 下一步明确：Step 35 CACHE-COHERENCE（`docs/remaining-capabilities.md` §8）
+- [x] Step 35 CACHE-COHERENCE 已由 Cursor 验收并提交
+- [x] IPC ABI = 14；cache format = v4
+- [x] Step 8–34 + Step 35 已验收状态已写清
+- [x] 下一步明确：Step 36 POSIX-LIFECYCLE（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

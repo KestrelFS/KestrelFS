@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-15，Cursor（验收 Step 34；选定 Step 35 = CACHE-COHERENCE）
+> 最后更新：2026-09-15，Codex（Step 35 CACHE-COHERENCE 实现完成，待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -15,7 +15,7 @@
 
 - Phase 4 cache、DIST、硬链接、`RENAME_NOREPLACE`、mode/目录 nlink（Step 24–34）均已验收。
 - Redis metadata 为 v2 分记录 HASH/SET + Lua revision-CAS；点查定向读。
-- IPC ABI **v13**，cache format **v4**。
+- 工作树 IPC ABI **v14**，cache format **v4**；Step 35 尚待 Cursor 验收。
 - cache/mount 测试只允许在 vng guest + loop；禁止触碰宿主机 zvol。
 
 状态约定：`PROPOSED` / `DECIDED` / `IMPLEMENTING` / `REVIEW` / `ACCEPTED` / `DEFERRED`。
@@ -25,7 +25,7 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–10 | cache + DIST + POSIX 子集 | Step 24–34 | **ACCEPTED** | 单节点 POSIX 主缺口已明显收窄 |
-| 11 | CACHE-COHERENCE | Step 35 多节点/远端失效 | **DECIDED** | 共享 MetaStore 部署下的正确性门槛 |
+| 11 | CACHE-COHERENCE | Step 35 多节点/远端失效 | **REVIEW** | daemon 轮询 Redis revision，持久化全 cache 失效闭环待验收 |
 | 12 | POSIX-LIFECYCLE | open-unlink | PROPOSED | 价值高但 inode 生命周期风险更大 |
 | — | RENAME_EXCHANGE / WHITEOUT / chmod | 其余 POSIX | PROPOSED | 可后补 |
 | — | CACHE-WRITE | 写缓存 | **DEFERRED** | 默认只读 fill cache |
@@ -47,9 +47,11 @@ CACHE-* 主线已 ACCEPTED；`CACHE-WRITE` 仍 DEFERRED；本步推进 `CACHE-CO
 
 ### CACHE-COHERENCE — Step 35
 
-- 状态：`DECIDED`
-- 缺口：本机只观察本 VFS mutation；其他节点或直接 Redis mutation 不会通知本内核失效。
-- 范围：见 §8（允许最小可测闭环，不必一次做完生产级 pub/sub）。
+- 状态：`REVIEW`
+- 实现：Redis daemon 每 100 ms 读取 durable revision；变化或探测故障时经 ABI v14
+  ioctl 请求内核用 v4 journal 逐条退休本地 cache。Redis daemon 启动时也先全失效，
+  防止离线期间积累的远端 mutation 被旧持久 cache 命中。
+- 权衡：最小闭环采用保守整盘 cache 失效，未实现按 inode/range 消息或生产级 pub/sub。
 
 ### open-unlink / DIST-OBJECT / IPC-SCALE
 
@@ -68,6 +70,8 @@ OPS-CONFIG / TEST-PERF / DOC-CLEANUP 仍为 `PROPOSED`。
 | 2026-09-15 | Codex | POSIX-ATTR | 实现与自检 | **REVIEW** |
 | 2026-09-15 | Cursor | POSIX-ATTR | Step 34 验收 | **ACCEPTED**；162 tests + vng PASS |
 | 2026-09-15 | Cursor | CACHE-COHERENCE | 选定 Step 35 | **DECIDED**；见 §8 |
+| 2026-09-15 | Codex | CACHE-COHERENCE | Step 35 开工 | **IMPLEMENTING**；选择 daemon 轮询 Redis revision 后经 ioctl 保守失效全部 cache |
+| 2026-09-15 | Codex | CACHE-COHERENCE | 实现与自检完成 | **REVIEW**；ABI v14、format v4；164 tests + Step 35/25/20/21/34 vng PASS |
 
 ## 7. 不应顺手扩大
 
@@ -121,6 +125,31 @@ Redis TLS 大重构、自动 wipe、iget5 重设计。
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-15 — Step 35 CACHE-COHERENCE（Codex REVIEW）
+
+- **方案选择**：采用 A（daemon 驱动失效）。Redis v2 `control.revision` 已由每次
+  Lua mutation 原子递增，daemon 每 100 ms 轮询；revision 变化或 probe 失败时调用
+  新增的 `KESTRELFS_IOC_INVALIDATE_CACHE_ALL`。相比仅靠易丢失的 pub/sub，durable
+  revision 能在断线恢复后发现变化；代价是至多一个 poll interval 的最终一致窗口、
+  每次变化保守清空整个本地 cache，以及额外的 Redis `HGETALL control`。
+- **ABI / cache 安全**：IPC ABI v13 → v14；共享内存、opcode 和 payload 不变，新增
+  daemon→kernel `_IO(..., 4)`。cache format 保持 v4。内核在 cache rwsem 写侧推进
+  mutation epoch，并对每个 entry 执行既有 invalidate journal 后才释放 slot；持久化
+  失效失败时销毁全部内存索引并禁用本次模块生命周期的 hit/fill，避免返回旧数据。
+  Redis daemon 每次启动在接入服务前先全失效，覆盖 daemon 离线期间的远端变更。
+- **验证**：`cargo test --manifest-path daemon/Cargo.toml` 为 **164 passed**；clippy
+  `-D warnings` 与 `make -C kestrelfs` 零警告。`test-step35-cache-coherence-vng.sh`
+  仅在 vng guest 使用 loop、显式 `insmod`、合法 namespace 和独立 data-dir；用临时
+  Redis 7.4.11 构造 reader 已命中后直接远端 revision-CAS overwrite，得到
+  `STEP35_READER_CACHE_HIT_PASS`、`STEP35_REMOTE_REVISION_INVALIDATE_PASS`、
+  `STEP35_DAEMON_FREE_NEW_HIT_PASS`、`STEP35_CACHE_COHERENCE_PASS`（umount 23 ms）。
+  Step 25 journal、Step 20/21 cache/namespace 与 Step 34 POSIX vng 回归也通过。
+- **限制 / 未做**：不是线性一致 lease；远端提交后到下一次 100 ms probe 前仍可能
+  短暂命中旧数据，daemon 整段离线期间也无法接收通知。未做生产 pub/sub、按
+  inode/range 精细失效、write-back、open-unlink、chmod、EXCHANGE/WHITEOUT、Redis
+  TLS/reconnect、自动 wipe。远端 Redis 原测试凭据在本轮返回 `WRONGPASS`，因此 vng
+  使用退出即删除的临时 Redis 容器完成真实协议测试，未将凭据写入仓库。
 
 ### 2026-09-15 — Step 34 POSIX-ATTR（Cursor ACCEPTED）
 

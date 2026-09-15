@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–29）
+## 当前边界（Step 18–35）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -80,6 +80,16 @@ fill 使用其中一个，其余供连续 fill 直接使用。LRU 尾部的近�
 victim 集合；rwsem 写侧仍等待 pinned-page reader 完成。IPC ABI v11、superblock、
 index entry 和 cache format v4 均未改变。
 
+Step 35 选择 daemon 驱动的最小远端 coherence 闭环。Redis v2 的每次 Lua
+metadata mutation 都会原子递增 durable `control.revision`；daemon 启动时先请求
+内核全失效恢复的本地索引，之后每 100 ms 探测 revision。revision 变化或探测失败
+时，daemon 经 `KESTRELFS_IOC_INVALIDATE_CACHE_ALL` 请求内核在 cache rwsem 写侧、
+用既有 v4 invalidate journal 逐条退休全部 entry。若持久化退休失败，内核销毁
+所有内存索引并禁用该模块生命周期的 hit/fill，宁可 miss 而不返回可能过期的数据。
+共享内存/opcode/payload 与 cache format v4 不变；新增 daemon→kernel ioctl 使 IPC
+ABI v13 bump 到 v14。这个方案用粗粒度和轮询延迟换取不依赖易丢事件的 durable
+检测，不是生产级 lease 或按 inode/range pub/sub。
+
 ## 缓存设备
 
 缓存后端必须是 Linux 块设备节点，例如：
@@ -138,7 +148,9 @@ dataset 时必须使用不同 digest。
 同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。六个只读
 观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks`、
 `cache_direct_fallbacks`、`cache_evictions`、`cache_checksum_failures` 和
-`cache_journal_recoveries` 可从 sysfs 读取；它们不是稳定用户 ABI。
+`cache_journal_recoveries` 可从 sysfs 读取；Step 35 另有
+`cache_coherence_invalidations` 记录成功的 daemon 全失效次数。它们都不是稳定用户
+ABI。
 
 `cache_evict_batch` 默认为 16，合法范围 1–64；实际单批还限制为总槽位的 1/16
 （至少 1），避免小 cache 被一次扫空。`cache_eviction_batches`、
@@ -224,9 +236,10 @@ VFS read/readv -> read_iter
 ```
 
 hook 位于 `kestrelfs_data_ipc_lock` 之前，因此 hit 不占 bounce buffer，也不会与
-单 in-flight data/name IPC 串行化。miss 继续使用 ABI v11，共享内存布局和同步
-模型均不改变。只有请求的整个 EOF-clamped 范围都有索引时才按 hit 返回；否则
-整次请求安全回退到 READ_DATA，避免把部分结果暴露给调用者。
+单 in-flight data/name IPC 串行化。miss 沿用既有 `READ_DATA` 编码（当前整体协议为
+ABI v14），共享内存布局和同步模型均不改变。只有请求的整个 EOF-clamped 范围都
+有索引时才按 hit 返回；否则整次请求安全回退到 READ_DATA，避免把部分结果暴露给
+调用者。
 
 直达路径只处理 read 范围完整覆盖、且完全位于当前单个用户 iovec 段的 cache block，
 绝不把 4 KiB BIO 指向只允许修改其中一部分或属于下一段的用户区间。连续的 file
@@ -284,6 +297,13 @@ journal 清零提交后才释放 slot；任一 metadata BIO 失败都会让相�
 期间发生，返回数据不会再被发布为 cache fill。普通 rename 不改变源 inode
 内容，因此只在覆盖已存在目标时失效目标 inode。
 
+Redis 共享 MetaStore 还有一条 daemon→kernel 远端失效路径：daemon 启动时先全
+失效；运行中看到 `control.revision` 与上次观测值不同，或无法确定当前 revision，
+即发 `INVALIDATE_CACHE_ALL`。该操作先推进同一 mutation epoch，阻止并发 miss 返回
+的旧数据再次发布，再按 v4 journal 提交每个索引清零。全失效与本机 inode 失效、
+fill、evict 共享 rwsem 写侧，所以 pinned-page hit 要么在失效前完整结束，要么在
+失效后 miss。FileMetaStore/MemStore 没有共享 revision，不启用这一路径。
+
 `kestrelfs_cache_lock` 是 rwsem。hit 的读侧覆盖 index 检查、用户页 pin、整个同步
 BIO、CRC 和 unpin；invalidate/fill/evict/journal mutation 必须取得写侧。因此正在
 进行的 hit 要么在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot
@@ -316,9 +336,10 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
-- 只观察本机 VFS mutation；其他节点或直接修改 Redis 的操作没有失效通知，
-  所以 Step 20 仍是单 kernel/daemon correctness prototype，不可直接作为共享
-  Redis+S3 多节点缓存部署。
+- Step 35 能发现其他节点或直接 Redis mutation 对 durable revision 的推进，但它是
+  每 100 ms 轮询后的保守全 cache 失效：远端提交到下一次 probe 前仍可能读到旧
+  hit，daemon 离线期间也没有 lease/通知，因此还不是线性一致的共享 Redis+S3
+  多节点缓存。尚无按 inode/range 精细消息或生产级 pub/sub/reconnect 运维。
 - v1/v2/v3 cache 默认拒绝且不自动迁移；没有自动或模块参数 wipe。Step 27 仅提供
   离线、块设备专用、双确认的 metadata wipe。
 - exclusive holder 防止其他内核 holder 抢占设备，但不能在所有内核配置下阻止
@@ -462,3 +483,32 @@ admin 报告 `journal_batch_count=16` / recovery-required；模块恢复整批�
 `STEP29_BATCH_RECOVERY_PASS`、`STEP29_CACHE_EVICT_PASS`，umount 253 ms。全部模块、挂载和 cache_device 操作只在
 vng guest 内执行；脚本显式 insmod、使用 loop、合法 namespace、独立 data-dir，
 并保留 daemon.log。
+
+## Step 35 远端 coherence 验证
+
+`test-step35-cache-coherence-vng.sh` 需要 `REDIS_URL` 指向一次性测试数据库；脚本用
+随机 prefix，不把 URL 或凭据写入仓库。所有模块、mount 和 cache-device 操作仍只
+在 vng guest 进行：创建 PID 隔离的 loop image/data-dir，显式 `insmod` 并传合法
+namespace，daemon 输出保留到 `daemon.log`。
+
+脚本先经本机 VFS 写入 4 KiB `A`，等待本次 revision 被 poll 后连续读取，要求
+cache hit 计数上升。随后模拟另一控制面 writer：先在共享 LocalFs ObjectStore 写入
+新 immutable block，再用 Lua CAS 原子替换 Redis v2 inode/slice 字段并递增
+revision。reader daemon 必须观察新 revision，`cache_coherence_invalidations` 上升，
+旧 `A` entry 不得继续命中；第一次读取应从新 slice 得到 `B` 并 fill，第二次命中
+`B`。最后停止 daemon 再读仍得到 `B`，证明新填充的 kernel cache 不依赖 IPC。
+
+2026-09-15 Codex vng 自检输出：
+
+```text
+STEP35_READER_CACHE_HIT_PASS hits_delta=1
+STEP35_REMOTE_REVISION_INVALIDATE_PASS
+STEP35_DAEMON_FREE_NEW_HIT_PASS
+STEP35_CACHE_COHERENCE: umount_ms=23
+STEP35_CACHE_COHERENCE_PASS
+```
+
+同一工作树还复跑 `STEP25_CACHE_TXN_PASS`、`STEP21_NAMESPACE_PASS`、
+`STEP20_CACHE_PASS` 和 `STEP34_POSIX_ATTR_PASS`。本轮提供的远端 Redis 凭据返回
+`WRONGPASS`，因此测试临时使用退出即删除、无持久卷的 Redis 7.4.11 容器；guest
+经 QEMU user-network host gateway 连接，容器在测试后停止删除。

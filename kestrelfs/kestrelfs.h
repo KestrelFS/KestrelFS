@@ -52,6 +52,7 @@ ssize_t kestrelfs_cache_read_iter(struct inode *inode, struct iov_iter *to,
 void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
 			  size_t length, u64 miss_epoch);
 int kestrelfs_cache_invalidate_inode(u64 inode_id);
+int kestrelfs_cache_invalidate_all(void);
 
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;

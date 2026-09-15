@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 34 POSIX-ATTR 已验收；下一步 Step 35 CACHE-COHERENCE；IPC ABI v13；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 35 CACHE-COHERENCE 已验收；下一步 Step 36 POSIX-LIFECYCLE；IPC ABI v14；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -32,8 +32,10 @@
 > 会幂等重试删除。Step 31 已将 Redis metadata 拆为 v2 分记录 schema，并用 Lua
 > revision-CAS 原子提交字段级变更。Step 32 已支持持久化硬链接、末引用 GC 与内核
 > `.link`。Step 33 已支持原子 `RENAME_NOREPLACE`；Step 34 已补齐 create/mkdir mode 与
-> 持久化目录 nlink（`EXCHANGE`/`WHITEOUT`、open-unlink、chmod 仍未实现）。
-> 真正的异步 completion 流水线与多节点失效尚未实现。详见[路线图](#路线图)、
+> 持久化目录 nlink。Step 35 通过 Redis durable revision 轮询与 ABI v14
+> daemon→kernel ioctl 保守清空本地 cache，形成远端 mutation 最小闭环
+> （`EXCHANGE`/`WHITEOUT`、open-unlink、chmod 仍未实现）。真正的异步 completion
+> 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -103,7 +105,8 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
   校验、对齐 hit 直达用户页、LRU 回收、CRC 校验、v4 intent journal，以及共享
   读锁下的并行同步 BIO 命中；离线工具可 inspect 并在双确认后重置 metadata；
   `read_iter` 让普通和 vectored read 共用结构化 iov 路径；满盘时可批量退休 LRU
-  victim 并合并同一 index page 的清零写。
+  victim 并合并同一 index page 的清零写。Step 35 允许 Redis daemon 在
+  durable revision 改变或探测失败时请求内核持久化全 cache 失效。
   详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
 - 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
@@ -131,7 +134,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–34 已验收；下一步 Step 35 CACHE-COHERENCE（ABI v13 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–35 已验收；下一步 Step 36 POSIX-LIFECYCLE（ABI v14 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -146,7 +149,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v13）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v14）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -157,6 +160,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step33-renameat2.c         # renameat2 flags 测试辅助程序
 ├── test-step34-posix-attr-vng.sh   # create/mkdir mode、目录 nlink 与重启恢复
 ├── test-step34-posix-attr.c        # 原始 open/mkdir mode 测试辅助程序
+├── test-step35-cache-coherence-vng.sh # Redis revision→本地 cache 全失效
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -301,6 +305,9 @@ S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 C
 Step 31 已验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
 queue 拆到独立 HASH/SET；点查只读取目标 field，复合 mutation 用 Lua
 revision-CAS 原子提交字段级 diff。旧 `<PREFIX>:meta:v1` 默认拒绝且不自动迁移。
+Step 35 复用该 durable revision：Redis daemon 启动时先清空恢复的本地 cache，
+运行中每 100 ms 探测 revision；变化或探测失败时经 ABI v14 ioctl 请求内核以 v4
+journal 保守退休全部 entry。该原型是有短暂窗口的最终一致失效，不是生产级 lease。
 可选集成测试：
 
 ```bash
@@ -374,6 +381,9 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step26-cache-async-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step33-posix-rename-vng.sh"
+# Step 35 需要 guest 可达的测试 Redis；REDIS_URL 不写入仓库或日志。
+vng --run --network user --cwd "$PWD" \
+  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 $PWD/test-step35-cache-coherence-vng.sh"
 # … Step 23/22/20/19/15 等脚本见 HANDOFF.md §7
 ```
 
@@ -417,7 +427,7 @@ offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 Ki
 
 Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
 truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链接，Step 33
-支持 `RENAME_NOREPLACE`（ABI v13）；Step 34 支持 create/mkdir mode 与
+支持 `RENAME_NOREPLACE`；Step 34 支持 create/mkdir mode 与
 `2 + 直接子目录数` 的持久化目录 nlink。仍缺：
 
 - 尚无 open-unlink 延迟回收、chmod/chown 属性 mutation；symlink 目标目前要求
@@ -430,9 +440,11 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链
   引用确认也仍需聚合扫描。当前仅支持 `redis://` 与一条 multiplexed connection，
   尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。S3 delete 失败会保留队列并
   重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加 IPC 尾延迟。
-- Phase 4 仍是单节点原型：v4 绑定 namespace；CRC32 非密码学；半提交可安全
-  miss，但无双 superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO
-  仍同步等待，mutation 会等待在途 reader；无多节点远端失效。Step 29 可用一次
+- Phase 4 v4 绑定 namespace；CRC32 非密码学；半提交可安全 miss，但无双
+  superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO 仍同步等待，
+  mutation 会等待在途 reader。Step 35（ABI v14）只提供 Redis revision 每 100 ms
+  轮询后的保守全 cache 失效：提交到 probe 前仍可能短暂旧 hit，daemon 离线期间
+  无 lease，也没有按 inode/range 消息或生产级 pub/sub。Step 29 可用一次
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 28 已覆盖 read/pread/readv/preadv；pinned BIO 只在单个当前 iovec 段内合并，

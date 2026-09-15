@@ -371,6 +371,10 @@ static __poll_t kestrelfs_poll(struct file *file, poll_table *wait)
  * KESTRELFS_IOC_GET_REGION_SIZE:
  *     Read back KESTRELFS_SHM_REGION_SIZE so userspace can size its
  *     mmap() call without hardcoding the constant redundantly.
+ *
+ * KESTRELFS_IOC_INVALIDATE_CACHE_ALL:
+ *     Persistently retire all local cache entries after the daemon observes
+ *     a shared metadata revision change.
  */
 static long kestrelfs_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
@@ -397,6 +401,9 @@ static long kestrelfs_ioctl(struct file *file, unsigned int cmd,
 			return -EFAULT;
 		return 0;
 	}
+
+	case KESTRELFS_IOC_INVALIDATE_CACHE_ALL:
+		return kestrelfs_cache_invalidate_all();
 
 	default:
 		return -ENOTTY;

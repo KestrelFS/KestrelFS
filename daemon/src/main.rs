@@ -77,6 +77,7 @@ use std::time::{Duration, Instant};
 
 const GC_RETRY_BASE: Duration = Duration::from_secs(1);
 const GC_RETRY_MAX: Duration = Duration::from_secs(60);
+const COHERENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 static GC_PASSES: AtomicU64 = AtomicU64::new(0);
 static GC_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static GC_DELETED: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +89,10 @@ fn next_gc_retry_delay(current: Duration, retry_needed: bool) -> Duration {
     } else {
         GC_RETRY_BASE
     }
+}
+
+fn coherence_revision_changed(observed: Option<u64>, current: Option<u64>) -> bool {
+    matches!((observed, current), (Some(old), Some(new)) if old != new)
 }
 
 /// KestrelFS control-plane daemon.
@@ -203,6 +208,14 @@ fn main() -> io::Result<()> {
         abi::ABI_VERSION,
         abi::SHM_REGION_SIZE
     );
+
+    // A Redis daemon may have been offline while another node committed
+    // mutations. Retire every restored local entry before connecting to the
+    // shared MetaStore, so an old cache cannot become a hit during startup.
+    if args.meta.is_some() {
+        dev.invalidate_cache_all()?;
+        println!("kestrelfs-daemon: Redis coherence startup cache invalidation complete");
+    }
 
     // A single, small multi-thread-capable Tokio runtime, created
     // once and kept alive for the process lifetime purely to
@@ -338,12 +351,20 @@ fn event_loop(
 
     let mut retry_delay = GC_RETRY_BASE;
     let mut retry_at = Instant::now() + retry_delay;
+    let mut coherence_revision = runtime
+        .block_on(store.coherence_revision())
+        .map_err(|error| io::Error::other(format!("initial coherence probe failed: {error}")))?;
+    let mut coherence_at = coherence_revision.map(|revision| {
+        println!("kestrelfs-daemon: Redis coherence polling enabled at revision {revision}");
+        Instant::now() + COHERENCE_POLL_INTERVAL
+    });
 
     loop {
         pfd.revents = 0;
 
         let now = Instant::now();
-        let timeout = retry_at
+        let wake_at = coherence_at.map_or(retry_at, |deadline| retry_at.min(deadline));
+        let timeout = wake_at
             .saturating_duration_since(now)
             .as_millis()
             .min(i32::MAX as u128) as i32;
@@ -393,6 +414,32 @@ fn event_loop(
             ));
             retry_delay = next_gc_retry_delay(retry_delay, outcome.retry_needed);
             retry_at = Instant::now() + retry_delay;
+        }
+
+        if coherence_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            match runtime.block_on(store.coherence_revision()) {
+                Ok(current) => {
+                    if coherence_revision_changed(coherence_revision, current) {
+                        let previous = coherence_revision.expect("change requires old revision");
+                        let current_revision = current.expect("change requires new revision");
+                        dev.invalidate_cache_all()?;
+                        println!(
+                            "kestrelfs-daemon: coherence revision {previous} -> {current_revision}; local cache invalidated"
+                        );
+                    }
+                    coherence_revision = current;
+                }
+                Err(error) => {
+                    // Metadata state is unknown, so retaining hits would be
+                    // unsafe. A durable full invalidation is the fail-closed
+                    // response; keep the old revision and retry the probe.
+                    eprintln!(
+                        "kestrelfs-daemon: coherence probe failed ({error}); invalidating local cache"
+                    );
+                    dev.invalidate_cache_all()?;
+                }
+            }
+            coherence_at = coherence_revision.map(|_| Instant::now() + COHERENCE_POLL_INTERVAL);
         }
 
         if pfd.revents & libc::POLLIN == 0 && ret > 0 {
@@ -1916,6 +1963,15 @@ mod tests {
             next_gc_retry_delay(Duration::from_secs(16), false),
             GC_RETRY_BASE
         );
+    }
+
+    #[test]
+    fn coherence_revision_change_requires_two_distinct_shared_revisions() {
+        assert!(!coherence_revision_changed(None, None));
+        assert!(!coherence_revision_changed(None, Some(1)));
+        assert!(!coherence_revision_changed(Some(7), None));
+        assert!(!coherence_revision_changed(Some(7), Some(7)));
+        assert!(coherence_revision_changed(Some(7), Some(8)));
     }
 
     #[test]

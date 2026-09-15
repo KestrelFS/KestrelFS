@@ -316,6 +316,13 @@ pub trait MetaStore: Send + Sync {
     /// Repeated acknowledgements are valid so ObjectStore delete + queue ack
     /// form an at-least-once, crash-safe protocol.
     async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()>;
+
+    /// Returns a backend-wide durable mutation revision when this MetaStore is
+    /// shared between daemons. `None` means no remote-coherence polling is
+    /// required (the in-memory and local-file backends are process-local).
+    async fn coherence_revision(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// One directory's worth of `name -> child inode id` mappings.
@@ -1504,6 +1511,11 @@ mod tests {
             store.getattr(directory).await.unwrap().mode,
             crate::fs_model::S_IFDIR | 0o1711
         );
+    }
+
+    #[tokio::test]
+    async fn process_local_store_does_not_request_remote_coherence_polling() {
+        assert_eq!(MemStore::new().coherence_revision().await.unwrap(), None);
     }
 
     #[tokio::test]

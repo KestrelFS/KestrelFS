@@ -73,6 +73,11 @@ pub const GET_ABI_VERSION: libc::c_ulong = ior(MAGIC, 2, 4);
 /// matching `__u64`).
 pub const GET_REGION_SIZE: libc::c_ulong = ior(MAGIC, 3, 8);
 
+/// Mirrors `KESTRELFS_IOC_INVALIDATE_CACHE_ALL`. The Redis coherence poller
+/// uses this no-argument command to make every local cache entry a durable
+/// miss after the shared metadata revision changes.
+pub const INVALIDATE_CACHE_ALL: libc::c_ulong = io(MAGIC, 4);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +93,6 @@ mod tests {
         assert_eq!(NOTIFY_RESP, 0xe001);
         assert_eq!(GET_ABI_VERSION, 0x8004e002);
         assert_eq!(GET_REGION_SIZE, 0x8008e003);
+        assert_eq!(INVALIDATE_CACHE_ALL, 0xe004);
     }
 }
