@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–26）
+## 当前边界（Step 18–27）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -54,6 +54,15 @@ journal 和损坏 entry 退休持有写侧。写侧取得锁之前会等待所�
 计数另由短时 spinlock 串行。CRC 失败的 reader 先记录 key+generation，释放读锁后
 取得写锁，仅在 generation 仍相同时退休 entry，避免误删期间重填的新版本。该步
 不改变 IPC ABI v11 或 cache format v4。
+
+Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
+以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
+open，避免模块持有期间读取不一致快照。它报告 namespace、geometry、
+entry 数、CRC/layout/重复 key 统计，以及 clean / recovery-required / invalid /
+unformatted 状态。`wipe` 是显式离线恢复动作：仅接受块设备，使用 exclusive open，
+且必须同时传 `--yes-really-wipe` 并令 `KESTRELFS_CACHE_WIPE_CONFIRM` 精确等于设备
+参数；它只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址，但
+不承诺安全擦除 data 区。IPC ABI 仍为 v11，cache format 仍为 v4。
 
 ## 缓存设备
 
@@ -120,7 +129,7 @@ dataset 时必须使用不同 digest。
 `cache_parallel_hit_peak`，分别表示当前和本次加载以来的峰值 hit reader 数；它们
 同样不是稳定用户 ABI。
 
-## Step 19–26 磁盘格式
+## Step 19–27 磁盘格式
 
 所有多字节字段采用 little-endian，LBA 固定表示 512 字节 sector。磁盘头占
 第一个 4 KiB：
@@ -168,8 +177,9 @@ Step 21 将 cache format 从 v1 bump 到 v2；v1 设备不会自动迁移或清�
 superblock 后 flush。非零但 magic/version/任一 geometry 不匹配时 fail
 closed，模块加载返回错误，不覆盖已有内容。用不同 `cache_size_mib` 重新加载
 已格式化设备也视为 geometry mismatch；v2 namespace digest 不匹配会输出独立的
-`cache namespace identity mismatch` 并拒绝加载。当前没有 `wipe` 模块参数，重用
-旧 v1 或其他 namespace 的设备必须由运维显式清空后再加载，避免误操作。
+`cache namespace identity mismatch` 并拒绝加载。当前没有 `wipe` 模块参数或自动
+清空路径；重用旧 v1 或其他 namespace 的设备只能在卸载模块后，由运维用 Step 27
+工具双确认显式清空 metadata，避免误操作。
 Step 24 再从 v2 bump 到 v3；v1/v2 都默认拒绝，不自动 wipe、迁移或重算 checksum。
 Step 25 从 v3 bump 到 v4；v1/v2/v3 均默认拒绝，不自动 wipe、迁移或补写 journal。
 
@@ -277,7 +287,8 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
 - 只观察本机 VFS mutation；其他节点或直接修改 Redis 的操作没有失效通知，
   所以 Step 20 仍是单 kernel/daemon correctness prototype，不可直接作为共享
   Redis+S3 多节点缓存部署。
-- v1/v2/v3 cache 默认拒绝且不自动迁移；当前仍无显式 wipe 参数。
+- v1/v2/v3 cache 默认拒绝且不自动迁移；没有自动或模块参数 wipe。Step 27 仅提供
+  离线、块设备专用、双确认的 metadata wipe。
 - exclusive holder 防止其他内核 holder 抢占设备，但不能在所有内核配置下阻止
   root 直接 raw write；设备隔离仍是部署要求。
 
@@ -350,3 +361,37 @@ reserved byte而不更新 CRC，三者必须 fail closed；恢复合法 superblo
 峰值分别为 1 和 8。数字包含辅助程序逐字节校验且受 TCG/loop 调度影响，只证明路径
 可重现地并行，不代表真实 NVMe 上限。自检输出 `STEP26_PARALLEL_HIT_PASS`、
 `STEP26_CONCURRENT_INVALIDATE_PASS`、`STEP26_CACHE_ASYNC_PASS`，umount 53 ms。
+
+## Step 27 离线诊断与显式恢复
+
+构建和只读检查：
+
+```bash
+make -C tools
+./tools/kestrelfs-cache-admin inspect /dev/loop0
+```
+
+`inspect` 可读块设备或离线 image；对干净 v4 返回 0，对未格式化的全零 metadata
+也返回 0，对结构/CRC 损坏返回 2，对合法 PREPARED journal 返回 3 并输出
+`overall_status=recovery-required`。它校验 super/journal/index entry CRC、固定 geometry、
+slot 边界和重复 `(inode_id,file_offset)`；为保持检查有界，不扫描 data 区，明确输出
+`data_crc=not-scanned`。块设备以只读 exclusive open 检查，仍被模块 claim 时会失败；
+普通文件只用于检查离线 image/snapshot，不能作为 cache device 或 wipe 目标。
+
+wipe 必须同时给出两个独立且目标一致的确认：
+
+```bash
+KESTRELFS_CACHE_WIPE_CONFIRM=/dev/loop0 \
+  ./tools/kestrelfs-cache-admin wipe /dev/loop0 --yes-really-wipe
+```
+
+缺环境变量、值与参数不一致、缺旗标、目标是普通文件，或设备仍被占用时均拒绝。
+wipe 只清前 2 MiB metadata：这是“丢弃 cache 索引并允许内核重新 format”，不是整盘
+安全擦除；MetaStore/ObjectStore 权威数据不受影响。
+
+`test-step27-ops-recovery-vng.sh` 在 vng guest+loop 中填充一个真实 entry，检查 clean
+v4 摘要和合法 PREPARED journal，再损坏 journal 验证 CRC 诊断。脚本覆盖两种缺确认
+拒绝、普通文件拒绝、显式 wipe 后 unformatted、重新加载 format、daemon 停止时旧
+entry 不可命中、恢复 daemon 后重填以及再次停 daemon 命中。2026-09-15 自检输出
+`STEP27_INSPECT_PASS`、`STEP27_WIPE_GUARD_PASS`、`STEP27_WIPE_PASS`、
+`STEP27_REFILL_PASS`、`STEP27_OPS_RECOVERY_PASS`，最终复跑 umount 50 ms。

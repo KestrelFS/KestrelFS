@@ -17,6 +17,7 @@ modules.order
 
 # Compiled test binaries (rebuild via gcc from the corresponding .c)
 kestrelfs/chardev_test
+tools/kestrelfs-cache-admin
 
 # Rust build artifacts (for later phases)
 target/

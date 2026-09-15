@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Phase 4 Step 25 已验收；Step 26 并行缓存命中待 Cursor 验收；IPC ABI v11；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Phase 4 Step 26 已验收；Step 27 缓存诊断/显式恢复待 Cursor 验收；IPC ABI v11；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据原型、`LocalFsObjectStore`、
@@ -26,8 +26,9 @@
 > miss 填充、同步内核 BIO 命中、rewrite/truncate/unlink/rename-overwrite 失效、
 > namespace SHA-256 绑定、对齐连续 hit 直达 pinned user pages、满盘 block-LRU、
 > data/index CRC32、v4 单页 intent journal（半提交恢复为安全 miss），以及多个
-> cache-hit 调用者并行等待同步 BIO。真正的异步 completion 流水线与多节点失效
-> 尚未实现。详见[路线图](#路线图)、`HANDOFF.md` 与
+> cache-hit 调用者并行等待同步 BIO。Step 27 待验收工作树另提供离线只读诊断和
+> 双确认 metadata wipe；真正的异步 completion 流水线与多节点失效尚未实现。
+> 详见[路线图](#路线图)、`HANDOFF.md` 与
 > `docs/remaining-capabilities.md`。
 
 ---
@@ -93,9 +94,10 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
 **数据面（内核，C）。** 树外 Linux 内核模块：
 
 - 注册 VFS 文件系统类型，实现挂载与文件服务所需的 inode/dentry/file 操作。
-- 拥有本地 NVMe SSD 缓存边界。Step 20–26：索引持久化、miss 填充、namespace
+- 拥有本地 NVMe SSD 缓存边界。Step 20–27：索引持久化、miss 填充、namespace
   校验、对齐 hit 直达用户页、LRU 回收、CRC 校验、v4 intent journal，以及共享
-  读锁下的并行同步 BIO 命中。详见
+  读锁下的并行同步 BIO 命中；离线工具可 inspect 并在双确认后重置 metadata。
+  详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
 - 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
 
@@ -122,7 +124,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 25 已验收；Step 26 并行命中待 Cursor 验收（format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 26 已验收；Step 27 运维恢复工具待 Cursor 验收（format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -141,7 +143,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
-├── test-step19-cache-vng.sh … test-step26-cache-async-vng.sh
+├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
+├── test-step19-cache-vng.sh … test-step27-ops-recovery-vng.sh
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
 ```
@@ -234,6 +237,25 @@ sudo umount /mnt/kestrelfs
 sudo rmmod kestrelfs
 ```
 
+### 离线检查或显式重置缓存
+
+先卸载使用该 cache device 的模块，再构建只读诊断工具：
+
+```bash
+make -C tools
+./tools/kestrelfs-cache-admin inspect /dev/loop0
+```
+
+确需丢弃 cache 索引时，必须同时给出两个目标一致的确认；普通文件会被拒绝：
+
+```bash
+KESTRELFS_CACHE_WIPE_CONFIRM=/dev/loop0 \
+  ./tools/kestrelfs-cache-admin wipe /dev/loop0 --yes-really-wipe
+```
+
+该动作只清零 2 MiB cache metadata，使旧 slot 不再可寻址并允许下次加载重新格式化；
+它不会安全擦除 data 区，也不会修改 MetaStore/ObjectStore 权威数据。
+
 ### 检查 IPC 字符设备
 
 ```bash
@@ -297,6 +319,7 @@ AWS_REGION=us-east-1 cargo test s3_environment_gated -- --nocapture
 ```bash
 # 1. 编译
 make -C kestrelfs
+make -C tools
 cargo test --manifest-path daemon/Cargo.toml
 cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 
@@ -324,6 +347,7 @@ sudo rmmod kestrelfs
 **缓存回归（仅 vng guest + loop）：**
 
 ```bash
+vng --run --network user --cwd "$PWD" --exec "$PWD/test-step27-ops-recovery-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step26-cache-async-vng.sh"
@@ -379,6 +403,9 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名（ABI v11）。仍缺�
   miss，但无双 superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO
   仍同步等待，mutation 会等待在途 reader；无多节点远端失效；journal 为每次
   index 变更增加 prepare/clear flush 成本。
+- Step 27 wipe 只清零前 2 MiB cache metadata，让旧 data slot 不再可寻址；它不是
+  数据区安全擦除。操作必须离线、目标必须是块设备，并同时提供环境变量和命令行
+  旗标确认；不会自动迁移旧格式。
 
 权威细节见 `HANDOFF.md` §6；后续排期见 `docs/remaining-capabilities.md`。
 
