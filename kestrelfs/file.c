@@ -473,36 +473,30 @@ out_unlock:
 }
 
 /*
- * kestrelfs_writable_write() - handle write(2) on writable.dat.
+ * Send an iter write through WRITE_DATA in 16 KiB bounce-buffer chunks.
+ * copy_from_iter() lets write(2), writev(2), pwritev(2), and synchronous
+ * kiocb callers share the same path without flattening userspace iovecs.
  *
- * Sends ABI v8 WRITE_DATA requests in 16 KiB bounce-buffer chunks. One
- * write(2) therefore completes a large buffer without relying on repeated
- * VFS short writes.
- *
- * O_APPEND handling: Unlike write_iter-based paths, when a filesystem
- * implements f_op->write directly, the VFS vfs_write() does NOT call
- * generic_write_checks() to automatically translate O_APPEND into
- * "seek to i_size before writing". We must manually check f_flags and
- * update *ppos to i_size when O_APPEND is set, otherwise "echo foo >> file"
- * would incorrectly write at offset 0 instead of appending.
- *
- * Returns number of bytes written on success, negative errno on error.
+ * A failure before any committed chunk is returned as a negative errno.  If
+ * an earlier chunk was committed, the byte count wins, matching normal VFS
+ * partial-write semantics.  A short copy_from_iter() is committed as a short
+ * final chunk and terminates the call.
  */
-static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *buf,
-					 size_t len, loff_t *ppos)
+static ssize_t kestrelfs_writable_write_iter(struct kiocb *iocb,
+					      struct iov_iter *from)
 {
+	struct file *filp = iocb->ki_filp;
 	struct kestrelfs_shared_region *region;
 	size_t done = 0;
+	ssize_t checked;
 	int ret;
 
-	if (len == 0)
-		return 0;
-	if (*ppos < 0)
-		return -EINVAL;
-	/* Persist invalidation before the authoritative write is committed. */
-	ret = kestrelfs_cache_invalidate_inode(filp->f_inode->i_ino);
-	if (ret)
-		return ret;
+	checked = generic_write_checks(iocb, from);
+	if (checked <= 0)
+		return checked;
+	/* This implementation waits for daemon IPC and cannot honor NOWAIT. */
+	if (iocb->ki_flags & IOCB_NOWAIT)
+		return -EOPNOTSUPP;
 
 	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)
@@ -514,31 +508,46 @@ static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *bu
 		goto out_unlock;
 	}
 
-	/* Handle O_APPEND: VFS does not automatically seek to EOF for us
-	 * when using f_op->write (only for write_iter). */
-	if (filp->f_flags & O_APPEND)
-		*ppos = i_size_read(filp->f_inode);
+	/*
+	 * generic_write_checks() resolves IOCB_APPEND, but it runs before the
+	 * bounce lock.  Re-read i_size under that lock so concurrent appenders
+	 * cannot select the same offset.
+	 */
+	if (iocb->ki_flags & IOCB_APPEND)
+		iocb->ki_pos = i_size_read(filp->f_inode);
 
-	while (done < len) {
+	/*
+	 * Keep invalidation before the authoritative commit, and under the same
+	 * lock as READ_DATA misses.  A miss begun before this point carries an
+	 * old epoch and cannot publish stale data after the write.
+	 */
+	ret = kestrelfs_cache_invalidate_inode(filp->f_inode->i_ino);
+	if (ret)
+		goto out_unlock;
+
+	while (iov_iter_count(from)) {
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
-		size_t chunk = min_t(size_t, len - done,
+		size_t chunk = min_t(size_t, iov_iter_count(from),
 					 KESTRELFS_DATA_BUFFER_SIZE);
 		u64 chunk_boundary = KESTRELFS_MODEL_CHUNK_SIZE -
-			((u64)*ppos % KESTRELFS_MODEL_CHUNK_SIZE);
+			((u64)iocb->ki_pos % KESTRELFS_MODEL_CHUNK_SIZE);
+		size_t copied;
+		bool short_copy;
 
 		/* A daemon Slice belongs to exactly one 64 MiB logical chunk. */
 		chunk = min_t(u64, chunk, chunk_boundary);
-
-		if (copy_from_user(region->data_buffer, buf + done, chunk)) {
+		copied = copy_from_iter(region->data_buffer, chunk, from);
+		if (!copied) {
 			ret = -EFAULT;
 			goto out_unlock;
 		}
+		short_copy = copied != chunk;
 
 		req.opcode = KESTRELFS_OP_WRITE_DATA;
 		put_unaligned_le64((u64)filp->f_inode->i_ino, &req.payload[0]);
-		put_unaligned_le64((u64)*ppos, &req.payload[8]);
-		put_unaligned_le32((u32)chunk, &req.payload[16]);
+		put_unaligned_le64((u64)iocb->ki_pos, &req.payload[8]);
+		put_unaligned_le32((u32)copied, &req.payload[16]);
 
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		if (ret)
@@ -552,10 +561,12 @@ static ssize_t kestrelfs_writable_write(struct file *filp, const char __user *bu
 			goto out_unlock;
 		}
 
-		done += chunk;
-		*ppos += chunk;
-		if (*ppos > i_size_read(filp->f_inode))
-			i_size_write(filp->f_inode, *ppos);
+		done += copied;
+		iocb->ki_pos += copied;
+		if (iocb->ki_pos > i_size_read(filp->f_inode))
+			i_size_write(filp->f_inode, iocb->ki_pos);
+		if (short_copy)
+			break;
 	}
 
 	ret = 0;
@@ -570,7 +581,7 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
-	.write	= kestrelfs_writable_write,
+	.write_iter	= kestrelfs_writable_write_iter,
 	.llseek	= kestrelfs_writable_llseek,
 };
 
@@ -837,7 +848,7 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
-	.write	= kestrelfs_writable_write,
+	.write_iter	= kestrelfs_writable_write_iter,
 	.llseek	= kestrelfs_writable_llseek,
 };
 

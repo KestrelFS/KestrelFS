@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 42 COHERENCE-FINE（细粒度 cache 失效）已由 Cursor 验收并纳入本提交（IPC ABI v20、cache format v4）。后续内核优先；下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 42 COHERENCE-FINE 已由 Cursor 验收并纳入基线；Step 43 KERNEL-WRITE-ITER 已由 Codex 实现并待 Cursor 验收（IPC ABI v20、cache format v4 均未变）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 42 COHERENCE-FINE 已验收；下一步内核优先 Step 43 = KERNEL-WRITE-ITER（见 remaining-capabilities §8） |
+| 当前阶段 | Step 42 COHERENCE-FINE 已验收；Step 43 KERNEL-WRITE-ITER 待 Cursor 验收（见 remaining-capabilities §9） |
 
 ---
 
@@ -191,6 +191,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 40** | **显式 atime/mtime；文件/目录重启恢复；orphan futimens** | **19** | **✅ 已验收** |
 | **Phase 4/数据面 Step 41** | **有界 GC delete worker + ObjectStore 长度完整性** | **19（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 42** | **Redis revision 有界 dirty-inode 日志 + 批量 inode cache 失效 + 全量回退** | **20** | **✅ 已验收** |
+| **Phase 4/内核 Step 43** | **普通文件 write_iter + write/writev/pwritev 统一 iov_iter 写路径** | **20（未变）** | **⏳ 待 Cursor 验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -225,7 +226,8 @@ Cursor 对照代码与 191 tests 确认 Step 41 已验收。
 Cursor 对照代码、193 tests 与 `STEP42_COHERENCE_FINE_PASS` 确认 Step 42 已验收。
 ABI v20 批量 inode 失效 + Redis dirty log；失败回退全量。ABI **v20**；format **v4**。
 
-下一步：**Step 43 KERNEL-WRITE-ITER**（内核优先），提示词在 `docs/remaining-capabilities.md` §8。
+待验收：**Step 43 KERNEL-WRITE-ITER**。Codex 自检见 §7.37 与
+`docs/remaining-capabilities.md` §9；下一步由 Cursor 验收后决定。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 20`（含 `INVALIDATE_CACHE_INODES`）
 
@@ -333,7 +335,7 @@ ABI v20 批量 inode 失效 + Redis dirty log；失败回退全量。ABI **v20**
 | 10 | **rename flags 尚无 WHITEOUT** | Step 33 支持原子 `RENAME_NOREPLACE`；Step 38 支持与其互斥的 `RENAME_EXCHANGE`，要求两端存在，并按 Linux 语义允许目录与非目录交换。`RENAME_WHITEOUT`、未知位及 NOREPLACE|EXCHANGE 返回 `-EINVAL`。 | `kestrelfs/dir.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
-| 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
+| 13 | **write_iter 仍是同步 bounce IPC** | Step 43 已删除旧 `.write`，普通 write/writev/pwritev 统一经 `.write_iter`；O_APPEND 由 `generic_write_checks()` 解析，并在 bounce 锁内重新读取 EOF 以串行并发追加。每个 16 KiB WRITE_DATA IPC 仍同步等待 daemon；尚无异步 completion、page cache/write-back。 | `kestrelfs/file.c` `kestrelfs_writable_write_iter()` |
 | 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
@@ -1448,6 +1450,24 @@ Cursor 验收自检（2026-09-16）：默认 Rust tests `193 passed`；clippy/ma
 `STEP42_FAILURE_FALLBACK_ALL_PASS`、`STEP42_COHERENCE_FINE_PASS`，umount 22 ms。
 所有 insmod/mount/cache_device 操作均在 vng guest；未触碰宿主机 zvol 或模块。
 
+### 7.37 Phase 4/内核 Step 43 KERNEL-WRITE-ITER（待 Cursor 验收）
+
+普通动态文件已从旧 `.write` 切换为 `.write_iter`，write/writev/pwritev 直接消费
+`iov_iter`，继续按 16 KiB bounce buffer 与 64 MiB model chunk 边界发送 ABI v20
+`WRITE_DATA`。`generic_write_checks()` 负责 VFS 写入边界和 append 标志；为避免并发
+append 在进入全局 data IPC 锁前选择相同 EOF，锁内会再次读取 `i_size`。cache 失效也
+移入同一锁并保持在权威写提交之前，使失效前开始的 READ_DATA miss 不能在写后发布旧
+epoch 数据。成功块更新 `ki_pos`/`i_size`；后续故障返回已提交字节数，首块前故障返回
+负 errno；`copy_from_iter()` 短拷贝只提交实际字节并结束本次调用。同步路径对
+`IOCB_NOWAIT` 返回 `EOPNOTSUPP`，不会假装非阻塞；旧 `.write` 已删除。
+
+Codex 自检（2026-09-16）：默认 Rust tests `193 passed`；clippy 与内核模块构建零警告。
+专项 vng + loop 输出：
+`STEP43_NORMAL_WRITE_PASS`、`STEP43_WRITEV_PASS`、`STEP43_O_APPEND_PASS`、
+`STEP43_PWRITEV_PASS`、`STEP43_CACHE_INVALIDATE_PASS first_read_hit_delta=0`、
+`STEP43_CACHE_REFILL_PASS delta=7`、`STEP43_WRITE_ITER_PASS`；umount 26 ms。
+所有 insmod/mount/cache_device 操作均在 vng guest；未触碰宿主机 zvol 或模块。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1457,8 +1477,8 @@ Cursor 验收自检（2026-09-16）：默认 Rust tests `193 passed`；clippy/ma
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **内核优先战略** | 后续以 VFS/数据面为主；见 remaining-capabilities §2 |
-| 2 | **Step 43 KERNEL-WRITE-ITER** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | 其后内核 | fsync → aops/page cache → mmap → locks → cache-async |
+| 2 | **Step 43 KERNEL-WRITE-ITER** | Codex 已实现，待 Cursor 验收；汇报见 remaining-capabilities §9 |
+| 3 | 其后内核 | 验收后由 Cursor 下发：fsync → aops/page cache → mmap → locks → cache-async |
 | 4 | 其它 | WHITEOUT、DIST-IO、CACHE-WRITE… |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1516,7 +1536,8 @@ mkdir -p "$data_dir"
 - [x] Step 42 COHERENCE-FINE 已由 Cursor 验收并提交
 - [x] IPC ABI = 20；cache format = v4
 - [x] Step 8–41 + Step 42 已验收状态已写清
-- [x] 下一步明确：内核优先 Step 43 KERNEL-WRITE-ITER（`docs/remaining-capabilities.md` §8）
+- [x] Step 43 KERNEL-WRITE-ITER 已实现并标记待 Cursor 验收（ABI/format 未变）
+- [x] 下一步等待 Cursor 验收与下发，不自行扩大范围
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

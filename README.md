@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 42 COHERENCE-FINE 已验收；后续优先内核 VFS；下一步 Step 43 write_iter；IPC ABI v20；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 42 COHERENCE-FINE 已验收；Step 43 write_iter 已实现、待 Cursor 验收；IPC ABI v20；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -41,6 +41,7 @@
 > （可与 mode 同事务）。Step 40 已支持秒级显式 atime/mtime 持久化；
 > Step 42 为 Redis revision 附加 256-revision 有界 dirty-inode 日志，正常变化经
 > ABI v20 批量 ioctl 只退休相关 inode，历史缺失、溢出或探测失败仍全量 fail closed；
+> Step 43 将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
 > `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -101,7 +102,7 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
                          │  • VFS（super/inode/file）      │
                          │  • /dev/kestrel_ctl             │
                          │  • 本地 NVMe 持久缓存           │
-                         │  • read_iter / iov 缓存读       │
+                         │  • read_iter/write_iter I/O    │
                          └─────────────────────────────────┘
 ```
 
@@ -115,6 +116,8 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
   victim 并合并同一 index page 的清零写。Step 42 在 Step 35 全量回退之上允许
   Redis daemon 批量持久化失效相关 inode，脏历史不可证明完整时仍全量失效。Step 36 在已打开
   文件失去最终目录项时保留 cache/inode，最后 close 才失效并回收。
+  Step 43 让普通 write/writev/pwritev 直接消费 `iov_iter`，继续复用 16 KiB bounce
+  WRITE_DATA、写前 cache 失效与同步错误/部分写语义。
   详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
 - 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
@@ -142,7 +145,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–42 已验收；下一步内核优先 Step 43 write_iter（ABI v20 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–42 已验收；Step 43 write_iter 待验收（ABI v20 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -170,6 +173,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step34-posix-attr.c        # 原始 open/mkdir mode 测试辅助程序
 ├── test-step35-cache-coherence-vng.sh # Redis revision→本地 cache 全失效
 ├── test-step42-coherence-fine-vng.sh  # dirty inode 精细失效 + 全量回退
+├── test-step43-write-iter-vng.sh      # write/writev/pwritev/append/cache 失效
+├── test-step43-write-iter.c           # 向量写与部分布局测试辅助程序
 ├── test-step36-posix-lifecycle-vng.sh # open-unlink/cache/last-close GC
 ├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
 ├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
@@ -478,6 +483,8 @@ Step 34 支持 create/mkdir mode 与
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 28 已覆盖 read/pread/readv/preadv；pinned BIO 只在单个当前 iovec 段内合并，
   跨段或非对齐范围仍用 `copy_to_iter`。尚无 page-cache/readahead/splice 全覆盖。
+- Step 43 已把普通 write/writev/pwritev 统一为 `.write_iter`，但 WRITE_DATA 仍通过
+  全局 bounce 锁逐块同步等待 daemon；尚无异步 completion、page-cache write-back。
 - Step 27 wipe 只清零前 2 MiB cache metadata，让旧 data slot 不再可寻址；它不是
   数据区安全擦除。操作必须离线、目标必须是块设备，并同时提供环境变量和命令行
   旗标确认；不会自动迁移旧格式。
