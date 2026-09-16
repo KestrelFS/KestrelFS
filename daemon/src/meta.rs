@@ -165,9 +165,21 @@ pub trait MetaStore: Send + Sync {
     /// [`MetaError::NotFound`] if no inode with this id exists.
     async fn getattr(&self, inode: u64) -> Result<Inode>;
 
-    /// Atomically replaces an inode's permission and special bits while
-    /// preserving its file type. Returns the authoritative full mode.
-    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32>;
+    /// Atomically updates any requested ownership/mode fields and returns the
+    /// authoritative inode. File type bits are preserved when mode is set.
+    async fn set_attrs(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode>;
+
+    /// Convenience wrapper retained for callers which only change mode.
+    #[allow(dead_code)]
+    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
+        Ok(self.set_attrs(inode, Some(mode), None, None).await?.mode)
+    }
 
     /// Resolves `(inode, chunk_idx)` to the list of [`Slice`] records
     /// making up that chunk's currently-visible data.
@@ -695,12 +707,26 @@ impl MetaStore for MemStore {
         inner.inodes.get(&inode).cloned().ok_or(MetaError::NotFound)
     }
 
-    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
+    async fn set_attrs(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
         let mut inner = self.inner.write().await;
         let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
-        inode_meta.mode = (inode_meta.mode & !MODE_PERMISSIONS_MASK)
-            | (mode & MODE_PERMISSIONS_MASK);
-        Ok(inode_meta.mode)
+        if let Some(mode) = mode {
+            inode_meta.mode = (inode_meta.mode & !MODE_PERMISSIONS_MASK)
+                | (mode & MODE_PERMISSIONS_MASK);
+        }
+        if let Some(uid) = uid {
+            inode_meta.uid = uid;
+        }
+        if let Some(gid) = gid {
+            inode_meta.gid = gid;
+        }
+        Ok(inode_meta.clone())
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
@@ -1754,7 +1780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_mode_preserves_type_and_updates_retained_orphan() {
+    async fn set_attrs_preserve_type_and_update_retained_orphan() {
         let store = MemStore::new();
         let file = store.create(ROOT_INODE, "chmod-file", 0o640).await.unwrap();
         let directory = store.mkdir(ROOT_INODE, "chmod-dir", 0o750).await.unwrap();
@@ -1771,7 +1797,15 @@ mod tests {
             .unlink_with_lifecycle(ROOT_INODE, "chmod-file", true)
             .await.unwrap().is_empty());
         assert_eq!(store.getattr(file).await.unwrap().nlink, 0);
-        assert_eq!(store.set_mode(file, 0o600).await.unwrap(), S_IFREG | 0o600);
+        let attrs = store
+            .set_attrs(file, Some(0o600), Some(1234), Some(2345))
+            .await
+            .unwrap();
+        assert_eq!(attrs.mode, S_IFREG | 0o600);
+        assert_eq!((attrs.uid, attrs.gid), (1234, 2345));
+        let persisted = store.getattr(file).await.unwrap();
+        assert_eq!(persisted.mode, attrs.mode);
+        assert_eq!((persisted.uid, persisted.gid), (attrs.uid, attrs.gid));
         assert!(matches!(store.set_mode(u64::MAX, 0o644).await, Err(MetaError::NotFound)));
     }
 

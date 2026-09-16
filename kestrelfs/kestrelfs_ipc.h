@@ -205,14 +205,21 @@
  *   offset  0, 8 bytes, little-endian u64: inode_id
  *   offset  8, 4 bytes, little-endian u32: valid attribute mask
  *   offset 12, 4 bytes, little-endian u32: requested mode
- *   offset 16..31: reserved, must be zero
+ *   offset 16, 4 bytes, little-endian u32: requested uid
+ *   offset 20, 4 bytes, little-endian u32: requested gid
+ *   offset 24..31: reserved, must be zero
  *
- * ABI v16 supports only KESTRELFS_SETATTR_MODE. The daemon preserves the
- * inode's existing file-type bits and replaces only mode & 07777. A successful
- * response returns the authoritative full mode as little-endian u32 at
- * payload offset 0; remaining response payload bytes are zero.
+ * ABI v18 accepts any non-empty combination of MODE, UID, and GID atomically.
+ * The daemon preserves the inode's existing file-type bits and replaces only
+ * mode & 07777. A successful response returns authoritative mode@0, uid@4,
+ * and gid@8 as little-endian u32 values; remaining response bytes are zero.
  */
 #define KESTRELFS_SETATTR_MODE		(1U << 0)
+#define KESTRELFS_SETATTR_UID		(1U << 1)
+#define KESTRELFS_SETATTR_GID		(1U << 2)
+#define KESTRELFS_SETATTR_VALID_MASK	(KESTRELFS_SETATTR_MODE | \
+					 KESTRELFS_SETATTR_UID | \
+					 KESTRELFS_SETATTR_GID)
 
 /*
  * Payload layout for KESTRELFS_OP_READ_CHUNK requests
@@ -817,8 +824,12 @@ struct kestrelfs_ring_ctrl {
  *  17 - Phase 4/control-plane step 38: RENAME_DATA accepts the mutually
  *       exclusive KESTRELFS_RENAME_EXCHANGE flag for atomic dirent swaps.
  *       The payload and shared-memory layouts are unchanged.
+ *
+ *  18 - Phase 4/control-plane step 39: SETATTR can atomically persist uid
+ *       and gid, independently or together with mode. Request uid/gid occupy
+ *       payload offsets 16/20; the response returns mode/uid/gid at 0/4/8.
  */
-#define KESTRELFS_ABI_VERSION		17
+#define KESTRELFS_ABI_VERSION		18
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -998,7 +1009,7 @@ _Static_assert(8 + 8 + 4 + 4 + 4 + 4 == KESTRELFS_EVENT_PAYLOAD_SIZE,
 _Static_assert(8 + 4 + 4 + 4 + 4 + 8 == KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_GETATTR response payload field layout no longer sums to KESTRELFS_EVENT_PAYLOAD_SIZE");
 
-_Static_assert(8 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+_Static_assert(8 + 4 + 4 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_SETATTR request fields overflow the event payload");
 
 #endif /* _KESTRELFS_IPC_H */

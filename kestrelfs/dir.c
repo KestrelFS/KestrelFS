@@ -138,6 +138,8 @@ static int kestrelfs_inode_getattr(struct mnt_idmap *idmap,
 	u64 size;
 	u64 mtime_sec;
 	u32 mode;
+	u32 uid;
+	u32 gid;
 	u32 nlink;
 	int ret;
 
@@ -149,12 +151,16 @@ static int kestrelfs_inode_getattr(struct mnt_idmap *idmap,
 
 	size = get_unaligned_le64(&resp.payload[0]);
 	mode = get_unaligned_le32(&resp.payload[8]);
+	uid = get_unaligned_le32(&resp.payload[12]);
+	gid = get_unaligned_le32(&resp.payload[16]);
 	nlink = get_unaligned_le32(&resp.payload[20]);
 	mtime_sec = get_unaligned_le64(&resp.payload[24]);
 	if (!S_ISDIR(mode) || nlink < 2)
 		return -EIO;
 
 	inode->i_mode = mode;
+	i_uid_write(inode, uid);
+	i_gid_write(inode, gid);
 	i_size_write(inode, size);
 	set_nlink(inode, nlink);
 	mtime.tv_sec = mtime_sec;
@@ -182,6 +188,8 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 	u64 child_ino;
 	u64 size;
 	u32 mode;
+	u32 uid;
+	u32 gid;
 	u32 nlink;
 	int ret;
 
@@ -208,13 +216,15 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 	memcpy(&child_ino, &resp.payload[0], sizeof(u64));
 	memcpy(&size, &resp.payload[8], sizeof(u64));
 	memcpy(&mode, &resp.payload[16], sizeof(u32));
+	memcpy(&uid, &resp.payload[20], sizeof(u32));
+	memcpy(&gid, &resp.payload[24], sizeof(u32));
 	memcpy(&nlink, &resp.payload[28], sizeof(u32));
 
 	pr_info("kestrelfs: lookup found child_ino=%llu size=%llu mode=0%o\n",
 		child_ino, size, mode);
 
 	/* Create/fetch inode */
-	inode = kestrelfs_get_inode(sb, child_ino, mode, size, nlink);
+	inode = kestrelfs_get_inode(sb, child_ino, mode, size, uid, gid, nlink);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
@@ -245,6 +255,8 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	u64 new_ino;
 	u64 size;
 	u32 resp_mode;
+	u32 uid;
+	u32 gid;
 	u32 create_mode;
 	u32 nlink;
 	int ret;
@@ -270,13 +282,16 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	memcpy(&new_ino, &resp.payload[0], sizeof(u64));
 	memcpy(&size, &resp.payload[8], sizeof(u64));
 	memcpy(&resp_mode, &resp.payload[16], sizeof(u32));
+	memcpy(&uid, &resp.payload[20], sizeof(u32));
+	memcpy(&gid, &resp.payload[24], sizeof(u32));
 	memcpy(&nlink, &resp.payload[28], sizeof(u32));
 
 	pr_info("kestrelfs: create -> new_ino=%llu size=%llu mode=0%o\n",
 		new_ino, size, resp_mode);
 
 	/* Create inode */
-	inode = kestrelfs_get_inode(sb, new_ino, resp_mode, size, nlink);
+	inode = kestrelfs_get_inode(sb, new_ino, resp_mode, size, uid, gid,
+				    nlink);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
@@ -302,7 +317,7 @@ static int kestrelfs_inode_symlink(struct mnt_idmap *idmap,
 	size_t name_len = dentry->d_name.len;
 	size_t target_len = strnlen(symname, KESTRELFS_SYMLINK_TARGET_MAX + 1);
 	u64 new_ino, size;
-	u32 mode, nlink;
+	u32 mode, uid, gid, nlink;
 	int ret;
 
 	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
@@ -338,8 +353,11 @@ out_unlock_symlink:
 	new_ino = get_unaligned_le64(&resp.payload[0]);
 	size = get_unaligned_le64(&resp.payload[8]);
 	mode = get_unaligned_le32(&resp.payload[16]);
+	uid = get_unaligned_le32(&resp.payload[20]);
+	gid = get_unaligned_le32(&resp.payload[24]);
 	nlink = get_unaligned_le32(&resp.payload[28]);
-	inode = kestrelfs_get_inode(dir->i_sb, new_ino, mode, size, nlink);
+	inode = kestrelfs_get_inode(dir->i_sb, new_ino, mode, size, uid, gid,
+				    nlink);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 	d_instantiate(dentry, inode);
@@ -448,7 +466,7 @@ static int kestrelfs_inode_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	pr_info("kestrelfs: mkdir created dir ino=%llu\n", new_ino);
 
 	/* Create VFS inode for the new directory */
-	inode = kestrelfs_get_inode(sb, new_ino, S_IFDIR | mode, 0, 2);
+	inode = kestrelfs_get_inode(sb, new_ino, S_IFDIR | mode, 0, 0, 0, 2);
 	if (IS_ERR(inode)) {
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));

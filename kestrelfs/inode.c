@@ -108,6 +108,8 @@ const struct super_operations kestrelfs_super_ops = {
  * @ino:	inode number
  * @mode:	file type and permissions (S_IFDIR | 0755, S_IFREG | 0644, etc.)
  * @size:	file size in bytes
+ * @uid:	persistent numeric owner id
+ * @gid:	persistent numeric group id
  * @nlink:	persistent link count reported by MetaStore
  *
  * Used by dir.c's lookup/create handlers to instantiate inodes dynamically.
@@ -119,7 +121,8 @@ const struct super_operations kestrelfs_super_ops = {
  * Return: pointer to inode on success, ERR_PTR(-errno) on failure.
  */
 struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
-				  u32 mode, u64 size, u32 nlink)
+				  u32 mode, u64 size, u32 uid, u32 gid,
+				  u32 nlink)
 {
 	struct inode *inode;
 
@@ -128,6 +131,8 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		return ERR_PTR(-ENOMEM);
 	if (!(inode->i_state & I_NEW)) {
 		inode->i_mode = mode;
+		i_uid_write(inode, uid);
+		i_gid_write(inode, gid);
 		i_size_write(inode, size);
 		set_nlink(inode, nlink);
 		return inode;
@@ -135,8 +140,8 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 
 	inode->i_ino = ino;
 	inode->i_mode = mode;
-	inode->i_uid = GLOBAL_ROOT_UID;
-	inode->i_gid = GLOBAL_ROOT_GID;
+	i_uid_write(inode, uid);
+	i_gid_write(inode, gid);
 	inode->i_size = size;
 	inode_set_atime_to_ts(inode, current_time(inode));
 	inode_set_mtime_to_ts(inode, current_time(inode));

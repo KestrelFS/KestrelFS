@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 17;
+pub const ABI_VERSION: u32 = 18;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -253,7 +253,7 @@ impl KestrelfsEvent {
         }
     }
 
-    /// Decodes the ABI v16 `OP_SETATTR` fixed payload.
+    /// Decodes the ABI v18 `OP_SETATTR` fixed payload.
     ///
     /// Callers validate `flags`, `valid`, and reserved bytes before applying
     /// the requested mutation.
@@ -262,6 +262,8 @@ impl KestrelfsEvent {
             inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
             valid: u32::from_le_bytes(self.payload[8..12].try_into().unwrap()),
             mode: u32::from_le_bytes(self.payload[12..16].try_into().unwrap()),
+            uid: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
+            gid: u32::from_le_bytes(self.payload[20..24].try_into().unwrap()),
         }
     }
 
@@ -881,16 +883,21 @@ pub struct TruncateReq {
     pub new_size: u64,
 }
 
-/// Decoded ABI v16 `OP_SETATTR` request.
+/// Decoded ABI v18 `OP_SETATTR` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetattrReq {
     pub inode_id: u64,
     pub valid: u32,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
-/// The only attribute mutation supported by ABI v16.
+/// Attribute mutations supported by ABI v18.
 pub const SETATTR_MODE: u32 = 1 << 0;
+pub const SETATTR_UID: u32 = 1 << 1;
+pub const SETATTR_GID: u32 = 1 << 2;
+pub const SETATTR_VALID_MASK: u32 = SETATTR_MODE | SETATTR_UID | SETATTR_GID;
 
 /// Decoded `KESTRELFS_OP_CREATE` request payload.
 pub struct CreateReq {
@@ -1099,6 +1106,7 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
 )];
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
@@ -1456,18 +1464,23 @@ mod tests {
     fn decode_setattr_req_and_payload_budget() {
         let mut event = KestrelfsEvent::zeroed(OP_SETATTR, 124);
         event.payload[0..8].copy_from_slice(&42u64.to_le_bytes());
-        event.payload[8..12].copy_from_slice(&SETATTR_MODE.to_le_bytes());
+        event.payload[8..12]
+            .copy_from_slice(&(SETATTR_MODE | SETATTR_UID | SETATTR_GID).to_le_bytes());
         event.payload[12..16].copy_from_slice(&0o106751u32.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&1000u32.to_le_bytes());
+        event.payload[20..24].copy_from_slice(&1001u32.to_le_bytes());
 
         assert_eq!(
             event.decode_setattr_req(),
             SetattrReq {
                 inode_id: 42,
-                valid: SETATTR_MODE,
+                valid: SETATTR_VALID_MASK,
                 mode: 0o106751,
+                uid: 1000,
+                gid: 1001,
             }
         );
-        const { assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE) };
+        const { assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE) };
     }
 
     #[test]

@@ -204,9 +204,11 @@ enum Mutation {
         inode: u64,
         new_size: u64,
     },
-    SetMode {
+    SetAttrs {
         inode: u64,
-        mode: u32,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
     },
     Mkdir {
         parent: u64,
@@ -242,7 +244,7 @@ enum Mutation {
 enum MutationOutput {
     Inode(u64),
     Nlink(u32),
-    Mode(u32),
+    Attributes(Inode),
     Unit,
     Garbage(Vec<String>),
 }
@@ -716,10 +718,15 @@ impl RedisMetaStore {
                 .truncate(*inode, *new_size)
                 .await
                 .map(MutationOutput::Garbage),
-            Mutation::SetMode { inode, mode } => mem
-                .set_mode(*inode, *mode)
+            Mutation::SetAttrs {
+                inode,
+                mode,
+                uid,
+                gid,
+            } => mem
+                .set_attrs(*inode, *mode, *uid, *gid)
                 .await
-                .map(MutationOutput::Mode),
+                .map(MutationOutput::Attributes),
             Mutation::Mkdir { parent, name, mode } => mem
                 .mkdir(*parent, name, *mode)
                 .await
@@ -842,10 +849,24 @@ impl MetaStore for RedisMetaStore {
         self.load_inode(inode).await
     }
 
-    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
-        match self.mutate(Mutation::SetMode { inode, mode }).await? {
-            MutationOutput::Mode(mode) => Ok(mode),
-            _ => unreachable!("set_mode mutation returned wrong output"),
+    async fn set_attrs(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<Inode> {
+        match self
+            .mutate(Mutation::SetAttrs {
+                inode,
+                mode,
+                uid,
+                gid,
+            })
+            .await?
+        {
+            MutationOutput::Attributes(attrs) => Ok(attrs),
+            _ => unreachable!("set_attrs mutation returned wrong output"),
         }
     }
 
@@ -1262,6 +1283,32 @@ mod tests {
         assert!(patch.gc_del.is_empty());
     }
 
+    #[tokio::test]
+    async fn ownership_patch_changes_only_its_inode_record() {
+        let mem = MemStore::new();
+        let inode = mem.create(ROOT_INODE, "owned", 0o640).await.unwrap();
+        let old_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
+        let attrs = mem
+            .set_attrs(inode, None, Some(1234), Some(2345))
+            .await
+            .unwrap();
+        let new_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
+        let patch = RedisPatch::between(&old_records, &new_records);
+
+        assert_eq!((attrs.uid, attrs.gid), (1234, 2345));
+        assert_eq!(patch.inodes_set.len(), 1);
+        assert_eq!(patch.inodes_set[0].0, inode.to_string());
+        assert!(patch.inodes_del.is_empty());
+        assert!(patch.dirents_set.is_empty());
+        assert!(patch.dirents_del.is_empty());
+        assert!(patch.slices_set.is_empty());
+        assert!(patch.slices_del.is_empty());
+        assert!(patch.symlinks_set.is_empty());
+        assert!(patch.symlinks_del.is_empty());
+        assert!(patch.gc_add.is_empty());
+        assert!(patch.gc_del.is_empty());
+    }
+
     #[test]
     fn rejects_invalid_connection_settings_without_network_access() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1355,6 +1402,15 @@ mod tests {
             S_IFREG | 0o6751
         );
         assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_chmod);
+        let revision_before_chown = peer.coherence_revision().await.unwrap().unwrap();
+        let owned = store
+            .set_attrs(persistent_mode_file, None, Some(1234), Some(2345))
+            .await
+            .unwrap();
+        assert_eq!((owned.uid, owned.gid), (1234, 2345));
+        let peer_owned = peer.getattr(persistent_mode_file).await.unwrap();
+        assert_eq!((peer_owned.uid, peer_owned.gid), (1234, 2345));
+        assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_chown);
         assert_eq!(store.link(directory, "data-alias", file).await.unwrap(), 2);
         assert_eq!(peer.lookup(directory, "data-alias").await.unwrap(), file);
         assert_eq!(peer.getattr(file).await.unwrap().nlink, 2);

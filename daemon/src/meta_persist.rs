@@ -140,10 +140,16 @@ impl MetaStore for FileMetaStore {
         self.mem.getattr(inode).await
     }
 
-    async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
-        let mode = self.mem.set_mode(inode, mode).await?;
+    async fn set_attrs(
+        &self,
+        inode: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<crate::fs_model::Inode> {
+        let attrs = self.mem.set_attrs(inode, mode, uid, gid).await?;
         self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(mode)
+        Ok(attrs)
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
@@ -453,12 +459,19 @@ mod tests {
             assert!(store
                 .unlink_with_lifecycle(ROOT_INODE, "open-orphan", true)
                 .await.unwrap().is_empty());
-            assert_eq!(store.set_mode(inode, 0o600).await.unwrap(), S_IFREG | 0o600);
+            let attrs = store
+                .set_attrs(inode, Some(0o600), Some(1234), Some(2345))
+                .await
+                .unwrap();
+            assert_eq!(attrs.mode, S_IFREG | 0o600);
+            assert_eq!((attrs.uid, attrs.gid), (1234, 2345));
         }
         {
             let restarted = FileMetaStore::new(path.clone()).await.unwrap();
             assert_eq!(restarted.getattr(inode).await.unwrap().nlink, 0);
             assert_eq!(restarted.getattr(inode).await.unwrap().mode, S_IFREG | 0o600);
+            assert_eq!(restarted.getattr(inode).await.unwrap().uid, 1234);
+            assert_eq!(restarted.getattr(inode).await.unwrap().gid, 2345);
             assert!(restarted.pending_garbage().await.unwrap().is_empty());
             assert_eq!(restarted.finalize_orphan(inode).await.unwrap(), vec![key.clone()]);
         }

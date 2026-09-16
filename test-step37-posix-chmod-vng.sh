@@ -82,12 +82,7 @@ test -d "$mnt/chmod-directory-long-name"
 test "$(stat -c %a "$mnt/chmod-directory-long-name")" = 1770
 echo 'STEP37_FILE_DIR_CHMOD_PASS'
 
-# Step 37 deliberately rejects uid/gid and explicit timestamp mutations.
-if chown 1:1 "$mnt/chmod-file-long-name" 2>/dev/null; then
-	echo 'STEP37_FAIL: chown unexpectedly succeeded'
-	exit 1
-fi
-test "$(stat -c %u:%g "$mnt/chmod-file-long-name")" = 0:0
+# Explicit timestamp mutation remains unsupported after Step 39.
 if touch -t 202001010000 "$mnt/chmod-file-long-name" 2>/dev/null; then
 	echo 'STEP37_FAIL: explicit timestamp setattr unexpectedly succeeded'
 	exit 1

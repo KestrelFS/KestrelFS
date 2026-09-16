@@ -609,16 +609,27 @@ async fn handle_setattr(
 ) -> KestrelfsEvent {
     let req = event.decode_setattr_req();
     if event.flags != 0
-        || req.valid != abi::SETATTR_MODE
-        || event.payload[16..].iter().any(|byte| *byte != 0)
+        || req.valid == 0
+        || req.valid & !abi::SETATTR_VALID_MASK != 0
+        || event.payload[24..].iter().any(|byte| *byte != 0)
     {
         return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
     }
 
-    match store.set_mode(req.inode_id, req.mode).await {
-        Ok(mode) => {
+    match store
+        .set_attrs(
+            req.inode_id,
+            (req.valid & abi::SETATTR_MODE != 0).then_some(req.mode),
+            (req.valid & abi::SETATTR_UID != 0).then_some(req.uid),
+            (req.valid & abi::SETATTR_GID != 0).then_some(req.gid),
+        )
+        .await
+    {
+        Ok(attrs) => {
             let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
-            response.payload[0..4].copy_from_slice(&mode.to_le_bytes());
+            response.payload[0..4].copy_from_slice(&attrs.mode.to_le_bytes());
+            response.payload[4..8].copy_from_slice(&attrs.uid.to_le_bytes());
+            response.payload[8..12].copy_from_slice(&attrs.gid.to_le_bytes());
             response
         }
         Err(error) => {
@@ -2244,11 +2255,20 @@ mod tests {
         event
     }
 
-    fn raw_setattr_req(req_id: u64, inode_id: u64, valid: u32, mode: u32) -> KestrelfsEvent {
+    fn raw_setattr_req(
+        req_id: u64,
+        inode_id: u64,
+        valid: u32,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> KestrelfsEvent {
         let mut event = KestrelfsEvent::zeroed(abi::OP_SETATTR, req_id);
         event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
         event.payload[8..12].copy_from_slice(&valid.to_le_bytes());
         event.payload[12..16].copy_from_slice(&mode.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&uid.to_le_bytes());
+        event.payload[20..24].copy_from_slice(&gid.to_le_bytes());
         event
     }
 
@@ -2380,6 +2400,8 @@ mod tests {
             REMOTE_TXT_INODE,
             abi::SETATTR_MODE,
             fs_model::S_IFDIR | 0o6751,
+            0,
+            0,
         );
 
         let resp = runtime.block_on(build_response(&req, &store, &object_store));
@@ -2399,15 +2421,39 @@ mod tests {
     }
 
     #[test]
+    fn setattr_uid_gid_combination_updates_getattr_and_response() {
+        let (runtime, store, object_store) = test_fixture();
+        let req = raw_setattr_req(
+            13,
+            REMOTE_TXT_INODE,
+            abi::SETATTR_UID | abi::SETATTR_GID,
+            0,
+            1234,
+            2345,
+        );
+
+        let resp = runtime.block_on(build_response(&req, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(u32::from_le_bytes(resp.payload[4..8].try_into().unwrap()), 1234);
+        assert_eq!(u32::from_le_bytes(resp.payload[8..12].try_into().unwrap()), 2345);
+
+        let getattr = raw_getattr_req(14, REMOTE_TXT_INODE);
+        let resp = runtime.block_on(build_response(&getattr, &store, &object_store));
+        assert_eq!(u32::from_le_bytes(resp.payload[12..16].try_into().unwrap()), 1234);
+        assert_eq!(u32::from_le_bytes(resp.payload[16..20].try_into().unwrap()), 2345);
+    }
+
+    #[test]
     fn setattr_rejects_unsupported_mask_and_nonzero_reserved_bytes() {
         let (runtime, store, object_store) = test_fixture();
-        let unsupported = raw_setattr_req(11, REMOTE_TXT_INODE, 2, 0o600);
+        let unsupported = raw_setattr_req(11, REMOTE_TXT_INODE, 1 << 31, 0o600, 0, 0);
         let resp = runtime.block_on(build_response(&unsupported, &store, &object_store));
         assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
         assert_eq!(resp.error_code, -libc::EINVAL);
 
-        let mut reserved = raw_setattr_req(12, REMOTE_TXT_INODE, abi::SETATTR_MODE, 0o600);
-        reserved.payload[16] = 1;
+        let mut reserved =
+            raw_setattr_req(12, REMOTE_TXT_INODE, abi::SETATTR_MODE, 0o600, 0, 0);
+        reserved.payload[24] = 1;
         let resp = runtime.block_on(build_response(&reserved, &store, &object_store));
         assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
         assert_eq!(resp.error_code, -libc::EINVAL);

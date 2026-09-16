@@ -145,7 +145,8 @@ extern const struct inode_operations kestrelfs_symlink_inode_operations;
  * Used by dir.c's lookup/create handlers.
  */
 struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
-				  u32 mode, u64 size, u32 nlink);
+				  u32 mode, u64 size, u32 uid, u32 gid,
+				  u32 nlink);
 
 /*
  * file.c: unified file operations for regular files.

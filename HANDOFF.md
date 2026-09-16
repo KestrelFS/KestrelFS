@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 38 POSIX-EXCHANGE（原子 `RENAME_EXCHANGE`）已由 Cursor 验收并纳入本提交（IPC ABI v17、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 39 POSIX-CHOWN（持久 uid/gid）已由 Cursor 验收并纳入本提交（IPC ABI v18、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 38 `RENAME_EXCHANGE` 已验收；下一步 Step 39 = POSIX-CHOWN（见 remaining-capabilities §8） |
+| 当前阶段 | Step 39 POSIX-CHOWN 已验收；下一步 Step 40 = POSIX-UTIMES（见 remaining-capabilities §8） |
 
 ---
 
@@ -58,7 +58,7 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 35 每 100 ms 探测该 durable revision，变化或探测失败时通知内核保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37 让 Mem/File/Redis 持久更新 inode mode。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 35 每 100 ms 探测该 durable revision，变化或探测失败时通知内核保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37 让 Mem/File/Redis 持久更新 inode mode；Step 39 把同一原子 mutation 扩展到 uid/gid。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
 - **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 35 由 Redis daemon 经 ABI v14 ioctl 请求 v4-journal 保护的全 cache 失效，形成最小远端 mutation 闭环。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
@@ -129,6 +129,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step37-posix-chmod-vng.sh # Step 37 文件/目录 chmod、重启及 orphan 回归
 ├── test-step37-posix-chmod.c # Step 37 open-unlink fchmod 测试助手
 ├── test-step38-posix-exchange-vng.sh # Step 38 原子 EXCHANGE/失败原子性/重启回归
+├── test-step39-posix-chown-vng.sh # Step 39 文件/目录 chown、重启及 orphan 回归
+├── test-step39-posix-chown.c # Step 39 open-unlink fchown 测试助手
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -182,6 +184,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 36** | **open-unlink：显式 open 计数、nlink=0 orphan、last-close GC** | **15** | **✅ 已验收** |
 | **Phase 4/控制面 Step 37** | **文件/目录持久 chmod；ABI v16 `OP_SETATTR`；orphan fchmod** | **16** | **✅ 已验收** |
 | **Phase 4/控制面 Step 38** | **原子 `RENAME_EXCHANGE`；文件/目录/混合类型交换；目录 nlink** | **17** | **✅ 已验收** |
+| **Phase 4/控制面 Step 39** | **文件/目录持久 chown；原子 mode/uid/gid setattr；orphan fchown** | **18** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -204,9 +207,12 @@ ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **
 Cursor 对照代码、179 tests 与 `STEP38_POSIX_EXCHANGE_PASS` 确认 Step 38 已验收。
 ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝。ABI **v17**；format **v4**。
 
-下一步：**Step 39 POSIX-CHOWN**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、181 tests 与 `STEP39_POSIX_CHOWN_PASS` 确认 Step 39 已验收。
+ABI v18 持久 uid/gid；可与 MODE 同事务；orphan fchown。ABI **v18**；format **v4**。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 17`（含 `RENAME_EXCHANGE`）
+下一步：**Step 40 POSIX-UTIMES**，提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 18`（含 SETATTR UID/GID）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -222,7 +228,7 @@ ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝�
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 17`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 18`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -242,6 +248,7 @@ ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝�
 15. Phase 4/控制面 Step 36：UNLINK_DATA/RENAME_DATA 增加延迟回收语义；新增 `FINALIZE_ORPHAN`
 16. Phase 4/控制面 Step 37：新增 `SETATTR`；当前 valid mask 仅支持 MODE，保留类型位并替换 `0o7777`
 17. Phase 4/控制面 Step 38：`RENAME_DATA` 接受与 NOREPLACE 互斥的 `RENAME_EXCHANGE`；payload/共享内存布局不变
+18. Phase 4/控制面 Step 39：`SETATTR` valid 扩展 UID/GID；请求新增 uid@16/gid@20，响应返回 mode/uid/gid@0/4/8
 
 ### 5.4 已实现 Opcode 列表
 
@@ -270,7 +277,7 @@ ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝�
 | 20 | `OP_READLINK_DATA` | daemon 将符号链接 target 返回到 bounce buffer | 11 |
 | 21 | `OP_LINK_DATA` | 为现有非目录 inode 创建 bounce 长名硬链接，返回更新后的 nlink | 12 |
 | 22 | `OP_FINALIZE_ORPHAN` | last close 后回收 nlink=0 inode，并把对象加入 durable GC | 15 |
-| 23 | `OP_SETATTR` | 持久更新受支持的 inode 属性；v16 当前仅支持 mode | 16 |
+| 23 | `OP_SETATTR` | 持久更新受支持的 inode 属性；v18 支持 mode/uid/gid 任意非空组合 | 18 |
 | 64 | `OP_RESULT_OK` | 响应：成功 | 1 |
 | 65 | `OP_RESULT_ERROR` | 响应：失败（error_code 携带负 errno） | 1 |
 
@@ -309,7 +316,7 @@ ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝�
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
-| 14 | **setattr 仍只覆盖 size/mode** | Step 37 已让文件/目录 chmod 持久化 `0o7777` 并保留类型位；chown、显式时间属性及 mode+size 单事务仍返回 `EOPNOTSUPP`。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
+| 14 | **setattr 仍缺显式时间属性** | Step 37/39 已持久化 mode 与 uid/gid（可同事务）；显式 atime/mtime 与 mode+size 单事务仍返回 `EOPNOTSUPP`。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
 | 17 | **open-unlink 离线 final-close 只保证不误删** | Step 36 用 mount-local open 计数和持久 nlink=0 orphan 延迟回收；daemon 重启时 open fd 仍可继续。若最终 close 时 daemon/IPC 不可用，当前保留 orphan，不在 `evict_inode` 发 IPC，因此可能安全泄漏且尚无自动 sweep。 | `kestrelfs/file.c`、`daemon/src/meta.rs` |
@@ -348,7 +355,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 38 验收基线 179 个）
+cargo test                    # 单元测试 + 集成测试（Step 39 验收基线 181 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1309,6 +1316,41 @@ Cursor 复跑确认上述 STEP38_* marker；Codex 另报告相关回归
 全部测试仅在 vng guest + loop 执行，脚本显式 `insmod`，使用独立 data_dir 并保留
 daemon.log；未触碰宿主机模块、mount 或 zvol。`RENAME_WHITEOUT` 仍未实现。
 
+### 7.33 Phase 4/控制面 Step 39 POSIX-CHOWN
+
+ABI v18 扩展 `OP_SETATTR`：请求为 inode@0、valid@8、mode@12、uid@16、gid@20，
+响应返回 authoritative mode/uid/gid@0/4/8。MODE/UID/GID 可在一个 MetaStore
+mutation 中任意组合；MemStore 单写锁、FileMetaStore 单次 sync、RedisMetaStore 单次
+Lua revision-CAS。内核 lookup/getattr 同步刷新 VFS inode uid/gid，retained orphan 在
+final close 前支持 fchown。size 与属性组合、显式时间属性仍 fail closed；权限模型沿用
+VFS root/capability 基础检查，不宣称完整 DAC/ACL/idmapped-mount 语义。
+
+Cursor 验收自检（2026-09-16）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  181 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+REDIS_URL=... cargo test --manifest-path daemon/Cargo.toml \
+  redis_url_gated_full_semantics_and_restart -- --nocapture
+  1 passed; 0 failed
+vng ... --exec ./test-step39-posix-chown-vng.sh
+  STEP39_FILE_DIR_CHOWN_PASS
+  STEP39_UNSUPPORTED_ATTRS_PASS
+  STEP39_ORPHAN_FCHOWN_PASS
+  STEP39_CHOWN_RESTART_PASS
+  STEP39_POSIX_CHOWN_PASS (umount_ms=22)
+vng regressions
+  STEP37_POSIX_CHMOD_PASS (umount_ms=21)
+  STEP36_POSIX_LIFECYCLE_PASS (umount_ms=25)
+```
+
+全部 mount/module 测试仅在 vng guest + loop 执行，脚本显式 `insmod`，使用独立
+data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1317,8 +1359,8 @@ daemon.log；未触碰宿主机模块、mount 或 zvol。`RENAME_WHITEOUT` 仍�
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 39 POSIX-CHOWN** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | 其余 / DIST | WHITEOUT、utimes、COHERENCE-FINE、DIST-OBJECT… |
+| 1 | **Step 40 POSIX-UTIMES** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | 其余 / DIST | WHITEOUT、COHERENCE-FINE、DIST-OBJECT… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1373,12 +1415,13 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 38 POSIX-EXCHANGE 已由 Cursor 验收并提交
-- [x] IPC ABI = 17；cache format = v4
-- [x] Step 8–37 + Step 38 已验收状态已写清
-- [x] 下一步明确：Step 39 POSIX-CHOWN（`docs/remaining-capabilities.md` §8）
+- [x] Step 39 POSIX-CHOWN 已由 Cursor 验收并提交
+- [x] IPC ABI = 18；cache format = v4
+- [x] Step 8–38 + Step 39 已验收状态已写清
+- [x] 下一步明确：Step 40 POSIX-UTIMES（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
+
 
 ---
 

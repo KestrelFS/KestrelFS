@@ -585,11 +585,12 @@ const struct file_operations kestrelfs_writable_file_ops = {
  *   - ftruncate(fd, size) - explicit size change
  *   - truncate(path, size) - explicit size change
  *   - chmod/fchmod - permission and special-bit change
+ *   - chown/fchown - numeric owner/group change
  *
- * ATTR_SIZE keeps using OP_TRUNCATE. ABI v16 adds OP_SETATTR for ATTR_MODE;
- * the daemon preserves file-type bits and returns the authoritative full
- * mode. uid/gid and explicit timestamp changes remain unsupported instead of
- * being accepted only in the transient VFS inode.
+ * ATTR_SIZE keeps using OP_TRUNCATE. ABI v18 OP_SETATTR atomically applies any
+ * non-empty combination of mode/uid/gid and returns authoritative values.
+ * Size remains mutually exclusive with those fields. Explicit timestamp
+ * changes remain unsupported instead of being transient VFS-only updates.
  *
  * Return: 0 on success, negative errno on failure.
  */
@@ -601,15 +602,15 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	int ret;
 
 	unsupported = attr->ia_valid &
-		(ATTR_UID | ATTR_GID | ATTR_ATIME_SET | ATTR_MTIME_SET |
+		(ATTR_ATIME | ATTR_MTIME | ATTR_ATIME_SET | ATTR_MTIME_SET |
 		 ATTR_TIMES_SET | ATTR_TOUCH | ATTR_DELEG);
 	if (unsupported)
 		return -EOPNOTSUPP;
-	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE)))
+	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID)))
 		return -EOPNOTSUPP;
 	/* There is no cross-opcode transaction for this unusual combination. */
-	if ((attr->ia_valid & (ATTR_SIZE | ATTR_MODE)) ==
-	    (ATTR_SIZE | ATTR_MODE))
+	if ((attr->ia_valid & ATTR_SIZE) &&
+	    (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)))
 		return -EOPNOTSUPP;
 	if ((attr->ia_valid & ATTR_SIZE) && !S_ISREG(inode->i_mode))
 		return -EISDIR;
@@ -657,18 +658,45 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		truncate_inode_pages(&inode->i_data, new_size);
 	}
 
-	if (attr->ia_valid & ATTR_MODE) {
+	if (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)) {
 		u64 inode_id = inode->i_ino;
-		u32 valid = KESTRELFS_SETATTR_MODE;
-		u32 requested_mode = attr->ia_mode;
+		u32 valid = 0;
+		u32 requested_mode = inode->i_mode;
+		u32 requested_uid = i_uid_read(inode);
+		u32 requested_gid = i_gid_read(inode);
 		u32 persisted_mode;
+		u32 persisted_uid;
+		u32 persisted_gid;
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
+
+		if (attr->ia_valid & ATTR_MODE) {
+			valid |= KESTRELFS_SETATTR_MODE;
+			requested_mode = attr->ia_mode;
+		}
+		if (attr->ia_valid & ATTR_UID) {
+			uid_t uid = from_kuid(i_user_ns(inode), attr->ia_uid);
+
+			if (uid == (uid_t)-1)
+				return -EOVERFLOW;
+			valid |= KESTRELFS_SETATTR_UID;
+			requested_uid = uid;
+		}
+		if (attr->ia_valid & ATTR_GID) {
+			gid_t gid = from_kgid(i_user_ns(inode), attr->ia_gid);
+
+			if (gid == (gid_t)-1)
+				return -EOVERFLOW;
+			valid |= KESTRELFS_SETATTR_GID;
+			requested_gid = gid;
+		}
 
 		req.opcode = KESTRELFS_OP_SETATTR;
 		put_unaligned_le64(inode_id, &req.payload[0]);
 		put_unaligned_le32(valid, &req.payload[8]);
 		put_unaligned_le32(requested_mode, &req.payload[12]);
+		put_unaligned_le32(requested_uid, &req.payload[16]);
+		put_unaligned_le32(requested_gid, &req.payload[20]);
 
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		if (ret)
@@ -679,9 +707,14 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			return -EIO;
 
 		persisted_mode = get_unaligned_le32(&resp.payload[0]);
+		persisted_uid = get_unaligned_le32(&resp.payload[4]);
+		persisted_gid = get_unaligned_le32(&resp.payload[8]);
 		if ((persisted_mode & S_IFMT) != (inode->i_mode & S_IFMT))
 			return -EPROTO;
-		attr->ia_mode = persisted_mode;
+		if (valid & KESTRELFS_SETATTR_MODE)
+			attr->ia_mode = persisted_mode;
+		i_uid_write(inode, persisted_uid);
+		i_gid_write(inode, persisted_gid);
 	}
 
 	/* Apply other attribute changes (mtime, mode, etc.)
