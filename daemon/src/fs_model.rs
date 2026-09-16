@@ -134,7 +134,7 @@ pub const SYMLINK_TARGET_MAX: usize = 4095;
 /// This intentionally only carries the subset of POSIX attributes
 /// KestrelFS actually needs to answer `KESTRELFS_OP_GETATTR`/
 /// `KESTRELFS_OP_LOOKUP` requests (see `kestrelfs_ipc.h`) - there is
-/// no `atime`/`ctime` split yet, no extended attributes, no ACLs.
+/// no persistent `ctime` yet, no extended attributes, no ACLs.
 /// Those can be added additively later without breaking the
 /// `#[derive(Serialize, Deserialize)]` contract as long as new fields
 /// carry `#[serde(default)]` for backward compatibility with
@@ -160,9 +160,11 @@ pub struct Inode {
     /// Persistent link count. Non-directories count hard-link dirents;
     /// directories use the POSIX convention `2 + immediate subdirectories`.
     pub nlink: u32,
-    /// Last modification time, Unix epoch seconds. Deliberately a
-    /// single timestamp (no separate `atime`/`ctime`) for this
-    /// bootstrap model - see the struct doc comment.
+    /// Last access time, Unix epoch seconds. ABI v19 intentionally stores
+    /// second precision only. Old persisted records deserialize as epoch.
+    #[serde(default)]
+    pub atime: u64,
+    /// Last modification time, Unix epoch seconds.
     pub mtime: u64,
 }
 
@@ -178,6 +180,7 @@ impl Inode {
             uid: 0,
             gid: 0,
             nlink: 2,
+            atime: mtime,
             mtime,
         }
     }
@@ -197,6 +200,7 @@ impl Inode {
             uid: 0,
             gid: 0,
             nlink: 1,
+            atime: mtime,
             mtime,
         }
     }
@@ -211,6 +215,7 @@ impl Inode {
             uid: 0,
             gid: 0,
             nlink: 2,
+            atime: mtime,
             mtime,
         }
     }
@@ -225,6 +230,7 @@ impl Inode {
             uid: 0,
             gid: 0,
             nlink: 1,
+            atime: mtime,
             mtime,
         }
     }
@@ -430,6 +436,16 @@ mod tests {
         assert_eq!(original.inode_id, restored.inode_id);
         assert_eq!(original.size, restored.size);
         assert_eq!(original.mode, restored.mode);
+        assert_eq!(original.atime, restored.atime);
+        assert_eq!(original.mtime, restored.mtime);
+    }
+
+    #[test]
+    fn legacy_inode_without_atime_deserializes_at_epoch() {
+        let json = r#"{"inode_id":7,"size":999,"mode":33188,"uid":0,"gid":0,"nlink":1,"mtime":1700000000}"#;
+        let restored: Inode = serde_json::from_str(json).expect("legacy inode deserialize");
+        assert_eq!(restored.atime, 0);
+        assert_eq!(restored.mtime, 1_700_000_000);
     }
 
     #[test]

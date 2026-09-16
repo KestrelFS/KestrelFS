@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 39 POSIX-CHOWN 已验收；下一步 Step 40 POSIX-UTIMES；IPC ABI v18；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 40 POSIX-UTIMES 已验收；下一步 Step 41 DIST-OBJECT；IPC ABI v19；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -38,7 +38,8 @@
 > open-unlink。Step 37已通过 `OP_SETATTR` 补齐文件/目录持久 chmod，并支持
 > retained orphan 的 fchmod（已验收）。Step 38 已支持原子 `RENAME_EXCHANGE`
 > （文件、目录及 Linux 允许的混合类型交换）。Step 39 已支持持久 chown/fchown
-> （可与 mode 同事务）。完整时间属性、`WHITEOUT`、真正的异步 completion
+> （可与 mode 同事务）。Step 40 已支持秒级显式 atime/mtime 持久化；
+> `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
@@ -139,7 +140,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–39 已验收；下一步 Step 40 POSIX-UTIMES（ABI v18 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–40 已验收；下一步 Step 41 DIST-OBJECT（ABI v19 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -154,7 +155,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v18）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v19）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -173,6 +174,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step38-posix-exchange-vng.sh  # EXCHANGE、失败原子性、缓存与重启回归
 ├── test-step39-posix-chown-vng.sh     # 文件/目录 chown、重启与 orphan 回归
 ├── test-step39-posix-chown.c          # open-unlink fchown 测试助手
+├── test-step40-posix-utimes-vng.sh    # 文件/目录时间、重启与 orphan 回归
+├── test-step40-posix-utimes.c         # open-unlink futimens 测试助手
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -446,8 +449,9 @@ Step 34 支持 create/mkdir mode 与
 `2 + 直接子目录数` 的持久化目录 nlink。仍缺：
 
 - Step 36 已支持 open-unlink 与 last-close GC；若最终 close 时 daemon
-  不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37/39 已实现文件/目录持久 chmod 与 chown/fchown。完整时间属性与
-  mode+size 单事务仍未实现。
+  不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37/39 已实现文件/目录
+  持久 chmod 与 chown/fchown。Step 40 已实现显式 atime/mtime，当前
+  仅有秒级精度，自动读 atime 与 ctime 不持久化；mode/owner/time 与 size 的单事务仍未实现。
   `RENAME_WHITEOUT` 仍返回 `EINVAL`；symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。

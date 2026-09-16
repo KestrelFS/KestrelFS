@@ -173,12 +173,17 @@ pub trait MetaStore: Send + Sync {
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
     ) -> Result<Inode>;
 
     /// Convenience wrapper retained for callers which only change mode.
     #[allow(dead_code)]
     async fn set_mode(&self, inode: u64, mode: u32) -> Result<u32> {
-        Ok(self.set_attrs(inode, Some(mode), None, None).await?.mode)
+        Ok(self
+            .set_attrs(inode, Some(mode), None, None, None, None)
+            .await?
+            .mode)
     }
 
     /// Resolves `(inode, chunk_idx)` to the list of [`Slice`] records
@@ -713,6 +718,8 @@ impl MetaStore for MemStore {
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
     ) -> Result<Inode> {
         let mut inner = self.inner.write().await;
         let inode_meta = inner.inodes.get_mut(&inode).ok_or(MetaError::NotFound)?;
@@ -725,6 +732,12 @@ impl MetaStore for MemStore {
         }
         if let Some(gid) = gid {
             inode_meta.gid = gid;
+        }
+        if let Some(atime) = atime {
+            inode_meta.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            inode_meta.mtime = mtime;
         }
         Ok(inode_meta.clone())
     }
@@ -1798,14 +1811,23 @@ mod tests {
             .await.unwrap().is_empty());
         assert_eq!(store.getattr(file).await.unwrap().nlink, 0);
         let attrs = store
-            .set_attrs(file, Some(0o600), Some(1234), Some(2345))
+            .set_attrs(
+                file,
+                Some(0o600),
+                Some(1234),
+                Some(2345),
+                Some(1_577_836_800),
+                Some(1_577_836_801),
+            )
             .await
             .unwrap();
         assert_eq!(attrs.mode, S_IFREG | 0o600);
         assert_eq!((attrs.uid, attrs.gid), (1234, 2345));
+        assert_eq!((attrs.atime, attrs.mtime), (1_577_836_800, 1_577_836_801));
         let persisted = store.getattr(file).await.unwrap();
         assert_eq!(persisted.mode, attrs.mode);
         assert_eq!((persisted.uid, persisted.gid), (attrs.uid, attrs.gid));
+        assert_eq!((persisted.atime, persisted.mtime), (attrs.atime, attrs.mtime));
         assert!(matches!(store.set_mode(u64::MAX, 0o644).await, Err(MetaError::NotFound)));
     }
 

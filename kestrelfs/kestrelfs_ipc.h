@@ -146,6 +146,7 @@
 #define KESTRELFS_OP_LINK_DATA		21	/* req: hard link using name in data_buffer */
 #define KESTRELFS_OP_FINALIZE_ORPHAN	22	/* req: reclaim an unlinked inode */
 #define KESTRELFS_OP_SETATTR		23	/* req: persist supported inode attributes */
+#define KESTRELFS_OP_GETATTR_TIMES	24	/* req: fetch persistent atime/mtime */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -204,22 +205,36 @@
  *
  *   offset  0, 8 bytes, little-endian u64: inode_id
  *   offset  8, 4 bytes, little-endian u32: valid attribute mask
+ * Basic layout (MODE/UID/GID only):
  *   offset 12, 4 bytes, little-endian u32: requested mode
  *   offset 16, 4 bytes, little-endian u32: requested uid
  *   offset 20, 4 bytes, little-endian u32: requested gid
  *   offset 24..31: reserved, must be zero
  *
- * ABI v18 accepts any non-empty combination of MODE, UID, and GID atomically.
- * The daemon preserves the inode's existing file-type bits and replaces only
- * mode & 07777. A successful response returns authoritative mode@0, uid@4,
- * and gid@8 as little-endian u32 values; remaining response bytes are zero.
+ * Time layout (ATIME/MTIME only):
+ *   offset 12, 8 bytes, little-endian u64: atime Unix seconds
+ *   offset 20, 8 bytes, little-endian u64: mtime Unix seconds
+ *   offset 28..31: reserved, must be zero
+ *
+ * Basic and time masks are mutually exclusive because their union fields
+ * overlap. ABI v19 stores timestamps at one-second precision. A basic response
+ * returns mode@0, uid@4, gid@8. A time response returns atime@0, mtime@8.
  */
 #define KESTRELFS_SETATTR_MODE		(1U << 0)
 #define KESTRELFS_SETATTR_UID		(1U << 1)
 #define KESTRELFS_SETATTR_GID		(1U << 2)
-#define KESTRELFS_SETATTR_VALID_MASK	(KESTRELFS_SETATTR_MODE | \
+#define KESTRELFS_SETATTR_ATIME		(1U << 3)
+#define KESTRELFS_SETATTR_MTIME		(1U << 4)
+#define KESTRELFS_SETATTR_BASIC_MASK	(KESTRELFS_SETATTR_MODE | \
 					 KESTRELFS_SETATTR_UID | \
 					 KESTRELFS_SETATTR_GID)
+#define KESTRELFS_SETATTR_TIME_MASK	(KESTRELFS_SETATTR_ATIME | \
+					 KESTRELFS_SETATTR_MTIME)
+#define KESTRELFS_SETATTR_VALID_MASK	(KESTRELFS_SETATTR_BASIC_MASK | \
+					 KESTRELFS_SETATTR_TIME_MASK)
+
+/* GETATTR_TIMES request: inode_id u64@0, remaining bytes zero.
+ * Success response: atime Unix seconds u64@0, mtime Unix seconds u64@8. */
 
 /*
  * Payload layout for KESTRELFS_OP_READ_CHUNK requests
@@ -828,8 +843,12 @@ struct kestrelfs_ring_ctrl {
  *  18 - Phase 4/control-plane step 39: SETATTR can atomically persist uid
  *       and gid, independently or together with mode. Request uid/gid occupy
  *       payload offsets 16/20; the response returns mode/uid/gid at 0/4/8.
+ *
+ *  19 - Phase 4/control-plane step 40: SETATTR adds a mutually-exclusive
+ *       atime/mtime union layout with second-precision Unix timestamps; added
+ *       GETATTR_TIMES (opcode 24) for inode reconstruction after lookup.
  */
-#define KESTRELFS_ABI_VERSION		18
+#define KESTRELFS_ABI_VERSION		19
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -1011,5 +1030,9 @@ _Static_assert(8 + 4 + 4 + 4 + 4 + 8 == KESTRELFS_EVENT_PAYLOAD_SIZE,
 
 _Static_assert(8 + 4 + 4 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_SETATTR request fields overflow the event payload");
+_Static_assert(8 + 4 + 8 + 8 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_SETATTR time fields overflow the event payload");
+_Static_assert(8 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_GETATTR_TIMES request overflows the event payload");
 
 #endif /* _KESTRELFS_IPC_H */

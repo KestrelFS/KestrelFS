@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 18;
+pub const ABI_VERSION: u32 = 19;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -119,8 +119,10 @@ pub const OP_READLINK_DATA: u32 = 20;
 pub const OP_LINK_DATA: u32 = 21;
 /// Request: reclaim an unlinked inode after its final open handle closes.
 pub const OP_FINALIZE_ORPHAN: u32 = 22;
-/// Request: persist supported inode attributes (currently mode only).
+/// Request: persist supported inode attributes.
 pub const OP_SETATTR: u32 = 23;
+/// Request: fetch persistent atime/mtime for VFS inode reconstruction.
+pub const OP_GETATTR_TIMES: u32 = 24;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -253,7 +255,7 @@ impl KestrelfsEvent {
         }
     }
 
-    /// Decodes the ABI v18 `OP_SETATTR` fixed payload.
+    /// Decodes the ABI v19 `OP_SETATTR` union payload.
     ///
     /// Callers validate `flags`, `valid`, and reserved bytes before applying
     /// the requested mutation.
@@ -264,6 +266,8 @@ impl KestrelfsEvent {
             mode: u32::from_le_bytes(self.payload[12..16].try_into().unwrap()),
             uid: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
             gid: u32::from_le_bytes(self.payload[20..24].try_into().unwrap()),
+            atime: u64::from_le_bytes(self.payload[12..20].try_into().unwrap()),
+            mtime: u64::from_le_bytes(self.payload[20..28].try_into().unwrap()),
         }
     }
 
@@ -883,7 +887,7 @@ pub struct TruncateReq {
     pub new_size: u64,
 }
 
-/// Decoded ABI v18 `OP_SETATTR` request.
+/// Decoded ABI v19 `OP_SETATTR` union request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetattrReq {
     pub inode_id: u64,
@@ -891,13 +895,19 @@ pub struct SetattrReq {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    pub atime: u64,
+    pub mtime: u64,
 }
 
-/// Attribute mutations supported by ABI v18.
+/// Attribute mutations supported by ABI v19.
 pub const SETATTR_MODE: u32 = 1 << 0;
 pub const SETATTR_UID: u32 = 1 << 1;
 pub const SETATTR_GID: u32 = 1 << 2;
-pub const SETATTR_VALID_MASK: u32 = SETATTR_MODE | SETATTR_UID | SETATTR_GID;
+pub const SETATTR_ATIME: u32 = 1 << 3;
+pub const SETATTR_MTIME: u32 = 1 << 4;
+pub const SETATTR_BASIC_MASK: u32 = SETATTR_MODE | SETATTR_UID | SETATTR_GID;
+pub const SETATTR_TIME_MASK: u32 = SETATTR_ATIME | SETATTR_MTIME;
+pub const SETATTR_VALID_MASK: u32 = SETATTR_BASIC_MASK | SETATTR_TIME_MASK;
 
 /// Decoded `KESTRELFS_OP_CREATE` request payload.
 pub struct CreateReq {
@@ -1107,6 +1117,7 @@ const _: [(); 131_264] = [(); std::mem::offset_of!(
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 4 + 8 + 8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
@@ -1474,13 +1485,32 @@ mod tests {
             event.decode_setattr_req(),
             SetattrReq {
                 inode_id: 42,
-                valid: SETATTR_VALID_MASK,
+                valid: SETATTR_BASIC_MASK,
                 mode: 0o106751,
                 uid: 1000,
                 gid: 1001,
+                atime: u64::from_le_bytes(event.payload[12..20].try_into().unwrap()),
+                mtime: u64::from_le_bytes(event.payload[20..28].try_into().unwrap()),
             }
         );
         const { assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE) };
+        const { assert!(8 + 4 + 8 + 8 <= EVENT_PAYLOAD_SIZE) };
+    }
+
+    #[test]
+    fn decode_setattr_time_union_uses_second_precision_fields() {
+        let mut event = KestrelfsEvent::zeroed(OP_SETATTR, 125);
+        event.payload[0..8].copy_from_slice(&42u64.to_le_bytes());
+        event.payload[8..12]
+            .copy_from_slice(&(SETATTR_ATIME | SETATTR_MTIME).to_le_bytes());
+        event.payload[12..20].copy_from_slice(&1_577_836_800u64.to_le_bytes());
+        event.payload[20..28].copy_from_slice(&1_577_836_801u64.to_le_bytes());
+
+        let req = event.decode_setattr_req();
+        assert_eq!(req.inode_id, 42);
+        assert_eq!(req.valid, SETATTR_TIME_MASK);
+        assert_eq!(req.atime, 1_577_836_800);
+        assert_eq!(req.mtime, 1_577_836_801);
     }
 
     #[test]

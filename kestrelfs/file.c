@@ -586,14 +586,46 @@ const struct file_operations kestrelfs_writable_file_ops = {
  *   - truncate(path, size) - explicit size change
  *   - chmod/fchmod - permission and special-bit change
  *   - chown/fchown - numeric owner/group change
+ *   - utimensat/futimens/touch - explicit atime/mtime change
  *
- * ATTR_SIZE keeps using OP_TRUNCATE. ABI v18 OP_SETATTR atomically applies any
- * non-empty combination of mode/uid/gid and returns authoritative values.
- * Size remains mutually exclusive with those fields. Explicit timestamp
- * changes remain unsupported instead of being transient VFS-only updates.
+ * ATTR_SIZE keeps using OP_TRUNCATE. ABI v19 OP_SETATTR atomically applies a
+ * non-empty basic (mode/uid/gid) or time (atime/mtime) group and returns
+ * authoritative values. Size and the overlapping basic/time wire layouts are
+ * mutually exclusive. Timestamp persistence deliberately has second precision.
  *
  * Return: 0 on success, negative errno on failure.
  */
+int kestrelfs_refresh_inode_times(struct inode *inode)
+{
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	struct timespec64 atime = { .tv_nsec = 0 };
+	struct timespec64 mtime = { .tv_nsec = 0 };
+	u64 atime_sec;
+	u64 mtime_sec;
+	int ret;
+
+	req.opcode = KESTRELFS_OP_GETATTR_TIMES;
+	put_unaligned_le64(inode->i_ino, &req.payload[0]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	if (ret)
+		return ret;
+	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+		return resp.error_code;
+	if (resp.opcode != KESTRELFS_OP_RESULT_OK)
+		return -EIO;
+
+	atime_sec = get_unaligned_le64(&resp.payload[0]);
+	mtime_sec = get_unaligned_le64(&resp.payload[8]);
+	if (atime_sec > S64_MAX || mtime_sec > S64_MAX)
+		return -EPROTO;
+	atime.tv_sec = (time64_t)atime_sec;
+	mtime.tv_sec = (time64_t)mtime_sec;
+	inode_set_atime_to_ts(inode, atime);
+	inode_set_mtime_to_ts(inode, mtime);
+	return 0;
+}
+
 int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			    struct iattr *attr)
 {
@@ -601,16 +633,20 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	unsigned int unsupported;
 	int ret;
 
-	unsupported = attr->ia_valid &
-		(ATTR_ATIME | ATTR_MTIME | ATTR_ATIME_SET | ATTR_MTIME_SET |
-		 ATTR_TIMES_SET | ATTR_TOUCH | ATTR_DELEG);
+	unsupported = attr->ia_valid & ATTR_DELEG;
 	if (unsupported)
 		return -EOPNOTSUPP;
-	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID)))
+	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID |
+			      ATTR_ATIME | ATTR_MTIME)))
 		return -EOPNOTSUPP;
-	/* There is no cross-opcode transaction for this unusual combination. */
+	/* TRUNCATE remains a separate mutation and the ABI v19 basic/time layouts
+	 * overlap, so neither combination can be one atomic request. */
 	if ((attr->ia_valid & ATTR_SIZE) &&
-	    (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)))
+	    (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID |
+			      ATTR_ATIME | ATTR_MTIME)))
+		return -EOPNOTSUPP;
+	if ((attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)) &&
+	    (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME)))
 		return -EOPNOTSUPP;
 	if ((attr->ia_valid & ATTR_SIZE) && !S_ISREG(inode->i_mode))
 		return -EISDIR;
@@ -715,6 +751,62 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			attr->ia_mode = persisted_mode;
 		i_uid_write(inode, persisted_uid);
 		i_gid_write(inode, persisted_gid);
+	}
+
+	if (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME)) {
+		u64 inode_id = inode->i_ino;
+		u64 requested_atime;
+		u64 requested_mtime;
+		u64 persisted_atime;
+		u64 persisted_mtime;
+		u32 valid = 0;
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+
+		if (inode_get_atime_sec(inode) < 0 ||
+		    inode_get_mtime_sec(inode) < 0)
+			return -EOVERFLOW;
+		requested_atime = inode_get_atime_sec(inode);
+		requested_mtime = inode_get_mtime_sec(inode);
+		if (attr->ia_valid & ATTR_ATIME) {
+			if (attr->ia_atime.tv_sec < 0)
+				return -EOVERFLOW;
+			valid |= KESTRELFS_SETATTR_ATIME;
+			requested_atime = attr->ia_atime.tv_sec;
+		}
+		if (attr->ia_valid & ATTR_MTIME) {
+			if (attr->ia_mtime.tv_sec < 0)
+				return -EOVERFLOW;
+			valid |= KESTRELFS_SETATTR_MTIME;
+			requested_mtime = attr->ia_mtime.tv_sec;
+		}
+
+		req.opcode = KESTRELFS_OP_SETATTR;
+		put_unaligned_le64(inode_id, &req.payload[0]);
+		put_unaligned_le32(valid, &req.payload[8]);
+		put_unaligned_le64(requested_atime, &req.payload[12]);
+		put_unaligned_le64(requested_mtime, &req.payload[20]);
+
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
+		if (ret)
+			return ret;
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+			return resp.error_code;
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK)
+			return -EIO;
+
+		persisted_atime = get_unaligned_le64(&resp.payload[0]);
+		persisted_mtime = get_unaligned_le64(&resp.payload[8]);
+		if (persisted_atime > S64_MAX || persisted_mtime > S64_MAX)
+			return -EPROTO;
+		if (valid & KESTRELFS_SETATTR_ATIME) {
+			attr->ia_atime.tv_sec = (time64_t)persisted_atime;
+			attr->ia_atime.tv_nsec = 0;
+		}
+		if (valid & KESTRELFS_SETATTR_MTIME) {
+			attr->ia_mtime.tv_sec = (time64_t)persisted_mtime;
+			attr->ia_mtime.tv_nsec = 0;
+		}
 	}
 
 	/* Apply other attribute changes (mtime, mode, etc.)

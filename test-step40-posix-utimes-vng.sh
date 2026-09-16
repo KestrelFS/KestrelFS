@@ -1,12 +1,12 @@
 #!/bin/bash
-# Step 39 POSIX-CHOWN: persistent file/directory ownership and orphan fchown.
+# Step 40 POSIX-UTIMES: persistent file/directory times and orphan futimens.
 set -euo pipefail
 
 test_id=$$
-image=/tmp/kestrel-step39-cache-$test_id.img
-mnt=/tmp/mnt-kestrelfs-step39-$test_id
-data_dir=/tmp/kestrelfs-step39-$test_id
-helper=/tmp/kestrel-step39-posix-chown-$test_id
+image=/tmp/kestrel-step40-cache-$test_id.img
+mnt=/tmp/mnt-kestrelfs-step40-$test_id
+data_dir=/tmp/kestrelfs-step40-$test_id
+helper=/tmp/kestrel-step40-posix-utimes-$test_id
 loopdev=
 daemon_pid=
 namespace=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
@@ -14,9 +14,9 @@ namespace=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
 
 report_error() {
 	local status=$?
-	echo "STEP39_FAIL: line=$1 status=$status"
-	test -f "$data_dir/daemon.log" && tail -n 140 "$data_dir/daemon.log"
-	dmesg | tail -n 160
+	echo "STEP40_FAIL: line=$1 status=$status"
+	test -f "$data_dir/daemon.log" && tail -n 160 "$data_dir/daemon.log"
+	dmesg | tail -n 180
 	exit "$status"
 }
 trap 'report_error $LINENO' ERR
@@ -53,7 +53,7 @@ rm -rf "$data_dir" "$mnt"
 rm -f "$image" "$helper"
 mkdir -p "$data_dir" "$mnt"
 cc -O2 -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror \
-	test-step39-posix-chown.c -o "$helper"
+	test-step40-posix-utimes.c -o "$helper"
 truncate -s 128M "$image"
 modprobe loop 2>/dev/null || true
 test -c /dev/loop-control || mknod /dev/loop-control c 10 237
@@ -62,7 +62,7 @@ for minor in 0 1 2 3 4 5 6 7; do
 done
 loopdev=$(losetup -fP --show "$image")
 test -b "$loopdev"
-echo "STEP39_POSIX_CHOWN: loop_device=$loopdev namespace=$namespace"
+echo "STEP40_POSIX_UTIMES: loop_device=$loopdev namespace=$namespace"
 
 # Module, cache device, and mount exist only in this vng guest.
 insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
@@ -70,39 +70,44 @@ insmod kestrelfs/kestrelfs.ko cache_device="$loopdev" cache_size_mib=64 \
 start_daemon
 busybox mount -t kestrelfs none "$mnt"
 
-printf 'step39 persistent owner data\n' >"$mnt/chown-file-long-name"
-mkdir "$mnt/chown-directory-long-name"
-ln "$mnt/chown-file-long-name" "$mnt/chown-file-alias"
-chown 1234 "$mnt/chown-file-long-name"
-chgrp 2345 "$mnt/chown-file-long-name"
-chown 2234:3345 "$mnt/chown-directory-long-name"
-test "$(stat -c %u:%g "$mnt/chown-file-long-name")" = 1234:2345
-test "$(stat -c %u:%g "$mnt/chown-file-alias")" = 1234:2345
-test "$(stat -c %u:%g "$mnt/chown-directory-long-name")" = 2234:3345
-echo 'STEP39_FILE_DIR_CHOWN_PASS'
+printf 'step40 persistent timestamp data\n' >"$mnt/utimes-file-long-name"
+mkdir "$mnt/utimes-directory-long-name"
 
-# The retained orphan remains addressable by inode until its final close.
-"$helper" "$mnt/chown-open-orphan"
-test ! -e "$mnt/chown-open-orphan"
-echo 'STEP39_ORPHAN_FCHOWN_PASS'
+# Exercise independent ATIME/MTIME requests, their combination, and ATTR_TOUCH.
+touch -a -d @1577836800 "$mnt/utimes-file-long-name"
+touch -m -d @1577836801 "$mnt/utimes-file-long-name"
+touch -d @1577836810 "$mnt/utimes-directory-long-name"
+test "$(stat -c %X:%Y "$mnt/utimes-file-long-name")" = 1577836800:1577836801
+test "$(stat -c %X:%Y "$mnt/utimes-directory-long-name")" = 1577836810:1577836810
+before=$(date +%s)
+touch "$mnt/utimes-file-long-name"
+after=$(date +%s)
+touch_time=$(stat -c %Y "$mnt/utimes-file-long-name")
+test "$touch_time" -ge "$before"
+test "$touch_time" -le "$after"
+echo 'STEP40_FILE_DIR_UTIMES_PASS'
 
-# FileMetaStore restart must reconstruct persistent owners for files and dirs.
+# Restore deterministic values for persistence assertions.
+touch -a -d @1577836800 "$mnt/utimes-file-long-name"
+touch -m -d @1577836801 "$mnt/utimes-file-long-name"
+"$helper" "$mnt/utimes-open-orphan"
+test ! -e "$mnt/utimes-open-orphan"
+echo 'STEP40_ORPHAN_FUTIMENS_PASS'
+
 busybox umount "$mnt"
 stop_daemon
 start_daemon
 busybox mount -t kestrelfs none "$mnt"
-test "$(stat -c %u:%g "$mnt/chown-file-long-name")" = 1234:2345
-test "$(stat -c %u:%g "$mnt/chown-file-alias")" = 1234:2345
-test "$(stat -c %u:%g "$mnt/chown-directory-long-name")" = 2234:3345
-test "$(cat "$mnt/chown-file-long-name")" = 'step39 persistent owner data'
-echo 'STEP39_CHOWN_RESTART_PASS'
+test "$(stat -c %X:%Y "$mnt/utimes-file-long-name")" = 1577836800:1577836801
+test "$(stat -c %X:%Y "$mnt/utimes-directory-long-name")" = 1577836810:1577836810
+echo 'STEP40_UTIMES_RESTART_PASS'
 
-rm "$mnt/chown-file-alias" "$mnt/chown-file-long-name"
-rmdir "$mnt/chown-directory-long-name"
+rm "$mnt/utimes-file-long-name"
+rmdir "$mnt/utimes-directory-long-name"
 dmesg >"$data_dir/dmesg.log"
 if grep -E 'BUG:|KASAN:|use-after-free|general protection fault|hung task' \
 	"$data_dir/dmesg.log"; then
-	echo 'STEP39_FAIL: kernel safety diagnostic found'
+	echo 'STEP40_FAIL: kernel safety diagnostic found'
 	exit 1
 fi
 
@@ -117,5 +122,5 @@ losetup -d "$loopdev"
 loopdev=
 trap - EXIT
 rm -f "$image" "$helper"
-echo "STEP39_POSIX_CHOWN: umount_ms=$umount_ms"
-echo 'STEP39_POSIX_CHOWN_PASS'
+echo "STEP40_POSIX_UTIMES: umount_ms=$umount_ms"
+echo 'STEP40_POSIX_UTIMES_PASS'

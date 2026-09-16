@@ -82,13 +82,6 @@ test -d "$mnt/chmod-directory-long-name"
 test "$(stat -c %a "$mnt/chmod-directory-long-name")" = 1770
 echo 'STEP37_FILE_DIR_CHMOD_PASS'
 
-# Explicit timestamp mutation remains unsupported after Step 39.
-if touch -t 202001010000 "$mnt/chmod-file-long-name" 2>/dev/null; then
-	echo 'STEP37_FAIL: explicit timestamp setattr unexpectedly succeeded'
-	exit 1
-fi
-echo 'STEP37_UNSUPPORTED_ATTRS_PASS'
-
 # An open-unlinked inode remains metadata-addressable until final close, so
 # fchmod updates the retained orphan; close then uses Step 36 finalization.
 "$helper" "$mnt/chmod-open-orphan"

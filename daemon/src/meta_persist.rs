@@ -146,8 +146,13 @@ impl MetaStore for FileMetaStore {
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
     ) -> Result<crate::fs_model::Inode> {
-        let attrs = self.mem.set_attrs(inode, mode, uid, gid).await?;
+        let attrs = self
+            .mem
+            .set_attrs(inode, mode, uid, gid, atime, mtime)
+            .await?;
         self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
         Ok(attrs)
     }
@@ -460,7 +465,14 @@ mod tests {
                 .unlink_with_lifecycle(ROOT_INODE, "open-orphan", true)
                 .await.unwrap().is_empty());
             let attrs = store
-                .set_attrs(inode, Some(0o600), Some(1234), Some(2345))
+                .set_attrs(
+                    inode,
+                    Some(0o600),
+                    Some(1234),
+                    Some(2345),
+                    Some(1_577_836_800),
+                    Some(1_577_836_801),
+                )
                 .await
                 .unwrap();
             assert_eq!(attrs.mode, S_IFREG | 0o600);
@@ -472,6 +484,8 @@ mod tests {
             assert_eq!(restarted.getattr(inode).await.unwrap().mode, S_IFREG | 0o600);
             assert_eq!(restarted.getattr(inode).await.unwrap().uid, 1234);
             assert_eq!(restarted.getattr(inode).await.unwrap().gid, 2345);
+            assert_eq!(restarted.getattr(inode).await.unwrap().atime, 1_577_836_800);
+            assert_eq!(restarted.getattr(inode).await.unwrap().mtime, 1_577_836_801);
             assert!(restarted.pending_garbage().await.unwrap().is_empty());
             assert_eq!(restarted.finalize_orphan(inode).await.unwrap(), vec![key.clone()]);
         }

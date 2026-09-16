@@ -209,6 +209,8 @@ enum Mutation {
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
     },
     Mkdir {
         parent: u64,
@@ -723,8 +725,10 @@ impl RedisMetaStore {
                 mode,
                 uid,
                 gid,
+                atime,
+                mtime,
             } => mem
-                .set_attrs(*inode, *mode, *uid, *gid)
+                .set_attrs(*inode, *mode, *uid, *gid, *atime, *mtime)
                 .await
                 .map(MutationOutput::Attributes),
             Mutation::Mkdir { parent, name, mode } => mem
@@ -855,6 +859,8 @@ impl MetaStore for RedisMetaStore {
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
+        atime: Option<u64>,
+        mtime: Option<u64>,
     ) -> Result<Inode> {
         match self
             .mutate(Mutation::SetAttrs {
@@ -862,6 +868,8 @@ impl MetaStore for RedisMetaStore {
                 mode,
                 uid,
                 gid,
+                atime,
+                mtime,
             })
             .await?
         {
@@ -1289,13 +1297,46 @@ mod tests {
         let inode = mem.create(ROOT_INODE, "owned", 0o640).await.unwrap();
         let old_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
         let attrs = mem
-            .set_attrs(inode, None, Some(1234), Some(2345))
+            .set_attrs(inode, None, Some(1234), Some(2345), None, None)
             .await
             .unwrap();
         let new_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
         let patch = RedisPatch::between(&old_records, &new_records);
 
         assert_eq!((attrs.uid, attrs.gid), (1234, 2345));
+        assert_eq!(patch.inodes_set.len(), 1);
+        assert_eq!(patch.inodes_set[0].0, inode.to_string());
+        assert!(patch.inodes_del.is_empty());
+        assert!(patch.dirents_set.is_empty());
+        assert!(patch.dirents_del.is_empty());
+        assert!(patch.slices_set.is_empty());
+        assert!(patch.slices_del.is_empty());
+        assert!(patch.symlinks_set.is_empty());
+        assert!(patch.symlinks_del.is_empty());
+        assert!(patch.gc_add.is_empty());
+        assert!(patch.gc_del.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timestamp_patch_changes_only_its_inode_record() {
+        let mem = MemStore::new();
+        let inode = mem.create(ROOT_INODE, "timed", 0o640).await.unwrap();
+        let old_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
+        let attrs = mem
+            .set_attrs(
+                inode,
+                None,
+                None,
+                None,
+                Some(1_577_836_800),
+                Some(1_577_836_801),
+            )
+            .await
+            .unwrap();
+        let new_records = SnapshotRecords::from_snapshot(&mem.snapshot().await).unwrap();
+        let patch = RedisPatch::between(&old_records, &new_records);
+
+        assert_eq!((attrs.atime, attrs.mtime), (1_577_836_800, 1_577_836_801));
         assert_eq!(patch.inodes_set.len(), 1);
         assert_eq!(patch.inodes_set[0].0, inode.to_string());
         assert!(patch.inodes_del.is_empty());
@@ -1404,13 +1445,39 @@ mod tests {
         assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_chmod);
         let revision_before_chown = peer.coherence_revision().await.unwrap().unwrap();
         let owned = store
-            .set_attrs(persistent_mode_file, None, Some(1234), Some(2345))
+            .set_attrs(
+                persistent_mode_file,
+                None,
+                Some(1234),
+                Some(2345),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!((owned.uid, owned.gid), (1234, 2345));
         let peer_owned = peer.getattr(persistent_mode_file).await.unwrap();
         assert_eq!((peer_owned.uid, peer_owned.gid), (1234, 2345));
         assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_chown);
+        let revision_before_times = peer.coherence_revision().await.unwrap().unwrap();
+        let timed = store
+            .set_attrs(
+                persistent_mode_file,
+                None,
+                None,
+                None,
+                Some(1_577_836_800),
+                Some(1_577_836_801),
+            )
+            .await
+            .unwrap();
+        assert_eq!((timed.atime, timed.mtime), (1_577_836_800, 1_577_836_801));
+        let peer_timed = peer.getattr(persistent_mode_file).await.unwrap();
+        assert_eq!(
+            (peer_timed.atime, peer_timed.mtime),
+            (1_577_836_800, 1_577_836_801)
+        );
+        assert!(peer.coherence_revision().await.unwrap().unwrap() > revision_before_times);
         assert_eq!(store.link(directory, "data-alias", file).await.unwrap(), 2);
         assert_eq!(peer.lookup(directory, "data-alias").await.unwrap(), file);
         assert_eq!(peer.getattr(file).await.unwrap().nlink, 2);

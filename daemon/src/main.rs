@@ -592,6 +592,7 @@ async fn build_response(
         abi::OP_RENAME => handle_rename(event, store, object_store).await,
         abi::OP_FINALIZE_ORPHAN => handle_finalize_orphan(event, store, object_store).await,
         abi::OP_SETATTR => handle_setattr(event, store).await,
+        abi::OP_GETATTR_TIMES => handle_getattr_times(event, store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -608,10 +609,18 @@ async fn handle_setattr(
     store: &Arc<dyn MetaStore>,
 ) -> KestrelfsEvent {
     let req = event.decode_setattr_req();
+    let has_basic = req.valid & abi::SETATTR_BASIC_MASK != 0;
+    let has_times = req.valid & abi::SETATTR_TIME_MASK != 0;
+    let reserved_nonzero = if has_times {
+        event.payload[28..].iter().any(|byte| *byte != 0)
+    } else {
+        event.payload[24..].iter().any(|byte| *byte != 0)
+    };
     if event.flags != 0
         || req.valid == 0
         || req.valid & !abi::SETATTR_VALID_MASK != 0
-        || event.payload[24..].iter().any(|byte| *byte != 0)
+        || (has_basic && has_times)
+        || reserved_nonzero
     {
         return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
     }
@@ -622,14 +631,21 @@ async fn handle_setattr(
             (req.valid & abi::SETATTR_MODE != 0).then_some(req.mode),
             (req.valid & abi::SETATTR_UID != 0).then_some(req.uid),
             (req.valid & abi::SETATTR_GID != 0).then_some(req.gid),
+            (req.valid & abi::SETATTR_ATIME != 0).then_some(req.atime),
+            (req.valid & abi::SETATTR_MTIME != 0).then_some(req.mtime),
         )
         .await
     {
         Ok(attrs) => {
             let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
-            response.payload[0..4].copy_from_slice(&attrs.mode.to_le_bytes());
-            response.payload[4..8].copy_from_slice(&attrs.uid.to_le_bytes());
-            response.payload[8..12].copy_from_slice(&attrs.gid.to_le_bytes());
+            if has_times {
+                response.payload[0..8].copy_from_slice(&attrs.atime.to_le_bytes());
+                response.payload[8..16].copy_from_slice(&attrs.mtime.to_le_bytes());
+            } else {
+                response.payload[0..4].copy_from_slice(&attrs.mode.to_le_bytes());
+                response.payload[4..8].copy_from_slice(&attrs.uid.to_le_bytes());
+                response.payload[8..12].copy_from_slice(&attrs.gid.to_le_bytes());
+            }
             response
         }
         Err(error) => {
@@ -637,6 +653,27 @@ async fn handle_setattr(
                 "kestrelfs-daemon:    OP_SETATTR inode={} valid={:#x} -> {error:?}",
                 req.inode_id, req.valid
             );
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
+        }
+    }
+}
+
+async fn handle_getattr_times(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+) -> KestrelfsEvent {
+    if event.flags != 0 || event.payload[8..].iter().any(|byte| *byte != 0) {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+    let inode_id = u64::from_le_bytes(event.payload[0..8].try_into().unwrap());
+    match store.getattr(inode_id).await {
+        Ok(attrs) => {
+            let mut response = KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id);
+            response.payload[0..8].copy_from_slice(&attrs.atime.to_le_bytes());
+            response.payload[8..16].copy_from_slice(&attrs.mtime.to_le_bytes());
+            response
+        }
+        Err(error) => {
             KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
         }
     }
@@ -2272,6 +2309,27 @@ mod tests {
         event
     }
 
+    fn raw_setattr_time_req(
+        req_id: u64,
+        inode_id: u64,
+        valid: u32,
+        atime: u64,
+        mtime: u64,
+    ) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_SETATTR, req_id);
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..12].copy_from_slice(&valid.to_le_bytes());
+        event.payload[12..20].copy_from_slice(&atime.to_le_bytes());
+        event.payload[20..28].copy_from_slice(&mtime.to_le_bytes());
+        event
+    }
+
+    fn raw_getattr_times_req(req_id: u64, inode_id: u64) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_GETATTR_TIMES, req_id);
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event
+    }
+
     /// Shared test fixture: a fresh runtime + `MemStore`, exactly
     /// mirroring how `main()` constructs both.
     fn test_fixture() -> (
@@ -2444,6 +2502,41 @@ mod tests {
     }
 
     #[test]
+    fn setattr_times_are_atomic_and_getattr_times_observes_update() {
+        let (runtime, store, object_store) = test_fixture();
+        let req = raw_setattr_time_req(
+            15,
+            REMOTE_TXT_INODE,
+            abi::SETATTR_ATIME | abi::SETATTR_MTIME,
+            1_577_836_800,
+            1_577_836_801,
+        );
+
+        let resp = runtime.block_on(build_response(&req, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u64::from_le_bytes(resp.payload[0..8].try_into().unwrap()),
+            1_577_836_800
+        );
+        assert_eq!(
+            u64::from_le_bytes(resp.payload[8..16].try_into().unwrap()),
+            1_577_836_801
+        );
+
+        let getattr = raw_getattr_times_req(16, REMOTE_TXT_INODE);
+        let resp = runtime.block_on(build_response(&getattr, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            u64::from_le_bytes(resp.payload[0..8].try_into().unwrap()),
+            1_577_836_800
+        );
+        assert_eq!(
+            u64::from_le_bytes(resp.payload[8..16].try_into().unwrap()),
+            1_577_836_801
+        );
+    }
+
+    #[test]
     fn setattr_rejects_unsupported_mask_and_nonzero_reserved_bytes() {
         let (runtime, store, object_store) = test_fixture();
         let unsupported = raw_setattr_req(11, REMOTE_TXT_INODE, 1 << 31, 0o600, 0, 0);
@@ -2455,6 +2548,29 @@ mod tests {
             raw_setattr_req(12, REMOTE_TXT_INODE, abi::SETATTR_MODE, 0o600, 0, 0);
         reserved.payload[24] = 1;
         let resp = runtime.block_on(build_response(&reserved, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp.error_code, -libc::EINVAL);
+
+        let mixed = raw_setattr_time_req(
+            17,
+            REMOTE_TXT_INODE,
+            abi::SETATTR_MODE | abi::SETATTR_ATIME,
+            1_577_836_800,
+            1_577_836_801,
+        );
+        let resp = runtime.block_on(build_response(&mixed, &store, &object_store));
+        assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
+        assert_eq!(resp.error_code, -libc::EINVAL);
+
+        let mut time_reserved = raw_setattr_time_req(
+            18,
+            REMOTE_TXT_INODE,
+            abi::SETATTR_ATIME,
+            1_577_836_800,
+            0,
+        );
+        time_reserved.payload[28] = 1;
+        let resp = runtime.block_on(build_response(&time_reserved, &store, &object_store));
         assert_eq!(resp.opcode, abi::OP_RESULT_ERROR);
         assert_eq!(resp.error_code, -libc::EINVAL);
     }

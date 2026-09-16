@@ -166,6 +166,9 @@ static int kestrelfs_inode_getattr(struct mnt_idmap *idmap,
 	mtime.tv_sec = mtime_sec;
 	mtime.tv_nsec = 0;
 	inode_set_mtime_to_ts(inode, mtime);
+	ret = kestrelfs_refresh_inode_times(inode);
+	if (ret)
+		return ret;
 	generic_fillattr(idmap, request_mask, inode, stat);
 	return 0;
 }
@@ -229,6 +232,11 @@ static struct dentry *kestrelfs_inode_lookup(struct inode *dir,
 		pr_err("kestrelfs: failed to create inode: %ld\n",
 		       PTR_ERR(inode));
 		return ERR_CAST(inode);
+	}
+	ret = kestrelfs_refresh_inode_times(inode);
+	if (ret) {
+		iput(inode);
+		return ERR_PTR(ret);
 	}
 
 	/* Attach to dentry */
