@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 42 COHERENCE-FINE 已验收；Step 43 write_iter 已实现、待 Cursor 验收；IPC ABI v20；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 43 write_iter 已验收；下一步 Step 44 KERNEL-FSYNC；IPC ABI v20；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -41,7 +41,7 @@
 > （可与 mode 同事务）。Step 40 已支持秒级显式 atime/mtime 持久化；
 > Step 42 为 Redis revision 附加 256-revision 有界 dirty-inode 日志，正常变化经
 > ABI v20 批量 ioctl 只退休相关 inode，历史缺失、溢出或探测失败仍全量 fail closed；
-> Step 43 将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
+> Step 43 已将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
 > `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -145,7 +145,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–42 已验收；Step 43 write_iter 待验收（ABI v20 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–43 已验收；下一步 Step 44 KERNEL-FSYNC（ABI v20 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
