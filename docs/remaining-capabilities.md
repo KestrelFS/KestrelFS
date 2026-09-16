@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-16，Cursor（验收 Step 43；选定 Step 44 = KERNEL-FSYNC）
+> 最后更新：2026-09-16，Cursor（验收 Step 44；选定 Step 45 = KERNEL-AOPS）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -13,9 +13,9 @@
 
 ## 1. 当前基线
 
-- Phase 4 cache、DIST、POSIX、COHERENCE-FINE、KERNEL-WRITE-ITER（Step 24–43）均已验收。
-- 已验收 IPC ABI **v20**，cache format **v4**。
-- **战略**：内核优先（write_iter ✅ → fsync → aops/page cache → mmap → locks → cache-async）。
+- Phase 4 至 Step 44（含 write_iter、fsync）均已验收。
+- 已验收 IPC ABI **v21**，cache format **v4**。
+- **战略**：内核优先（write_iter ✅ → fsync ✅ → aops/page cache → mmap → locks → cache-async）。
 - cache/mount 测试只允许在 vng guest + loop；禁止触碰宿主机 zvol。
 
 状态约定：`PROPOSED` / `DECIDED` / `IMPLEMENTING` / `REVIEW` / `ACCEPTED` / `DEFERRED`。
@@ -24,10 +24,9 @@
 
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
-| 0–19 | … + WRITE-ITER | Step 24–43 | **ACCEPTED** | write_iter 已落地 |
-| 20 | KERNEL-FSYNC | Step 44 真实 fsync | **DECIDED** | 纠正空转刷盘语义 |
-| 21 | KERNEL-AOPS | address_space + 读侧 page cache | PROPOSED | mmap 基础 |
-| 22 | KERNEL-MMAP | 文件 mmap | PROPOSED | 应用兼容 |
+| 0–20 | … + FSYNC | Step 24–44 | **ACCEPTED** | fsync 屏障已落地 |
+| 21 | KERNEL-AOPS | Step 45 读侧 page cache | **DECIDED** | mmap 前置 |
+| 22 | KERNEL-MMAP | 文件 mmap | PROPOSED | 依赖 aops |
 | 23 | KERNEL-LOCKS | flock / POSIX locks | PROPOSED | 多进程共享 |
 | 24 | KERNEL-CACHE-ASYNC | cache hit 异步 BIO | PROPOSED | 热路径性能 |
 | — | WHITEOUT / DIST-IO / CACHE-WRITE | 其它 | PROPOSED/DEFERRED | 内核主线之后 |
@@ -36,19 +35,19 @@ Codex **只实现 §8 当前提示词**。
 
 ## 3. Phase 4 缓存能力
 
-CACHE-* / COHERENCE / WRITE-ITER 已 ACCEPTED；`CACHE-WRITE` 仍 DEFERRED。
+读缓存与 fsync 已 ACCEPTED；`CACHE-WRITE`（写回缓存）仍 DEFERRED。
 
 ## 4. 内核 VFS
 
-### KERNEL-WRITE-ITER — Step 43
-
-- 状态：`ACCEPTED`（Cursor，2026-09-16）
-- 实现：`.write_iter`；write/writev/pwritev；O_APPEND；cache invalidate 在锁内提交前。
-
 ### KERNEL-FSYNC — Step 44
 
+- 状态：`ACCEPTED`（Cursor，2026-09-16）
+- 实现：ABI v21 `OP_FSYNC`/`OP_SYNC_FS`；File+LocalFs 真 fsync；离线 fail closed。
+
+### KERNEL-AOPS — Step 45
+
 - 状态：`DECIDED`
-- 目标：`fsync`/`fdatasync`/`sync_fs` 真正等待 daemon 侧元数据与对象耐久落盘。
+- 目标：为普通文件引入 `address_space_operations`，至少打通**读侧** page cache。
 - 范围：见 §8。
 
 ## 5. 运维、测试与文档
@@ -59,27 +58,27 @@ OPS-CONFIG / TEST-PERF / DOC-CLEANUP 仍为 `PROPOSED`。
 
 | 日期 | 记录者 | ID | 决策/问题 | 结论或待办 |
 |---|---|---|---|---|
-| 2026-09-16 | Cursor | COHERENCE-FINE | Step 42 验收 | **ACCEPTED** |
-| 2026-09-16 | Cursor | KERNEL-WRITE-ITER | 选定 Step 43 | **DECIDED** |
-| 2026-09-16 | Codex | KERNEL-WRITE-ITER | 实现与自检 | **REVIEW** |
-| 2026-09-16 | Cursor | KERNEL-WRITE-ITER | Step 43 验收 | **ACCEPTED**；193 tests + Cursor vng PASS |
-| 2026-09-16 | Cursor | KERNEL-FSYNC | 选定 Step 44 | **DECIDED**；见 §8 |
+| 2026-09-16 | Cursor | KERNEL-WRITE-ITER | Step 43 验收 | **ACCEPTED** |
+| 2026-09-16 | Cursor | KERNEL-FSYNC | 选定 Step 44 | **DECIDED** |
+| 2026-09-16 | Codex | KERNEL-FSYNC | 实现与自检 | **REVIEW** |
+| 2026-09-16 | Cursor | KERNEL-FSYNC | Step 44 验收 | **ACCEPTED**；195 tests + Cursor vng PASS |
+| 2026-09-16 | Cursor | KERNEL-AOPS | 选定 Step 45 | **DECIDED**；见 §8 |
 
 ## 7. 不应顺手扩大
 
 - 不自动 wipe；不触碰宿主机 zvol；不擅自 commit/push。
-- Step 44 不顺手做 mmap/page cache、write-back、flock、async BIO、WHITEOUT。
+- Step 45 不顺手做完整 mmap 导出、writeback/脏页写回、flock、async BIO、WHITEOUT。
 
-## 8. 当前 Codex 提示词（Step 44）
+## 8. 当前 Codex 提示词（Step 45）
 
 > **人类操作**：对 Codex 说「读 `HANDOFF.md` 与 `docs/remaining-capabilities.md`，只执行 §8」。
 
 ```text
 你是 KestrelFS 实现 agent。路径：/home/roots/work/code/KestrelFS。
 先读 HANDOFF.md 与 docs/remaining-capabilities.md（全文，尤其 §2/§6/§8）。
-HEAD 应含 Step 43（KERNEL-WRITE-ITER；ABI v20）。战略：内核优先。
+HEAD 应含 Step 44（ABI v21 OP_FSYNC/OP_SYNC_FS）。战略：内核优先。
 
-开工时：KERNEL-FSYNC → IMPLEMENTING，§6 追加一行。
+开工时：KERNEL-AOPS → IMPLEMENTING，§6 追加一行。
 
 ## 测试铁律
 - 涉及内核/mount 的验证只在 vng guest + loop；禁止触碰宿主机 zvol
@@ -87,63 +86,58 @@ HEAD 应含 Step 43（KERNEL-WRITE-ITER；ABI v20）。战略：内核优先。
 - 一旦改 kestrelfs/*.c 或依赖 mount：必须 vng
 - Redis/S3 门控测可选；默认 cargo test 不依赖外部服务
 
-## 目标：Step 44 — KERNEL-FSYNC
-纠正当前 `write_inode`/`sync_fs` 近似空转：让 `fsync`/`fdatasync`/`syncfs` 真正等待
-daemon 把该 inode（及必要时全局）的元数据与对象数据耐久化。
+## 目标：Step 45 — KERNEL-AOPS（读侧 page cache）
+为普通文件接入 `address_space_operations`，让读路径可以进入内核 page cache
+（为后续 mmap 打基础）。本步以**读**为主；写回/脏页可仍走现有 write_iter。
 
 必做：
-1. 内核：为普通文件实现 `.fsync`（或等价 file op）；`sync_fs` 覆盖挂载级 sync。
-   `fdatasync` 与 `fsync` 的差异若本步简化，须在 §9 写明。
-2. ABI：新增或扩展 opcode（预期 bump 至 v21），例如 `OP_FSYNC` / `OP_SYNC_FS`，
-   携带 inode（可选）与 flags；C/Rust 同步 + 编译期断言。
-3. Daemon/MetaStore/ObjectStore：
-   - FileMetaStore：确保 fsync 路径强制 `meta.json` 落盘（fsync 文件/目录）
-   - LocalFsObjectStore：相关对象文件 fsync（至少本 inode 引用的 block；若成本过高可文档化为“全 objects dir sync”并测试）
-   - Mem 后端：可空操作成功
-   - Redis/S3：至少等待本步已提交的写对客户端可见的耐久点（Redis 可用 WAIT/或文档化“依赖 Redis AOF/RDB 配置”；S3 put 已返回即可视为耐久）。须在 §9 写清每后端语义。
-4. 与 write_iter / cache：fsync 不要求写回 cache（仍无 write-back）；但不得让应用以为刷盘成功而 daemon 仍只在内存。
+1. 给 regular inode 设置 `i_mapping->a_ops`；实现至少 `read_folio`/`readahead`
+   （或当前内核版本等价 API：`readpage` 已淘汰则用 folio 接口）
+2. 页填充数据来源：可复用现有 cache hit 或 READ_DATA miss 路径；语义与直接
+   `read_iter` 一致（同一文件内容）
+3. `read_iter` 策略二选一并在 §9 写清：
+   A) 切换到 `generic_file_read_iter`（推荐，若 a_ops 完整），或
+   B) 保留自定义 read_iter 但在命中 page cache 时走 folio
+4. 写路径：本步可不启用 writeback；若保留 `.write_iter` IPC 写，须在写后
+   `invalidate`/`truncate` 相关 page cache，避免读到陈旧页
+5. fsync：仍走 Step 44 屏障；不要假装 page cache 脏页已写回（若无 writeback）
 
 要求：
-1. 单测覆盖 opcode/handler；File 后端可用临时目录验证 fsync 后杀进程仍可读（daemon 级）
-2. STEP44_*_PASS vng：写后 fsync、杀 daemon 重启（同 data_dir）数据仍在；syncfs 或目录级行为按实现覆盖
-3. 更新 HANDOFF（待验收）、README（中文）、本文 → REVIEW + §9
-4. 不要擅自 commit/push
+1. `make -C kestrelfs` 零警告；cargo test 不回归
+2. STEP45_*_PASS vng：写入后读回；同一文件第二次读应体现 page cache 收益或至少
+   行为正确（可用 `/proc`/`drop_caches` 或重复 read 断言一致性）；写后旧页不得脏读
+3. 若本步引入 ABI 变化须 bump 并断言；否则保持 v21
+4. 更新 HANDOFF（待验收）、README（中文）、本文 → REVIEW + §9
+5. 不要擅自 commit/push
 
 ## 明确不做
-page cache/mmap、flock、async BIO、write-back、WHITEOUT、扩大 coherence。
+完整 `mmap` 导出（可留到 Step 46）、writeback 写缓存、flock、async BIO、WHITEOUT。
 
 ## 验收自检
 - cargo test + clippy -D warnings
-- make -C kestrelfs 零警告 + Step 44 vng
+- make -C kestrelfs 零警告 + Step 45 vng
 - 汇报写入本文 §9
 ```
 
 ## 9. 实现汇报日志
 
-### 2026-09-16 — Step 43 KERNEL-WRITE-ITER（Cursor ACCEPTED）
+### 2026-09-16 — Step 44 KERNEL-FSYNC（Cursor ACCEPTED）
 
-- `.write_iter` 统一 write/writev/pwritev；O_APPEND；锁内 invalidate；ABI/format 未变。
-- 验证：193 tests；clippy / make 干净；Cursor 复跑 vng `STEP43_WRITE_ITER_PASS`
-  （umount_ms=27）。
+- ABI v21 `OP_FSYNC`/`OP_SYNC_FS`；File+LocalFs 真 fsync；离线 fail closed；
+  fsync=fdatasync（无 page-cache 写）。
+- 验证：195 tests；clippy / make 干净；Cursor 复跑 vng `STEP44_KERNEL_FSYNC_PASS`
+  （umount_ms=31）。
 - Commit：随 Cursor 本轮验收推送。
 
-### 2026-09-16 — Step 43 KERNEL-WRITE-ITER（Codex REVIEW）
+### 2026-09-16 — Step 44 KERNEL-FSYNC（Codex REVIEW）
 
-- 路径：`kestrelfs_reg_file_ops` 与 `kestrelfs_writable_file_ops` 删除旧 `.write`，统一
-  注册 `.write_iter`。write/writev/pwritev 直接由 `copy_from_iter()` 消费 iovec，仍按
-  16 KiB bounce buffer 和 64 MiB model chunk 边界发送同步 `WRITE_DATA`；IPC ABI
-  **v20**、共享内存和 cache format **v4** 均未改变。
-- append/失效：先由 `generic_write_checks()` 处理 VFS 限制与 `IOCB_APPEND`，再在
-  `kestrelfs_data_ipc_lock` 内重新读取 EOF，避免并发 append 选择相同 offset。cache
-  invalidate 移到同一锁内、保持在权威写提交之前；这样失效前开始的 READ_DATA miss
-  携带旧 epoch，不能在写后发布旧 cache 数据。
-- 错误/部分写：首个提交前的 generic check、锁、连接、失效、复制或 IPC 错误返回负
-  errno；已有 chunk 提交后若后续失败则返回已写字节数。`copy_from_iter()` 短拷贝只把
-  实际复制字节发给 daemon，成功后作为本次短写结束；仅成功提交后更新 `ki_pos` 与
-  `i_size`。同步 IPC 不能兑现 `IOCB_NOWAIT`，因此显式返回 `EOPNOTSUPP` 而不阻塞。
-- 测试：`193 passed`；clippy / make 干净；vng `STEP43_*_PASS`（umount 26 ms）。
-- 未做：page cache/mmap、fsync、flock、async BIO、write-back。
+- ABI：v20 → **v21**，`OP_FSYNC`/`OP_SYNC_FS`；共享内存与 cache format v4 不变。
+- 内核：`.fsync`/`fdatasync` 同路径；`sync_fs(wait=1)` 全挂载屏障；离线 `ENOTCONN`。
+- File+LocalFs：对象与 meta.json 真 fsync；缺失引用 `EIO`。
+- Mem/Redis/S3 语义差异已文档化。
+- 单测 195；vng STEP44_*_PASS（Codex umount 120 ms）。
+- 未做：page cache/mmap、flock、async BIO、write-back。
 
-### 2026-09-16 — Step 42 COHERENCE-FINE（Cursor ACCEPTED）
+### 2026-09-16 — Step 43 KERNEL-WRITE-ITER（Cursor ACCEPTED）
 
-- ABI v20；Cursor vng `STEP42_COHERENCE_FINE_PASS`（umount_ms=24）。
+- `.write_iter`；Cursor vng `STEP43_WRITE_ITER_PASS`（umount_ms=27）。

@@ -1027,6 +1027,20 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
+    async fn referenced_keys(&self, inode: u64) -> Result<Vec<String>> {
+        let loaded = self.load_snapshot().await?;
+        MemStore::from_snapshot(loaded.snapshot)
+            .referenced_keys(inode)
+            .await
+    }
+
+    async fn all_referenced_keys(&self) -> Result<Vec<String>> {
+        let loaded = self.load_snapshot().await?;
+        MemStore::from_snapshot(loaded.snapshot)
+            .all_referenced_keys()
+            .await
+    }
+
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
         let mut connection = self.connection.clone();
         let (control, inode_record, encoded): (

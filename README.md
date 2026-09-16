@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 43 write_iter 已验收；下一步 Step 44 KERNEL-FSYNC；IPC ABI v20；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 43 已验收；Step 44 KERNEL-FSYNC 待 Cursor 验收；IPC ABI v21；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -42,6 +42,7 @@
 > Step 42 为 Redis revision 附加 256-revision 有界 dirty-inode 日志，正常变化经
 > ABI v20 批量 ioctl 只退休相关 inode，历史缺失、溢出或探测失败仍全量 fail closed；
 > Step 43 已将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
+> Step 44 的普通文件 fsync/fdatasync 与挂载 syncfs 已经同步等待 daemon 后端耐久屏障；
 > `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -145,7 +146,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–43 已验收；下一步 Step 44 KERNEL-FSYNC（ABI v20 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–43 已验收；Step 44 KERNEL-FSYNC 待验收（ABI v21 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -160,7 +161,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v20）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v21）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -175,6 +176,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step42-coherence-fine-vng.sh  # dirty inode 精细失效 + 全量回退
 ├── test-step43-write-iter-vng.sh      # write/writev/pwritev/append/cache 失效
 ├── test-step43-write-iter.c           # 向量写与部分布局测试辅助程序
+├── test-step44-fsync-vng.sh           # fsync/syncfs 与强杀 daemon 后重启验证
+├── test-step44-fsync.c                # 文件同步、离线拒绝和读回辅助程序
 ├── test-step36-posix-lifecycle-vng.sh # open-unlink/cache/last-close GC
 ├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
 ├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
@@ -485,6 +488,10 @@ Step 34 支持 create/mkdir mode 与
   跨段或非对齐范围仍用 `copy_to_iter`。尚无 page-cache/readahead/splice 全覆盖。
 - Step 43 已把普通 write/writev/pwritev 统一为 `.write_iter`，但 WRITE_DATA 仍通过
   全局 bounce 锁逐块同步等待 daemon；尚无异步 completion、page-cache write-back。
+- Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有
+  引用对象和本地对象目录树。FileMetaStore/LocalFs 同步文件与目录项；Mem 仅内存生效，
+  Redis 已 ACK 的 mutation 崩溃耐久仍取决于 AOF/RDB 设置（RDB 不保证逐次 fsync），
+  S3 以 PUT 完成确认作为边界；没有跨 Redis/S3 原子事务、目录 fd 的 fsync。
 - Step 27 wipe 只清零前 2 MiB cache metadata，让旧 data slot 不再可寻址；它不是
   数据区安全擦除。操作必须离线、目标必须是块设备，并同时提供环境变量和命令行
   旗标确认；不会自动迁移旧格式。

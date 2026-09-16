@@ -653,6 +653,7 @@ async fn build_response(
         abi::OP_FINALIZE_ORPHAN => handle_finalize_orphan(event, store, object_store).await,
         abi::OP_SETATTR => handle_setattr(event, store).await,
         abi::OP_GETATTR_TIMES => handle_getattr_times(event, store).await,
+        abi::OP_FSYNC | abi::OP_SYNC_FS => handle_sync(event, store, object_store).await,
         abi::OP_NOP => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
         other => {
             eprintln!(
@@ -660,6 +661,48 @@ async fn build_response(
                 event.req_id
             );
             KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
+        }
+    }
+}
+
+/// Serialized IPC barrier: objects first, then authoritative metadata.
+/// A missing/unreadable referenced local object fails closed with EIO.
+async fn handle_sync(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> KestrelfsEvent {
+    if event.flags != 0
+        || (event.opcode == abi::OP_FSYNC && event.payload[8..].iter().any(|byte| *byte != 0))
+        || (event.opcode == abi::OP_SYNC_FS && event.payload.iter().any(|byte| *byte != 0))
+    {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+    let keys = if event.opcode == abi::OP_FSYNC {
+        let inode = u64::from_le_bytes(event.payload[..8].try_into().unwrap());
+        store.referenced_keys(inode).await
+    } else {
+        store.all_referenced_keys().await
+    };
+    let keys = match keys {
+        Ok(keys) => keys,
+        Err(error) => return KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error)),
+    };
+    let result = object_store.sync_keys(&keys).await;
+    let result = if result.is_ok() && event.opcode == abi::OP_SYNC_FS {
+        object_store.sync_all().await
+    } else {
+        result
+    };
+    if let Err(error) = result {
+        eprintln!("kestrelfs-daemon: object sync failed: {error}");
+        return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
+    }
+    match store.sync_persistence().await {
+        Ok(()) => KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id),
+        Err(error) => {
+            eprintln!("kestrelfs-daemon: metadata sync failed: {error}");
+            KestrelfsEvent::error_response(event.req_id, meta_error_to_errno(&error))
         }
     }
 }
@@ -2441,6 +2484,57 @@ mod tests {
         let response = handle_read_data(&read, &store, &object_store, bounce.as_mut_ptr()).await;
         assert_eq!(response.opcode, abi::OP_RESULT_OK);
         assert_eq!(&bounce[..expected.len()], expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn fsync_and_sync_fs_barrier_survive_local_store_reopen() {
+        let dir = TempDir::new().unwrap();
+        let meta_path = dir.path().join("meta.json");
+        let store: Arc<dyn MetaStore> = Arc::new(FileMetaStore::new(meta_path.clone()).await.unwrap());
+        let objects: Arc<dyn ObjectStore> =
+            Arc::new(LocalFsObjectStore::new(dir.path()).await.unwrap());
+        seed_remote_txt_block(&objects).await.unwrap();
+        let inode = store.create(fs_model::ROOT_INODE, "sync-data", 0o644).await.unwrap();
+        let content = b"step44 durable object and metadata".to_vec();
+        assert_eq!(
+            handle_write_bytes(31000, inode, 0, content.clone(), "test", &store, &objects)
+                .await.opcode,
+            abi::OP_RESULT_OK
+        );
+        let mut req = KestrelfsEvent::zeroed(abi::OP_FSYNC, 31001);
+        req.payload[..8].copy_from_slice(&inode.to_le_bytes());
+        assert_eq!(handle_sync(&req, &store, &objects).await.opcode, abi::OP_RESULT_OK);
+        let global = KestrelfsEvent::zeroed(abi::OP_SYNC_FS, 31002);
+        assert_eq!(handle_sync(&global, &store, &objects).await.opcode, abi::OP_RESULT_OK);
+
+        let key = store.referenced_keys(inode).await.unwrap().remove(0);
+        drop(store);
+        drop(objects);
+        let store: Arc<dyn MetaStore> = Arc::new(FileMetaStore::new(meta_path).await.unwrap());
+        let objects: Arc<dyn ObjectStore> =
+            Arc::new(LocalFsObjectStore::new(dir.path()).await.unwrap());
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "sync-data").await.unwrap(), inode);
+        assert_eq!(objects.get(&key).await.unwrap(), content);
+        // A missing referenced object must never produce a false successful fsync.
+        tokio::fs::remove_file(dir.path().join(&key)).await.unwrap();
+        assert_eq!(handle_sync(&req, &store, &objects).await.error_code, -libc::EIO);
+        assert_eq!(handle_sync(&global, &store, &objects).await.error_code, -libc::EIO);
+    }
+
+    #[tokio::test]
+    async fn sync_opcodes_reject_nonzero_reserved_and_missing_inode() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let objects: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+        let mut req = KestrelfsEvent::zeroed(abi::OP_FSYNC, 1);
+        req.payload[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(handle_sync(&req, &store, &objects).await.error_code, -libc::ENOENT);
+        req.payload[8] = 1;
+        assert_eq!(handle_sync(&req, &store, &objects).await.error_code, -libc::EINVAL);
+        let mut global = KestrelfsEvent::zeroed(abi::OP_SYNC_FS, 2);
+        global.flags = 1;
+        assert_eq!(handle_sync(&global, &store, &objects).await.error_code, -libc::EINVAL);
+        global.flags = 0;
+        assert_eq!(handle_sync(&global, &store, &objects).await.opcode, abi::OP_RESULT_OK);
     }
 
     /// Builds a raw `OP_GETATTR` request event.

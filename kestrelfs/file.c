@@ -86,6 +86,36 @@ static int kestrelfs_ipc_sync_call(struct kestrelfs_event *req,
 	return -ETIMEDOUT;
 }
 
+int kestrelfs_sync_daemon(u32 opcode, u64 inode_id)
+{
+	struct kestrelfs_event req = { 0 };
+	struct kestrelfs_event resp = { 0 };
+	int ret;
+
+	if (opcode != KESTRELFS_OP_FSYNC && opcode != KESTRELFS_OP_SYNC_FS)
+		return -EINVAL;
+	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+	req.opcode = opcode;
+	if (opcode == KESTRELFS_OP_FSYNC)
+		put_unaligned_le64(inode_id, &req.payload[0]);
+	ret = kestrelfs_ipc_sync_call(&req, &resp);
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret)
+		return ret;
+	if (resp.opcode == KESTRELFS_OP_RESULT_ERROR)
+		return resp.error_code < 0 ? resp.error_code : -EIO;
+	return resp.opcode == KESTRELFS_OP_RESULT_OK ? 0 : -EPROTO;
+}
+
+static int kestrelfs_regular_fsync(struct file *file, loff_t start,
+				   loff_t end, int datasync)
+{
+	/* No page-cache writes exist; both flavors sync data AND metadata. */
+	return kestrelfs_sync_daemon(KESTRELFS_OP_FSYNC, file_inode(file)->i_ino);
+}
+
 /*
  * kestrelfs_file_read() - serve reads against hello.txt.
  * @file:	open file instance (unused beyond sanity, content is static).
@@ -582,6 +612,7 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
 	.write_iter	= kestrelfs_writable_write_iter,
+	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,
 };
 
@@ -849,6 +880,7 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_writable_read_iter,
 	.write_iter	= kestrelfs_writable_write_iter,
+	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,
 };
 

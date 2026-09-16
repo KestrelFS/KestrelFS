@@ -71,8 +71,9 @@ static void kestrelfs_evict_inode(struct inode *inode)
  * VFS may call this during umount or sync even if we don't call mark_inode_dirty().
  * notify_change() can mark inodes dirty internally.
  * 
- * Since daemon is the authoritative metadata store and we already send IPC during
- * write/setattr, we don't need to do anything here. Just return success.
+ * The daemon is authoritative: all write/setattr IPC is committed before VFS
+ * acknowledges it. Explicit durability uses file.c's ->fsync and ->sync_fs,
+ * not this writeback callback (which may also run during inode teardown).
  *
  * MUST NOT send IPC here - daemon may be shutting down during umount.
  */
@@ -82,16 +83,15 @@ static int kestrelfs_write_inode(struct inode *inode, struct writeback_control *
 }
 
 /*
- * kestrelfs_sync_fs() - handle sync(2) / syncfs(2).
+ * kestrelfs_sync_fs() - issue the mount-wide daemon durability barrier.
  * @sb: superblock
- * @wait: whether to wait for completion (ignored)
- *
- * Since all writes are synchronous IPC calls that complete before returning,
- * there's nothing to flush. Just return success.
+ * @wait: VFS zero means queue only; the blocking pass issues the barrier.
  */
 static int kestrelfs_sync_fs(struct super_block *sb, int wait)
 {
-	return 0;
+	if (!wait)
+		return 0;
+	return kestrelfs_sync_daemon(KESTRELFS_OP_SYNC_FS, 0);
 }
 
 const struct super_operations kestrelfs_super_ops = {

@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 20;
+pub const ABI_VERSION: u32 = 21;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -123,6 +123,10 @@ pub const OP_FINALIZE_ORPHAN: u32 = 22;
 pub const OP_SETATTR: u32 = 23;
 /// Request: fetch persistent atime/mtime for VFS inode reconstruction.
 pub const OP_GETATTR_TIMES: u32 = 24;
+/// Request: sync one inode's referenced data, then metadata.
+pub const OP_FSYNC: u32 = 25;
+/// Request: mount-wide object and metadata durability barrier.
+pub const OP_SYNC_FS: u32 = 26;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -1120,6 +1124,8 @@ const _: () = assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 8 + 8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(std::mem::size_of::<u64>() <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(OP_FSYNC == 25 && OP_SYNC_FS == 26);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(RENAME_NOREPLACE == 1 && RENAME_EXCHANGE == 2);
 const _: () = assert!(8 + 2 + 2 + 4 <= EVENT_PAYLOAD_SIZE);

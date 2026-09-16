@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 43 KERNEL-WRITE-ITER 已由 Cursor 验收并纳入本提交（IPC ABI v20、cache format v4 未变）。下一步内核优先见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 43 已由 Cursor 验收；Step 44 KERNEL-FSYNC 由 Codex 实现并待 Cursor 验收（IPC ABI v21，cache format v4 未变）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 43 write_iter 已验收；下一步 Step 44 = KERNEL-FSYNC（见 remaining-capabilities §8） |
+| 当前阶段 | Step 43 已验收；Step 44 KERNEL-FSYNC 待 Cursor 验收（见 remaining-capabilities §9） |
 
 ---
 
@@ -192,6 +192,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/数据面 Step 41** | **有界 GC delete worker + ObjectStore 长度完整性** | **19（未变）** | **✅ 已验收** |
 | **Phase 4/控制面 Step 42** | **Redis revision 有界 dirty-inode 日志 + 批量 inode cache 失效 + 全量回退** | **20** | **✅ 已验收** |
 | **Phase 4/内核 Step 43** | **普通文件 write_iter + write/writev/pwritev 统一 iov_iter 写路径** | **20（未变）** | **✅ 已验收** |
+| **Phase 4/内核 Step 44** | **文件 fsync/fdatasync 与挂载 syncfs 后端耐久屏障** | **21** | **⏳ 待 Cursor 验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -229,9 +230,9 @@ ABI v20 批量 inode 失效 + Redis dirty log；失败回退全量。ABI **v20**
 Cursor 对照代码、193 tests 与 `STEP43_WRITE_ITER_PASS` 确认 Step 43 已验收。
 `.write_iter` 统一 write/writev/pwritev；ABI **v20** 未变；format **v4**。
 
-下一步：**Step 44 KERNEL-FSYNC**，提示词在 `docs/remaining-capabilities.md` §8。
+待验收：**Step 44 KERNEL-FSYNC**；Codex 自检见 §7.38 / remaining-capabilities §9。下一步由 Cursor 决定。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 20`（含 `INVALIDATE_CACHE_INODES`）
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 21`（新增 `FSYNC` / `SYNC_FS`）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -300,6 +301,8 @@ Cursor 对照代码、193 tests 与 `STEP43_WRITE_ITER_PASS` 确认 Step 43 已�
 | 22 | `OP_FINALIZE_ORPHAN` | last close 后回收 nlink=0 inode，并把对象加入 durable GC | 15 |
 | 23 | `OP_SETATTR` | 持久更新 inode；v19 支持 basic 或互斥的秒级 atime/mtime layout | 18（v19 扩展时间） |
 | 24 | `OP_GETATTR_TIMES` | 获取持久 atime/mtime，供 VFS inode 重建 | 19 |
+| 25 | `OP_FSYNC` | 同步 inode 全部引用对象与元数据；payload inode_id u64@0 | 21 |
+| 26 | `OP_SYNC_FS` | 挂载级引用对象与元数据同步；payload 全零 | 21 |
 | 64 | `OP_RESULT_OK` | 响应：成功 | 1 |
 | 65 | `OP_RESULT_ERROR` | 响应：失败（error_code 携带负 errno） | 1 |
 
@@ -354,6 +357,7 @@ Cursor 对照代码、193 tests 与 `STEP43_WRITE_ITER_PASS` 确认 Step 43 已�
 | 27 | **远端 cache coherence 仍是最终一致原型** | Step 42 用最近 256 revision 的 durable dirty log 将正常变化收窄为最多 64 inode 的 ABI v20 批量失效；记录缺失/损坏、溢出、累计超限或 probe 失败仍全量 fail closed。提交到下一次 probe 前仍有短暂旧 hit 窗口，daemon 离线期间没有 lease，尚无 range/pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
 | 28 | **batch block-LRU 热度仍只在内存** | Step 29 默认一次退休 16 个 LRU victim（至多总槽位 1/16），用一份 journal 并按 index page 合并清零；连续 fill 可消费预回收槽位，MRU 尾部受到小批量保护。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后仍按 generation 恢复 insertion-order 近似。没有分区配额/租户热点隔离；victim 分散时仍需每个 index page 一次同步写，fill/invalidate 仍逐次 journal。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
+| 30 | **fsync 的持久性受后端配置限制** | Step 44 fsync 与 fdatasync 同样同步对象和元数据；syncfs 检查所有引用且同步本地对象目录树。Mem 返回仅进程内成功；Redis 仅保证已 ACK 的 mutation 可见，崩溃耐久取决于 AOF/RDB 配置（RDB 不保证逐次 fsync 耐久；本步没有 WAIT/WAITAOF）；S3 以已完成 PUT ACK 为边界；没有分布式跨后端原子事务或目录 file op 的 fsync。 | `daemon/src/main.rs`、`daemon/src/object_store.rs`、`daemon/src/meta_persist.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
 
@@ -1470,6 +1474,32 @@ Cursor 验收自检（2026-09-16）：默认 Rust tests `193 passed`；clippy �
 `STEP43_CACHE_REFILL_PASS delta=7`、`STEP43_WRITE_ITER_PASS`；Cursor 复跑 umount 27 ms。
 所有 insmod/mount/cache_device 操作均在 vng guest；未触碰宿主机 zvol 或模块。
 
+### 7.38 Phase 4/内核 Step 44 KERNEL-FSYNC（待 Cursor 验收）
+
+ABI v21 新增 opcode 25 `FSYNC`（payload inode_id u64@0，剩余零）和 opcode 26
+`SYNC_FS`（32 字节 payload 全零），共享内存布局与 cache format v4 不变。普通文件
+`.fsync`（`fdatasync` 同处理）以及 `sync_fs(wait=1)` 经同步 IPC 等 daemon 真正完成
+屏障；`wait=0` 只作非阻塞第一阶段。原 `.write_inode` 仍不发 IPC：它会在 inode 回收
+时调用，且当前没有内核 page-cache 写回数据；显式屏障由上述两个回调负责。fsync
+与写同用 data IPC mutex，先同步引用对象再同步 metadata；失败返回错误，daemon
+不在时拒绝假成功，不将内核 NVMe 读缓存当作权威写回源。
+
+FileMetaStore 对已有 `meta.json` 执行文件和父目录 fsync（新命名空间无快照则先
+创建）；LocalFs 对 inode 的全部 COW slice keys 执行文件和目录 fsync，syncfs
+检查所有仍被引用的 keys、遍历 object root 同步文件和目录。缺失对象返回 EIO；
+Mem 仅进程内确认。Redis 只等待 mutation ACK 与一致快照可见：本步未实现
+WAIT/WAITAOF，进程/节点崩溃耐久取决于 Redis AOF/RDB 配置，RDB 不保证每次 fsync；
+S3 以已完成 PUT 的 ACK 为边界；跨后端没有原子事务。
+
+Codex 自检：195 Rust tests passed、clippy `-D warnings` 通过、模块零警告；
+vng + loop `STEP44_FSYNC_FDATASYNC_SYNCFS_PASS`、`STEP44_SYNCFS_ONLY_PASS`、
+`STEP44_OFFLINE_FAIL_CLOSED_PASS`、两文件 `STEP44_RESTART_READBACK_PASS`、
+`STEP44_KERNEL_FSYNC_PASS`（最终复跑 umount 120 ms）；Step 43 vng 回归
+`STEP43_WRITE_ITER_PASS`（umount 119 ms）。
+旧 Step 15 GC 脚本的立即 `test ! -e` 在异步 GC 删除完成前失败（`bash -x`
+定位于 unlink 阶段）；本步未改变 GC，亦未扩大范围修旧脚本的竞态断言。
+只在 vng guest insmod/mount/loop；未触碰宿主机 zvol。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1479,8 +1509,8 @@ Cursor 验收自检（2026-09-16）：默认 Rust tests `193 passed`；clippy �
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **内核优先战略** | 后续以 VFS/数据面为主；见 remaining-capabilities §2 |
-| 2 | **Step 44 KERNEL-FSYNC** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | 其后内核 | aops/page cache → mmap → locks → cache-async |
+| 2 | **Step 44 KERNEL-FSYNC** | Codex 已实现，待 Cursor 验收；见 remaining-capabilities §9 |
+| 3 | 其后内核 | 等待 Cursor 下发：aops/page cache → mmap → locks → cache-async |
 | 4 | 其它 | WHITEOUT、DIST-IO、CACHE-WRITE… |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1536,9 +1566,9 @@ mkdir -p "$data_dir"
 ## 10. 交接检查清单
 
 - [x] Step 43 KERNEL-WRITE-ITER 已由 Cursor 验收并提交
-- [x] IPC ABI = 20（未变）；cache format = v4
+- [x] IPC ABI = 21；cache format = v4（未变）
 - [x] Step 8–42 + Step 43 已验收状态已写清
-- [x] 下一步明确：Step 44 KERNEL-FSYNC（`docs/remaining-capabilities.md` §8）
+- [x] Step 44 KERNEL-FSYNC 已实现，待 Cursor 验收；下一步等待下发
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

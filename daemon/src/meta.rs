@@ -234,6 +234,18 @@ pub trait MetaStore: Send + Sync {
     #[allow(dead_code)]
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>>;
 
+    /// Snapshot all object keys referenced by this inode, including COW slices.
+    async fn referenced_keys(&self, inode: u64) -> Result<Vec<String>>;
+
+    /// Include every live slice for mount-wide syncfs verification.
+    async fn all_referenced_keys(&self) -> Result<Vec<String>>;
+
+    /// Persistence barrier for metadata already committed by this daemon.
+    /// Memory/Redis ACK semantics need no local disk operation.
+    async fn sync_persistence(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Creates a new regular file under `parent`. The operation forces the
     /// file type and preserves `mode & 0o7777`. Returns its inode id.
     ///
@@ -783,6 +795,31 @@ impl MetaStore for MemStore {
             .and_then(|chunks| chunks.get(&chunk_idx))
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn referenced_keys(&self, inode: u64) -> Result<Vec<String>> {
+        let inner = self.inner.read().await;
+        if !inner.inodes.contains_key(&inode) {
+            return Err(MetaError::NotFound);
+        }
+        let mut keys: Vec<_> = inner
+            .slices
+            .get(&inode)
+            .into_iter()
+            .flat_map(|chunks| chunks.values())
+            .flat_map(|slices| slices.iter())
+            .flat_map(|slice| (0..slice.block_count()).map(|index| slice.block_key(index)))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    async fn all_referenced_keys(&self) -> Result<Vec<String>> {
+        let inner = self.inner.read().await;
+        let mut keys: Vec<_> = referenced_block_keys(&inner).into_iter().collect();
+        keys.sort_unstable();
+        Ok(keys)
     }
 
     async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {

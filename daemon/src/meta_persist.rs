@@ -18,6 +18,8 @@
 //! 1. Serialize to `{path}.tmp`
 //! 2. `fsync()` the temp file
 //! 3. Rename `{path}.tmp` -> `{path}` (atomic on POSIX)
+//! 4. Explicit fsync/syncfs barriers also sync the renamed file and its
+//!    containing directory so the namespace entry survives a crash.
 //!
 //! # Recovery
 //!
@@ -128,6 +130,19 @@ impl FileMetaStore {
 
         Ok(())
     }
+
+    async fn sync_existing(&self) -> std::io::Result<()> {
+        match fs::File::open(&self.path).await {
+            Ok(file) => file.sync_all().await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A fresh namespace has not yet created a metadata snapshot.
+                self.sync_to_disk().await?;
+            }
+            Err(error) => return Err(error),
+        }
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent).await?.sync_all().await
+    }
 }
 
 #[async_trait]
@@ -159,6 +174,18 @@ impl MetaStore for FileMetaStore {
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
         self.mem.read_slices(inode, chunk_idx).await
+    }
+
+    async fn referenced_keys(&self, inode: u64) -> Result<Vec<String>> {
+        self.mem.referenced_keys(inode).await
+    }
+
+    async fn all_referenced_keys(&self) -> Result<Vec<String>> {
+        self.mem.all_referenced_keys().await
+    }
+
+    async fn sync_persistence(&self) -> Result<()> {
+        self.sync_existing().await.map_err(|_| MetaError::Io)
     }
 
     async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {

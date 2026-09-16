@@ -60,6 +60,8 @@ void kestrelfs_cache_fill(struct inode *inode, u64 offset, const u8 *data,
 int kestrelfs_cache_invalidate_inode(u64 inode_id);
 int kestrelfs_cache_invalidate_inodes(const u64 *inode_ids, u32 count);
 int kestrelfs_cache_invalidate_all(void);
+/* file.c: serialized daemon durability barrier for inode or mount. */
+int kestrelfs_sync_daemon(u32 opcode, u64 inode_id);
 
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;

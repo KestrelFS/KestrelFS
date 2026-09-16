@@ -147,6 +147,8 @@
 #define KESTRELFS_OP_FINALIZE_ORPHAN	22	/* req: reclaim an unlinked inode */
 #define KESTRELFS_OP_SETATTR		23	/* req: persist supported inode attributes */
 #define KESTRELFS_OP_GETATTR_TIMES	24	/* req: fetch persistent atime/mtime */
+#define KESTRELFS_OP_FSYNC		25	/* req: inode_id u64@0; rest zero */
+#define KESTRELFS_OP_SYNC_FS		26	/* req: all-zero payload; mount-wide barrier */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -851,8 +853,10 @@ struct kestrelfs_ring_ctrl {
  *  20 - Phase 4/control-plane step 42: Added the daemon-to-kernel bounded
  *       KESTRELFS_IOC_INVALIDATE_CACHE_INODES command for fine-grained Redis
  *       cache coherence. Shared-memory and event layouts are unchanged.
+ *  21 - Phase 4 step 44: FSYNC (inode_id@0) and SYNC_FS (zero payload)
+ *       durability barriers; event/shared-memory layouts are unchanged.
  */
-#define KESTRELFS_ABI_VERSION		20
+#define KESTRELFS_ABI_VERSION		21
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -1064,5 +1068,9 @@ _Static_assert(8 + 4 + 8 + 8 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_SETATTR time fields overflow the event payload");
 _Static_assert(8 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"KESTRELFS_OP_GETATTR_TIMES request overflows the event payload");
+_Static_assert(sizeof(__u64) <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"KESTRELFS_OP_FSYNC inode id overflows the event payload");
+_Static_assert(KESTRELFS_OP_FSYNC == 25 && KESTRELFS_OP_SYNC_FS == 26,
+		"durability opcode values must match the daemon");
 
 #endif /* _KESTRELFS_IPC_H */

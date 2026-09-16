@@ -125,6 +125,17 @@ pub trait ObjectStore: Send + Sync {
     /// for S3: PUT request returned 200).
     async fn put(&self, key: String, value: Vec<u8>) -> Result<()>;
 
+    /// Durability barrier for the supplied referenced keys. Memory is a
+    /// volatile success; S3 PUT acknowledgement is the S3-side boundary.
+    async fn sync_keys(&self, _keys: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mount-wide barrier, including directory entries for local objects.
+    async fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Deletes `key`. Deletion is idempotent: an already-absent object is a
     /// successful outcome, which makes post-metadata-commit GC safe to retry.
     async fn delete(&self, key: &str) -> Result<()>;
@@ -425,6 +436,82 @@ impl ObjectStore for LocalFsObjectStore {
             ObjectStoreError::Io(format!("Failed to rename temp file: {}", e))
         })?;
 
+        Ok(())
+    }
+
+    async fn sync_keys(&self, keys: &[String]) -> Result<()> {
+        let mut parents = std::collections::HashSet::new();
+        for key in keys {
+            let path = self.sanitize_key(key)?;
+            fs::File::open(&path)
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("open {}: {error}", path.display())))?
+                .sync_all()
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("sync {}: {error}", path.display())))?;
+            let mut cursor = path.parent();
+            while let Some(parent) = cursor {
+                parents.insert(parent.to_path_buf());
+                if parent == self.root.as_path() {
+                    break;
+                }
+                cursor = parent.parent();
+            }
+        }
+        let mut parents: Vec<_> = parents.into_iter().collect();
+        parents.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for parent in parents {
+            fs::File::open(&parent)
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("open {}: {error}", parent.display())))?
+                .sync_all()
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("sync {}: {error}", parent.display())))?;
+        }
+        // Even an empty inode has namespace metadata in the object root.
+        fs::File::open(self.root.as_path()).await
+            .map_err(|error| ObjectStoreError::Io(format!("open object root: {error}")))?
+            .sync_all().await
+            .map_err(|error| ObjectStoreError::Io(format!("sync object root: {error}")))
+    }
+
+    async fn sync_all(&self) -> Result<()> {
+        let mut pending = vec![self.root.as_ref().clone()];
+        let mut directories = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let mut entries = fs::read_dir(&dir)
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("list {}: {error}", dir.display())))?;
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                ObjectStoreError::Io(format!("list {}: {error}", dir.display()))
+            })? {
+                let path = entry.path();
+                let kind = entry.file_type().await.map_err(|error| {
+                    ObjectStoreError::Io(format!("stat {}: {error}", path.display()))
+                })?;
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() {
+                    fs::File::open(&path)
+                        .await
+                        .map_err(|error| ObjectStoreError::Io(format!("open {}: {error}", path.display())))?
+                        .sync_all()
+                        .await
+                        .map_err(|error| ObjectStoreError::Io(format!("sync {}: {error}", path.display())))?;
+                } else {
+                    return Err(ObjectStoreError::Io(format!("unexpected object entry: {}", path.display())));
+                }
+            }
+            directories.push(dir);
+        }
+        for dir in directories.into_iter().rev() {
+            fs::File::open(&dir)
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("open {}: {error}", dir.display())))?
+                .sync_all()
+                .await
+                .map_err(|error| ObjectStoreError::Io(format!("sync {}: {error}", dir.display())))?;
+        }
         Ok(())
     }
 
