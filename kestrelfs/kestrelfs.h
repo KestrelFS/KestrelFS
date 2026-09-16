@@ -25,6 +25,7 @@ struct iov_iter;
 struct kestrelfs_inode_state {
 	struct mutex lifecycle_lock;
 	unsigned int open_handles;
+	u64 pagecache_coherence_epoch;
 };
 
 #define KESTRELFS_NAME		"kestrelfs"
@@ -62,6 +63,7 @@ int kestrelfs_cache_invalidate_inodes(const u64 *inode_ids, u32 count);
 int kestrelfs_cache_invalidate_all(void);
 /* file.c: serialized daemon durability barrier for inode or mount. */
 int kestrelfs_sync_daemon(u32 opcode, u64 inode_id);
+void kestrelfs_pagecache_coherence_advance(void);
 
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;
@@ -158,6 +160,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
  * kestrelfs_reg_inode_ops - generic setattr (truncate) for all regular files.
  */
 extern const struct file_operations kestrelfs_reg_file_ops;
+extern const struct address_space_operations kestrelfs_reg_aops;
 extern const struct inode_operations kestrelfs_reg_inode_ops;
 int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			    struct iattr *attr);

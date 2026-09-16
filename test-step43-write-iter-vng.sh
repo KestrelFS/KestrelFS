@@ -102,6 +102,9 @@ hit_count() {
 }
 
 hot_before=$(hit_count)
+# Step 45 adds a read-side page cache; drop only clean file pages so this
+# legacy assertion still measures the lower NVMe cache rather than filemap.
+echo 1 >/proc/sys/vm/drop_caches
 "$helper" warm "$mnt/vector-write.dat"
 hot_after=$(hit_count)
 test "$hot_after" -gt "$hot_before"
@@ -114,6 +117,7 @@ invalidate_after=$(hit_count)
 test "$invalidate_after" -eq "$invalidate_before"
 echo "STEP43_CACHE_INVALIDATE_PASS first_read_hit_delta=0"
 
+echo 1 >/proc/sys/vm/drop_caches
 "$helper" verify-overwrite "$mnt/vector-write.dat"
 refill_after=$(hit_count)
 test "$refill_after" -gt "$invalidate_after"

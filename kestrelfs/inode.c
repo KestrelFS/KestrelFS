@@ -166,7 +166,8 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		}
 		mutex_init(&state->lifecycle_lock);
 		inode->i_private = state;
-		/* Regular file - no custom a_ops (avoid dirty_folio without writeback) */
+		/* Read-side page cache only; writes remain synchronous daemon IPC. */
+		inode->i_mapping->a_ops = &kestrelfs_reg_aops;
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
 		set_nlink(inode, nlink);
