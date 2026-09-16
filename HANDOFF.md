@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 40 POSIX-UTIMES（秒级显式 atime/mtime）已由 Cursor 验收并纳入本提交（IPC ABI v19、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 41 DIST-OBJECT（有界 GC worker + ObjectStore 完整性）已由 Cursor 验收并纳入本提交（IPC ABI 仍为 v19、cache format 仍为 v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 40 POSIX-UTIMES 已验收；下一步 Step 41 = DIST-OBJECT（见 remaining-capabilities §8） |
+| 当前阶段 | Step 41 DIST-OBJECT 已验收；下一步 Step 42 = COHERENCE-FINE（见 remaining-capabilities §8） |
 
 ---
 
@@ -90,6 +90,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       ├── meta_redis.rs        # RedisMetaStore（v2 分记录 HASH/SET + Lua revision-CAS）
 │       ├── object_store.rs      # ObjectStore trait + MemObjectStore + LocalFsObjectStore
 │       ├── object_store_s3.rs   # S3ObjectStore（AWS SDK、MinIO path-style）
+│       ├── gc_worker.rs         # 有界异步 ObjectStore GC delete worker
 │       ├── fs_model.rs          # Inode / Slice / Block 数据模型
 │       ├── device.rs            # /dev/kestrel_ctl 打开/mmap/ABI校验
 │       ├── ring.rs              # Rust 侧 ring buffer 读写
@@ -188,6 +189,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 38** | **原子 `RENAME_EXCHANGE`；文件/目录/混合类型交换；目录 nlink** | **17** | **✅ 已验收** |
 | **Phase 4/控制面 Step 39** | **文件/目录持久 chown；原子 mode/uid/gid setattr；orphan fchown** | **18** | **✅ 已验收** |
 | **Phase 4/控制面 Step 40** | **显式 atime/mtime；文件/目录重启恢复；orphan futimens** | **19** | **✅ 已验收** |
+| **Phase 4/数据面 Step 41** | **有界 GC delete worker + ObjectStore 长度完整性** | **19（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -216,7 +218,10 @@ ABI v18 持久 uid/gid；可与 MODE 同事务；orphan fchown。ABI **v18**；f
 Cursor 对照代码、185 tests 与 `STEP40_POSIX_UTIMES_PASS` 确认 Step 40 已验收。
 ABI v19 秒级 atime/mtime + `GETATTR_TIMES`；basic/time layout 互斥。ABI **v19**；format **v4**。
 
-下一步：**Step 41 DIST-OBJECT**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码与 191 tests 确认 Step 41 已验收。
+有界 GC delete worker + ObjectStore 长度完整性；IPC ABI **v19** 未变；format **v4**。
+
+下一步：**Step 42 COHERENCE-FINE**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 19`（含 SETATTR times / GETATTR_TIMES）
 
@@ -332,7 +337,7 @@ ABI v19 秒级 atime/mtime + `GETATTR_TIMES`；basic/time layout 互斥。ABI **
 | 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
 | 20 | **Redis schema 异常/旧 v1 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，v2 control/record 非法、版本未知、control 缺失但残留 v2 key 或旧 `<prefix>:meta:v1` 存在时 daemon 启动失败；运行中 schema/control 被删除或破坏时 metadata 操作返回 EIO。没有 v1 自动迁移或自动 wipe。 | `daemon/src/meta_redis.rs` |
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
-| 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 30 将候选存入所选 File/Redis MetaStore；S3 DeleteObject 成功或对象已缺失后确认出队，网络/权限失败按 1–60 秒退避重试且不回滚命名空间。Redis v2 `gc` SET 由同一 Lua mutation 入队/ack，多个 daemon 可看到同一队列；幂等 delete/revision-CAS ack 可容忍重复处理，但尚无跨 Redis/S3 原子事务或队列限流。 | `daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
+| 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 41 用容量 32、每项最多 64 keys、delete 并发 4 的 worker 隔离慢 S3；背压/失败不丢 durable key，成功结果由串行 metadata 线程确认。多 daemon 仍可能重复处理同一 Redis `gc` SET，幂等 delete/revision-CAS ack 可容忍；尚无跨 Redis/S3 事务、dead-letter 或运维限额。 | `daemon/src/gc_worker.rs`、`daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
 | 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 28 已用 `read_iter` / `iov_iter` 覆盖普通 read/pread/readv/preadv。完整、对齐且位于单个当前用户 iovec 段的连续 4 KiB blocks 最多合并 128 KiB 并直达 pinned pages；跨段、partial/unaligned、kernel-backed iter 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_iter`。没有真正异步 completion、跨 iovec scatter-gather BIO、page-cache/readahead 或 splice 全覆盖；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
@@ -363,7 +368,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 40 验收基线 185 个）
+cargo test                    # 单元测试 + 集成测试（Step 41 验收基线 191 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1394,6 +1399,33 @@ vng regressions
 全部 mount/module 测试仅在 vng guest + loop 执行，脚本显式 `insmod`，使用独立
 data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
 
+### 7.35 Phase 4/数据面 Step 41 DIST-OBJECT
+
+纯 daemon 改动，IPC ABI 保持 v19、cache format 保持 v4。GC delete 从串行 IPC
+event loop 移到有界 worker：请求队列容量 32，每项最多 64 keys，同时最多 4 个
+ObjectStore delete。队列满、任务失败或进程在 delete/ack 之间退出时，key 仍在
+MetaStore durable GC queue；只有成功结果回到串行 metadata 线程后才确认出队，避免
+FileMetaStore 并发写 `meta.json.tmp`。
+
+ObjectStore 新增长度完整性接口。读 slice 时要求对象覆盖全部当前引用字节且不超过
+4 MiB 物理块；truncate 后不可见的旧对象尾部允许保留但不会返回。S3 在收 body 前
+校验响应 `Content-Length`，收完后再校验 header/body 与上述安全区间，不匹配返回
+integrity error/EIO。multipart PUT 未实现：当前内核 bounce 单次写最多 16 KiB，现有
+4 MiB Block 路径没有可测收益。
+
+Cursor 验收自检（2026-09-16）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  191 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+```
+
+本步未改 `kestrelfs/*.c` 或 mount 行为，按 §8 不运行 vng，也未触碰宿主机
+insmod/mount/zvol。Codex 另报告真实 MinIO 门控 `2 passed`；见
+`docs/remaining-capabilities.md` §9。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1402,8 +1434,8 @@ data_dir 并保留 daemon.log；未触碰宿主机模块、mount 或 zvol。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 41 DIST-OBJECT** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 2 | 其余 | WHITEOUT、COHERENCE-FINE、ASYNC… |
+| 1 | **Step 42 COHERENCE-FINE** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | 其余 | WHITEOUT、ASYNC、DIST-IO… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1458,12 +1490,13 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 40 POSIX-UTIMES 已由 Cursor 验收并提交
-- [x] IPC ABI = 19；cache format = v4
-- [x] Step 8–39 + Step 40 已验收状态已写清
-- [x] 下一步明确：Step 41 DIST-OBJECT（`docs/remaining-capabilities.md` §8）
+- [x] Step 41 DIST-OBJECT 已由 Cursor 验收并提交
+- [x] IPC ABI = 19（未变）；cache format = v4
+- [x] Step 8–40 + Step 41 已验收状态已写清
+- [x] 下一步明确：Step 42 COHERENCE-FINE（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
+
 
 
 

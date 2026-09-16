@@ -51,6 +51,7 @@
 mod abi;
 mod device;
 mod fs_model;
+mod gc_worker;
 mod ioctl;
 mod meta;
 mod meta_persist;
@@ -66,13 +67,14 @@ use abi::{AttrFields, KestrelfsEvent};
 use clap::Parser;
 use device::KestrelDevice;
 use fs_model::{Inode, Slice};
+use gc_worker::{DeleteCompletion, GcScheduler, GcWorker};
 use meta::{MetaError, MetaStore};
 use object_store::ObjectStore;
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const GC_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -82,6 +84,7 @@ static GC_PASSES: AtomicU64 = AtomicU64::new(0);
 static GC_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static GC_DELETED: AtomicU64 = AtomicU64::new(0);
 static GC_FAILURES: AtomicU64 = AtomicU64::new(0);
+static GC_SCHEDULER: OnceLock<GcScheduler> = OnceLock::new();
 
 fn next_gc_retry_delay(current: Duration, retry_needed: bool) -> Duration {
     if retry_needed {
@@ -175,9 +178,12 @@ async fn seed_remote_txt_block(store: &Arc<dyn ObjectStore>) -> io::Result<()> {
     };
     let block_key = seed_slice.block_key(0);
 
-    // Check if block already exists (idempotent for persistent storage)
-    if store.get(&block_key).await.is_ok() {
-        return Ok(());
+    // Check if the block already exists and is complete. A malformed existing
+    // seed is an integrity failure, not equivalent to an absent object.
+    match store.get_exact(&block_key, BLOCK_SIZE).await {
+        Ok(_) => return Ok(()),
+        Err(object_store::ObjectStoreError::NotFound(_)) => {}
+        Err(error) => return Err(io::Error::other(error.to_string())),
     }
 
     // Generate seed data
@@ -313,20 +319,29 @@ fn main() -> io::Result<()> {
 
     println!("kestrelfs-daemon: MetaStore initialized (seeded: /, /remote.txt, /writable.dat)");
 
-    // A metadata mutation and its GC candidates are committed together. Run
-    // one pass before serving requests so a queue left by a previous crash is
-    // retried immediately; later retries are driven by event_loop's poll
-    // timeout without adding a concurrent FileMetaStore writer.
-    runtime.block_on(delete_garbage_objects(
+    // Potentially slow ObjectStore deletes run away from the serial IPC ring
+    // consumer. Only this thread acknowledges successful deletes in MetaStore,
+    // so FileMetaStore remains a single-writer despite the background I/O.
+    let mut gc_worker = GcWorker::start(runtime.handle(), Arc::clone(&object_store));
+    let gc_scheduler = gc_worker.scheduler();
+    GC_SCHEDULER
+        .set(gc_scheduler.clone())
+        .map_err(|_| io::Error::other("GC scheduler initialized more than once"))?;
+    runtime.block_on(schedule_pending_garbage(
         "startup",
-        None,
         &store,
-        &object_store,
+        &gc_scheduler,
     ));
 
     println!("kestrelfs-daemon: entering poll() event loop, waiting for REQ events ...");
 
-    event_loop(&dev, &runtime, &store, &object_store)
+    event_loop(
+        &dev,
+        &runtime,
+        &store,
+        &object_store,
+        &mut gc_worker,
+    )
 }
 
 /// Blocks in `poll()` on the device fd until the kernel wakes us up
@@ -342,6 +357,7 @@ fn event_loop(
     runtime: &tokio::runtime::Runtime,
     store: &Arc<dyn MetaStore>,
     object_store: &Arc<dyn ObjectStore>,
+    gc_worker: &mut GcWorker,
 ) -> io::Result<()> {
     let mut pfd = libc::pollfd {
         fd: dev.as_raw_fd(),
@@ -405,14 +421,29 @@ fn event_loop(
             retry_at = retry_at.min(Instant::now() + retry_delay);
         }
 
-        if Instant::now() >= retry_at {
-            let outcome = runtime.block_on(delete_garbage_objects(
-                "retry",
-                None,
+        while let Some(completion) = gc_worker.try_recv() {
+            let retry_needed = runtime.block_on(apply_gc_completion(
+                completion,
                 store,
-                object_store,
+                &gc_worker.scheduler(),
             ));
-            retry_delay = next_gc_retry_delay(retry_delay, outcome.retry_needed);
+            if retry_needed {
+                retry_delay = next_gc_retry_delay(retry_delay, true);
+            } else {
+                retry_delay = GC_RETRY_BASE;
+            }
+            retry_at = Instant::now() + retry_delay;
+        }
+
+        if Instant::now() >= retry_at {
+            let retry_needed = runtime.block_on(schedule_pending_garbage(
+                "retry",
+                store,
+                &gc_worker.scheduler(),
+            ));
+            if retry_needed {
+                retry_delay = next_gc_retry_delay(retry_delay, true);
+            }
             retry_at = Instant::now() + retry_delay;
         }
 
@@ -690,12 +721,13 @@ async fn handle_finalize_orphan(
     let inode = u64::from_le_bytes(event.payload[0..8].try_into().unwrap());
     match store.finalize_orphan(inode).await {
         Ok(garbage_keys) => {
-            delete_garbage_objects(
+            dispatch_garbage_objects(
                 "OP_FINALIZE_ORPHAN",
-                Some(&garbage_keys),
+                &garbage_keys,
                 store,
                 object_store,
-            ).await;
+            )
+            .await;
             KestrelfsEvent::zeroed(abi::OP_RESULT_OK, event.req_id)
         }
         Err(error) => {
@@ -1205,13 +1237,7 @@ async fn handle_unlink_request(
         .await
     {
         Ok(garbage_keys) => {
-            delete_garbage_objects(
-                operation,
-                Some(&garbage_keys),
-                store,
-                object_store,
-            )
-            .await;
+            dispatch_garbage_objects(operation, &garbage_keys, store, object_store).await;
             println!(
                 "kestrelfs-daemon:    OP_UNLINK removed \"{}\" from parent={}",
                 name, parent_inode
@@ -1309,13 +1335,7 @@ async fn handle_rename_request(
         .await
     {
         Ok(garbage_keys) => {
-            delete_garbage_objects(
-                operation,
-                Some(&garbage_keys),
-                store,
-                object_store,
-            )
-            .await;
+            dispatch_garbage_objects(operation, &garbage_keys, store, object_store).await;
             println!(
                 "kestrelfs-daemon:    {operation} success: \"{}\" -> \"{}\"",
                 req.old_name, req.new_name
@@ -1327,6 +1347,109 @@ async fn handle_rename_request(
             KestrelfsEvent::error_response(req_id, meta_error_to_errno(&e))
         }
     }
+}
+
+/// Sends committed garbage to the production worker without waiting for
+/// ObjectStore latency. Unit tests do not run `main()`, so they retain the
+/// direct helper's deterministic, immediate-delete behavior.
+async fn dispatch_garbage_objects(
+    operation: &str,
+    garbage_keys: &[String],
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+) {
+    if let Some(scheduler) = GC_SCHEDULER.get() {
+        let outcome = scheduler.schedule(operation, garbage_keys.to_vec());
+        if outcome.backpressured != 0 {
+            eprintln!(
+                "kestrelfs-daemon:    DIST-OBJECT source={operation} worker queue full; {} key(s) remain durable for retry",
+                outcome.backpressured
+            );
+        }
+        return;
+    }
+
+    let outcome = delete_garbage_objects(operation, Some(garbage_keys), store, object_store).await;
+    if outcome.retry_needed {
+        eprintln!(
+            "kestrelfs-daemon:    DIST-OBJECT source={operation} direct test path requires retry"
+        );
+    }
+}
+
+/// Reads the durable queue on the IPC thread and attempts a nonblocking worker
+/// submission. Returning true asks the event loop to retain retry backoff.
+async fn schedule_pending_garbage(
+    operation: &str,
+    store: &Arc<dyn MetaStore>,
+    scheduler: &GcScheduler,
+) -> bool {
+    let pending = match store.pending_garbage().await {
+        Ok(keys) => keys,
+        Err(error) => {
+            let failures = GC_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "kestrelfs-daemon:    DIST-OBJECT source={operation} queue read failed: {error}; total_failures={failures}"
+            );
+            return true;
+        }
+    };
+    let outcome = scheduler.schedule(operation, pending);
+    if outcome.backpressured != 0 {
+        eprintln!(
+            "kestrelfs-daemon:    DIST-OBJECT source={operation} worker queue full; {} key(s) remain durable for retry",
+            outcome.backpressured
+        );
+        return true;
+    }
+    false
+}
+
+/// Applies one worker result on the serial IPC/metadata thread. Successful
+/// deletes are acknowledged only here; failures (including ack failure) stay
+/// in the durable queue and become schedulable again.
+async fn apply_gc_completion(
+    completion: DeleteCompletion,
+    store: &Arc<dyn MetaStore>,
+    scheduler: &GcScheduler,
+) -> bool {
+    let pass = GC_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+    let attempted = completion.attempted();
+    GC_ATTEMPTED.fetch_add(attempted as u64, Ordering::Relaxed);
+    for (key, error) in &completion.failed {
+        eprintln!(
+            "kestrelfs-daemon:    DIST-OBJECT source={} delete failed for {key}: {error}",
+            completion.operation
+        );
+    }
+
+    let mut acknowledged = 0usize;
+    let mut ack_failed = false;
+    if !completion.succeeded.is_empty() {
+        if let Err(error) = store.acknowledge_garbage(&completion.succeeded).await {
+            ack_failed = true;
+            eprintln!(
+                "kestrelfs-daemon:    DIST-OBJECT source={} queue ack failed after {} idempotent delete(s): {error}",
+                completion.operation,
+                completion.succeeded.len()
+            );
+        } else {
+            acknowledged = completion.succeeded.len();
+            GC_DELETED.fetch_add(acknowledged as u64, Ordering::Relaxed);
+        }
+    }
+
+    let failures = completion.failed.len() as u64 + u64::from(ack_failed);
+    GC_FAILURES.fetch_add(failures, Ordering::Relaxed);
+    scheduler.complete(&completion);
+    println!(
+        "kestrelfs-daemon:    DIST-OBJECT pass={pass} source={} attempted={attempted} acknowledged={acknowledged} failed={failures}; totals attempted={} deleted={} failures={}",
+        completion.operation,
+        GC_ATTEMPTED.load(Ordering::Relaxed),
+        GC_DELETED.load(Ordering::Relaxed),
+        GC_FAILURES.load(Ordering::Relaxed)
+    );
+    failures != 0
 }
 
 #[derive(Default)]
@@ -1895,13 +2018,7 @@ async fn handle_truncate(
             return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
         }
     };
-    delete_garbage_objects(
-        "OP_TRUNCATE",
-        Some(&garbage_keys),
-        store,
-        object_store,
-    )
-    .await;
+    dispatch_garbage_objects("OP_TRUNCATE", &garbage_keys, store, object_store).await;
 
     println!(
         "kestrelfs-daemon:    OP_TRUNCATE inode={} new_size={} -> success",
@@ -2000,18 +2117,19 @@ async fn read_from_slices(
 
                 // Check cache first, fetch if not present
                 if !block_cache.contains_key(&block_key) {
+                    let block_start = u64::from(block_idx) * fs_model::BLOCK_SIZE;
+                    let expected_len = (u64::from(slice.length) - block_start)
+                        .min(fs_model::BLOCK_SIZE) as usize;
                     let block_data = object_store
-                        .get(&block_key)
+                        .get_range(&block_key, expected_len, fs_model::BLOCK_SIZE as usize)
                         .await
-                        .map_err(|e| format!("ObjectStore::get({block_key}) failed: {e}"))?;
+                        .map_err(|e| format!("ObjectStore::get_range({block_key}) failed: {e}"))?;
                     block_cache.insert(block_key.clone(), block_data);
                 }
 
                 let block_data = &block_cache[&block_key];
-                if byte_in_block < block_data.len() {
-                    let file_byte_idx = (chunk_base + offset_in_chunk - file_offset) as usize;
-                    result[file_byte_idx] = block_data[byte_in_block];
-                }
+                let file_byte_idx = (chunk_base + offset_in_chunk - file_offset) as usize;
+                result[file_byte_idx] = block_data[byte_in_block];
             }
         }
     }
@@ -2665,6 +2783,32 @@ mod tests {
         assert_eq!(data.len(), 16);
         // "Phase3-seed-data! " repeated (18 bytes), bytes [10..26] = "d-data! Phase3-s"
         assert_eq!(&data, b"d-data! Phase3-s");
+    }
+
+    #[tokio::test]
+    async fn read_from_slices_rejects_object_length_mismatch() {
+        let mem_store = MemStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+        let inode = 98;
+        mem_store
+            .insert_inode_for_test(inode, fs_model::Inode::new_file(inode, 4, 1))
+            .await;
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 4,
+            written_at: 1,
+        };
+        let key = slice.block_key(0);
+        object_store.put(key, vec![1, 2, 3]).await.unwrap();
+        mem_store.append_slice(inode, slice).await.unwrap();
+        let store: Arc<dyn MetaStore> = Arc::new(mem_store);
+
+        let error = read_from_slices(inode, 0, 4, &store, &object_store)
+            .await
+            .unwrap_err();
+        assert!(error.contains("object integrity error"), "{error}");
     }
 
     #[tokio::test]
@@ -4273,6 +4417,67 @@ mod tests {
         // A post-ack pass is a no-op, proving repeated recovery is safe.
         let third = delete_garbage_objects("TEST_IDEMPOTENT", None, &store, &object_store).await;
         assert!(!third.retry_needed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_gc_failure_stays_durable_until_worker_retry_and_ack() {
+        let flaky = FailOnceObjectStore::new();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(flaky.clone());
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let inode = store
+            .create(
+                fs_model::ROOT_INODE,
+                "gc-worker-retry",
+                fs_model::S_IFREG | 0o644,
+            )
+            .await
+            .unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: meta::current_unix_time(),
+        };
+        let key = slice.block_key(0);
+        flaky.put(key.clone(), vec![42; 32]).await.unwrap();
+        store.append_slice(inode, slice).await.unwrap();
+        let garbage = store
+            .unlink(fs_model::ROOT_INODE, "gc-worker-retry")
+            .await
+            .unwrap();
+
+        let mut worker = GcWorker::start(&tokio::runtime::Handle::current(), object_store);
+        let scheduler = worker.scheduler();
+        assert_eq!(scheduler.schedule("TEST_ASYNC_FAIL", garbage).queued, 1);
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(completion) = worker.try_recv() {
+                    break completion;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(apply_gc_completion(first, &store, &scheduler).await);
+        assert_eq!(store.pending_garbage().await.unwrap(), vec![key.clone()]);
+        assert!(flaky.get(&key).await.is_ok());
+
+        assert_eq!(scheduler.schedule("TEST_ASYNC_RETRY", vec![key.clone()]).queued, 1);
+        let second = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(completion) = worker.try_recv() {
+                    break completion;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!apply_gc_completion(second, &store, &scheduler).await);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+        assert!(matches!(flaky.get(&key).await, Err(ObjectStoreError::NotFound(_))));
     }
 
     #[tokio::test]

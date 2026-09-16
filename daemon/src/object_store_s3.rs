@@ -10,7 +10,7 @@
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{error::ProvideErrorMetadata, primitives::ByteStream, Client};
 
-use crate::object_store::{ObjectStore, ObjectStoreError, Result};
+use crate::object_store::{validate_length_range, ObjectStore, ObjectStoreError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct S3Location {
@@ -103,6 +103,49 @@ impl S3ObjectStore {
         })
     }
 
+    async fn get_checked(
+        &self,
+        key: &str,
+        expected_range: Option<(usize, usize)>,
+    ) -> Result<Vec<u8>> {
+        let object_key = self.location.object_key(key)?;
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.location.bucket)
+            .key(&object_key)
+            .send()
+            .await
+            .map_err(|error| {
+                if is_not_found_code(error.as_service_error().and_then(|value| value.code())) {
+                    ObjectStoreError::NotFound(key.to_string())
+                } else {
+                    ObjectStoreError::Io(format!("S3 GET {object_key} failed: {error}"))
+                }
+            })?;
+        let declared_len = output.content_length().map(|length| {
+            usize::try_from(length).map_err(|_| {
+                ObjectStoreError::Integrity(format!(
+                    "S3 GET {object_key} returned invalid Content-Length {length}"
+                ))
+            })
+        }).transpose()?;
+        if let (Some((min_len, max_len)), Some(declared)) = (expected_range, declared_len) {
+            validate_length_range(key, min_len, max_len, declared)?;
+        }
+        let bytes = output.body.collect().await.map_err(|error| {
+            ObjectStoreError::Io(format!("S3 GET {object_key} body failed: {error}"))
+        })?;
+        let value = bytes.into_bytes().to_vec();
+        if let Some(declared) = declared_len {
+            validate_length_range(key, declared, declared, value.len())?;
+        }
+        if let Some((min_len, max_len)) = expected_range {
+            validate_length_range(key, min_len, max_len, value.len())?;
+        }
+        Ok(value)
+    }
+
     #[cfg(test)]
     pub(crate) async fn ensure_bucket_for_test(&self) {
         if std::env::var("S3_CREATE_BUCKET").as_deref() != Ok("1") {
@@ -129,25 +172,15 @@ impl S3ObjectStore {
 #[async_trait::async_trait]
 impl ObjectStore for S3ObjectStore {
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
-        let object_key = self.location.object_key(key)?;
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.location.bucket)
-            .key(&object_key)
-            .send()
-            .await
-            .map_err(|error| {
-                if is_not_found_code(error.as_service_error().and_then(|value| value.code())) {
-                    ObjectStoreError::NotFound(key.to_string())
-                } else {
-                    ObjectStoreError::Io(format!("S3 GET {object_key} failed: {error}"))
-                }
-            })?;
-        let bytes = output.body.collect().await.map_err(|error| {
-            ObjectStoreError::Io(format!("S3 GET {object_key} body failed: {error}"))
-        })?;
-        Ok(bytes.into_bytes().to_vec())
+        self.get_checked(key, None).await
+    }
+
+    async fn get_exact(&self, key: &str, expected_len: usize) -> Result<Vec<u8>> {
+        self.get_checked(key, Some((expected_len, expected_len))).await
+    }
+
+    async fn get_range(&self, key: &str, min_len: usize, max_len: usize) -> Result<Vec<u8>> {
+        self.get_checked(key, Some((min_len, max_len))).await
     }
 
     async fn put(&self, key: String, value: Vec<u8>) -> Result<()> {
@@ -249,7 +282,11 @@ mod tests {
         let key = "slice/0";
 
         store.put(key.to_string(), b"first".to_vec()).await.unwrap();
-        assert_eq!(store.get(key).await.unwrap(), b"first");
+        assert_eq!(store.get_exact(key, 5).await.unwrap(), b"first");
+        assert!(matches!(
+            store.get_exact(key, 6).await,
+            Err(ObjectStoreError::Integrity(_))
+        ));
         store
             .put(key.to_string(), b"replacement".to_vec())
             .await

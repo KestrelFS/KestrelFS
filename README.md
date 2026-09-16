@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 40 POSIX-UTIMES 已验收；下一步 Step 41 DIST-OBJECT；IPC ABI v19；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 41 DIST-OBJECT 已验收；下一步 Step 42 COHERENCE-FINE；IPC ABI v19；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -140,7 +140,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–40 已验收；下一步 Step 41 DIST-OBJECT（ABI v19 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–41 已验收；下一步 Step 42 COHERENCE-FINE（ABI v19 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -341,8 +341,11 @@ AWS_REGION=us-east-1 cargo test s3_environment_gated -- --nocapture
 
 Step 30 已把 GC 候选保存在 MetaStore 的 `pending_garbage` 中：FileMetaStore 随
 `meta.json` 原子落盘，RedisMetaStore 随同一 v2 Lua mutation 提交到 `gc` SET。
-daemon 启动时立即重放，运行中按 1 秒到 60 秒指数退避重试；对象删除成功后才从
-队列确认移除。`--memory` 下队列与对象都只在内存中，进程退出后二者一起消失。
+Step 41 已把慢 delete 移到容量 32、每项最多 64 keys 的有界 worker 队列，
+最多并发 4 个 ObjectStore 请求；队列满或删除失败时 key 仍留在 durable GC queue，
+成功结果回到串行 metadata 线程后才确认出队。对象读取会校验 body 长度足以覆盖
+当前 slice 且不超过 4 MiB；S3 还会交叉校验响应 `Content-Length`，不匹配时 fail
+closed。`--memory` 下队列与对象都只在内存中，进程退出后二者一起消失。
 
 **验证持久化：**
 

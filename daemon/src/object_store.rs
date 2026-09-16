@@ -52,6 +52,11 @@ pub enum ObjectStoreError {
     /// The provided key is invalid (e.g., contains ".." or is an absolute path).
     #[error("invalid key: {0}")]
     InvalidKey(String),
+
+    /// The backend returned a complete response whose object metadata or body
+    /// length disagrees with the slice metadata. Callers must fail closed.
+    #[error("object integrity error: {0}")]
+    Integrity(String),
 }
 
 pub type Result<T> = std::result::Result<T, ObjectStoreError>;
@@ -91,6 +96,23 @@ pub trait ObjectStore: Send + Sync {
     /// timeout, disk read error, etc.).
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
 
+    /// Retrieves an object and verifies its exact expected byte length.
+    /// Network backends may override this to reject bad response metadata
+    /// before buffering the body; the default still validates every backend's
+    /// returned bytes.
+    async fn get_exact(&self, key: &str, expected_len: usize) -> Result<Vec<u8>> {
+        self.get_range(key, expected_len, expected_len).await
+    }
+
+    /// Retrieves an object whose stored length must cover every referenced
+    /// byte without exceeding the physical block bound. A truncated slice may
+    /// legitimately reference a prefix of an older, longer immutable object.
+    async fn get_range(&self, key: &str, min_len: usize, max_len: usize) -> Result<Vec<u8>> {
+        let value = self.get(key).await?;
+        validate_length_range(key, min_len, max_len, value.len())?;
+        Ok(value)
+    }
+
     /// Stores `value` under `key`, overwriting any existing value.
     ///
     /// # Errors
@@ -106,6 +128,20 @@ pub trait ObjectStore: Send + Sync {
     /// Deletes `key`. Deletion is idempotent: an already-absent object is a
     /// successful outcome, which makes post-metadata-commit GC safe to retry.
     async fn delete(&self, key: &str) -> Result<()>;
+}
+
+pub(crate) fn validate_length_range(
+    key: &str,
+    min_len: usize,
+    max_len: usize,
+    actual: usize,
+) -> Result<()> {
+    if actual < min_len || actual > max_len {
+        return Err(ObjectStoreError::Integrity(format!(
+            "{key}: expected {min_len}..={max_len} bytes, received {actual}"
+        )));
+    }
+    Ok(())
 }
 
 /// In-memory, `HashMap`-backed [`ObjectStore`] for Phase 3
@@ -216,6 +252,21 @@ mod tests {
             Err(ObjectStoreError::NotFound(_))
         ));
         store.delete(key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_exact_fails_closed_on_short_or_long_objects() {
+        let store = MemObjectStore::new();
+        store.put("short".to_string(), vec![1; 3]).await.unwrap();
+        assert!(matches!(
+            store.get_exact("short", 4).await,
+            Err(ObjectStoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            store.get_exact("short", 2).await,
+            Err(ObjectStoreError::Integrity(_))
+        ));
+        assert_eq!(store.get_exact("short", 3).await.unwrap(), vec![1; 3]);
     }
 
     #[tokio::test]
