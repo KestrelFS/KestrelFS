@@ -3615,6 +3615,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_data_exchange_swaps_existing_paths_without_gc() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let left = store
+            .create(fs_model::ROOT_INODE, "exchange-left", fs_model::S_IFREG | 0o640)
+            .await
+            .unwrap();
+        let right = store
+            .create(fs_model::ROOT_INODE, "exchange-right", fs_model::S_IFREG | 0o600)
+            .await
+            .unwrap();
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req_with_flags(
+            707,
+            fs_model::ROOT_INODE,
+            "exchange-left",
+            fs_model::ROOT_INODE,
+            "exchange-right",
+            abi::RENAME_EXCHANGE,
+            &mut data_buffer,
+        );
+
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "exchange-left").await.unwrap(), right);
+        assert_eq!(store.lookup(fs_model::ROOT_INODE, "exchange-right").await.unwrap(), left);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn rename_data_noreplace_same_inode_aliases_is_successful_noop() {
         let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
         let object_store: Arc<dyn ObjectStore> =

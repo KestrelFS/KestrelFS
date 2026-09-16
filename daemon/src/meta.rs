@@ -94,7 +94,7 @@ pub enum MetaError {
     /// Incrementing the inode's persistent link count would overflow.
     #[error("too many hard links")]
     TooManyLinks,
-    /// A rename flag other than the currently supported NOREPLACE bit was used.
+    /// A rename flag or flag combination is not supported.
     #[error("unsupported rename flags: {0:#x}")]
     UnsupportedRenameFlags(u32),
     /// I/O error during persistence operations (FileMetaStore).
@@ -109,6 +109,9 @@ pub type Result<T> = std::result::Result<T, MetaError>;
 /// Atomic rename must fail with [`MetaError::AlreadyExists`] when the target
 /// exists. This value intentionally matches Linux `RENAME_NOREPLACE`.
 pub const RENAME_NOREPLACE: u32 = 1;
+/// Atomically swap two existing directory entries. This value intentionally
+/// matches Linux `RENAME_EXCHANGE`.
+pub const RENAME_EXCHANGE: u32 = 2;
 
 /// `MetaStore` - async abstraction over the POSIX metadata backing
 /// store.
@@ -312,9 +315,10 @@ pub trait MetaStore: Send + Sync {
         new_name: &str,
     ) -> Result<Vec<String>>;
 
-    /// Rename with Linux-compatible flags. Only [`RENAME_NOREPLACE`] is
-    /// currently supported; implementations must perform its target-existence
-    /// check in the same atomic metadata mutation as the rename itself.
+    /// Rename with Linux-compatible flags. [`RENAME_NOREPLACE`] and
+    /// [`RENAME_EXCHANGE`] are individually supported and mutually exclusive;
+    /// implementations must perform all checks and dirent changes in one
+    /// atomic metadata mutation.
     async fn rename_with_flags(
         &self,
         old_parent: u64,
@@ -478,6 +482,35 @@ fn directory_nlink_after_delta(current: u32, delta: i32) -> Result<u32> {
         return Err(MetaError::Io);
     }
     Ok(next)
+}
+
+/// Returns true when moving `directory` below `destination_parent` would form
+/// a cycle. Directory hard links are forbidden, so scanning parent dirents is
+/// sufficient to walk the unique ancestry chain.
+fn directory_move_creates_cycle(
+    inner: &MemStoreInner,
+    directory: u64,
+    destination_parent: u64,
+) -> bool {
+    let mut check_parent = destination_parent;
+    loop {
+        if check_parent == directory {
+            return true;
+        }
+        if check_parent == ROOT_INODE {
+            return false;
+        }
+        let found_parent = inner.dir_entries.iter().find_map(|(&dir_ino, entries)| {
+            entries
+                .values()
+                .any(|&child| child == check_parent)
+                .then_some(dir_ino)
+        });
+        match found_parent {
+            Some(parent) => check_parent = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Fixed inode id for the bootstrap `remote.txt` entry seeded by
@@ -1152,7 +1185,9 @@ impl MetaStore for MemStore {
         flags: u32,
         defer_reclaim: bool,
     ) -> Result<Vec<String>> {
-        if flags & !RENAME_NOREPLACE != 0 {
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0
+            || flags == (RENAME_NOREPLACE | RENAME_EXCHANGE)
+        {
             return Err(MetaError::UnsupportedRenameFlags(flags));
         }
 
@@ -1196,32 +1231,12 @@ impl MetaStore for MemStore {
         let source_is_dir = source_inode.is_dir();
 
         // Check if we're renaming a directory into its own subtree
-        if source_is_dir {
-            // Walk up from new_parent to check if it's a descendant of source
-            let mut check_parent = new_parent;
-            loop {
-                if check_parent == source_inode_id {
-                    // Attempting to move directory into its own subtree
-                    return Err(MetaError::InvalidName(
-                        "cannot move directory into its own subtree".to_string(),
-                    ));
-                }
-                if check_parent == ROOT_INODE {
-                    break;
-                }
-                // Find parent by scanning dir_entries (inefficient but simple)
-                let mut found_parent = None;
-                for (&dir_ino, entries) in inner.dir_entries.iter() {
-                    if entries.values().any(|&child| child == check_parent) {
-                        found_parent = Some(dir_ino);
-                        break;
-                    }
-                }
-                match found_parent {
-                    Some(p) => check_parent = p,
-                    None => break, // Orphaned or root
-                }
-            }
+        if source_is_dir
+            && directory_move_creates_cycle(&inner, source_inode_id, new_parent)
+        {
+            return Err(MetaError::InvalidName(
+                "cannot move directory into its own subtree".to_string(),
+            ));
         }
 
         // Check if target exists
@@ -1229,6 +1244,76 @@ impl MetaStore for MemStore {
             .dir_entries
             .get(&new_parent)
             .and_then(|entries| entries.get(new_name).copied());
+
+        if flags & RENAME_EXCHANGE != 0 {
+            let target_inode_id = target_exists.ok_or(MetaError::NotFound)?;
+            if target_inode_id == source_inode_id {
+                return Ok(Vec::new());
+            }
+            let target_is_dir = inner
+                .inodes
+                .get(&target_inode_id)
+                .ok_or(MetaError::NotFound)?
+                .is_dir();
+            if target_is_dir
+                && directory_move_creates_cycle(&inner, target_inode_id, old_parent)
+            {
+                return Err(MetaError::InvalidName(
+                    "cannot move directory into its own subtree".to_string(),
+                ));
+            }
+
+            let old_parent_nlink = inner
+                .inodes
+                .get(&old_parent)
+                .ok_or(MetaError::NotFound)?
+                .nlink;
+            let new_parent_nlink = inner
+                .inodes
+                .get(&new_parent)
+                .ok_or(MetaError::NotFound)?
+                .nlink;
+            let (old_parent_nlink_after, new_parent_nlink_after) =
+                if old_parent == new_parent {
+                    (old_parent_nlink, None)
+                } else {
+                    (
+                        directory_nlink_after_delta(
+                            old_parent_nlink,
+                            target_is_dir as i32 - source_is_dir as i32,
+                        )?,
+                        Some(directory_nlink_after_delta(
+                            new_parent_nlink,
+                            source_is_dir as i32 - target_is_dir as i32,
+                        )?),
+                    )
+                };
+
+            inner
+                .dir_entries
+                .get_mut(&old_parent)
+                .expect("source parent entries checked above")
+                .insert(old_name.to_string(), target_inode_id);
+            inner
+                .dir_entries
+                .get_mut(&new_parent)
+                .expect("target parent entries checked above")
+                .insert(new_name.to_string(), source_inode_id);
+
+            let now = current_unix_time();
+            if let Some(parent_inode) = inner.inodes.get_mut(&old_parent) {
+                parent_inode.mtime = now;
+                parent_inode.nlink = old_parent_nlink_after;
+            }
+            if old_parent != new_parent {
+                if let Some(parent_inode) = inner.inodes.get_mut(&new_parent) {
+                    parent_inode.mtime = now;
+                    parent_inode.nlink = new_parent_nlink_after
+                        .expect("cross-directory exchange computed new parent nlink");
+                }
+            }
+            return Ok(Vec::new());
+        }
 
         if target_exists == Some(source_inode_id) {
             return Ok(Vec::new());
@@ -2179,6 +2264,126 @@ mod tests {
         assert_eq!(store.getattr(source).await.unwrap().nlink, 2);
         assert_eq!(store.lookup(ROOT_INODE, "noreplace-new").await.unwrap(), source);
         assert_eq!(store.lookup(ROOT_INODE, "noreplace-alias").await.unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn rename_exchange_is_atomic_for_files_and_failure_paths() {
+        let store = MemStore::new();
+        let left = store
+            .create(ROOT_INODE, "exchange-left", S_IFREG | 0o640)
+            .await
+            .unwrap();
+        let right = store
+            .create(ROOT_INODE, "exchange-right", S_IFREG | 0o600)
+            .await
+            .unwrap();
+
+        assert!(store
+            .rename_with_flags(
+                ROOT_INODE,
+                "exchange-left",
+                ROOT_INODE,
+                "missing",
+                RENAME_EXCHANGE,
+            )
+            .await
+            .is_err());
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-left").await.unwrap(), left);
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-right").await.unwrap(), right);
+
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "exchange-left",
+                    ROOT_INODE,
+                    "exchange-right",
+                    RENAME_NOREPLACE | RENAME_EXCHANGE,
+                )
+                .await,
+            Err(MetaError::UnsupportedRenameFlags(_))
+        ));
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-left").await.unwrap(), left);
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-right").await.unwrap(), right);
+
+        assert_eq!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "exchange-left",
+                    ROOT_INODE,
+                    "exchange-right",
+                    RENAME_EXCHANGE,
+                )
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-left").await.unwrap(), right);
+        assert_eq!(store.lookup(ROOT_INODE, "exchange-right").await.unwrap(), left);
+        assert_eq!(store.getattr(left).await.unwrap().nlink, 1);
+        assert_eq!(store.getattr(right).await.unwrap().nlink, 1);
+        assert!(store.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_exchange_supports_directories_and_mixed_types_without_cycles() {
+        let store = MemStore::new();
+        let left_parent = store.mkdir(ROOT_INODE, "left-parent", 0o755).await.unwrap();
+        let right_parent = store.mkdir(ROOT_INODE, "right-parent", 0o755).await.unwrap();
+        let left_dir = store.mkdir(left_parent, "left-dir", 0o755).await.unwrap();
+        let right_dir = store.mkdir(right_parent, "right-dir", 0o755).await.unwrap();
+        let child = store.create(left_dir, "child", 0o644).await.unwrap();
+
+        store
+            .rename_with_flags(
+                left_parent,
+                "left-dir",
+                right_parent,
+                "right-dir",
+                RENAME_EXCHANGE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.lookup(left_parent, "left-dir").await.unwrap(), right_dir);
+        assert_eq!(store.lookup(right_parent, "right-dir").await.unwrap(), left_dir);
+        assert_eq!(store.lookup(left_dir, "child").await.unwrap(), child);
+        assert_eq!(store.getattr(left_parent).await.unwrap().nlink, 3);
+        assert_eq!(store.getattr(right_parent).await.unwrap().nlink, 3);
+
+        let mixed_file = store.create(left_parent, "mixed", 0o640).await.unwrap();
+        let mixed_dir = store.mkdir(right_parent, "mixed", 0o750).await.unwrap();
+        assert_eq!(store.getattr(left_parent).await.unwrap().nlink, 3);
+        assert_eq!(store.getattr(right_parent).await.unwrap().nlink, 4);
+        store
+            .rename_with_flags(
+                left_parent,
+                "mixed",
+                right_parent,
+                "mixed",
+                RENAME_EXCHANGE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.lookup(left_parent, "mixed").await.unwrap(), mixed_dir);
+        assert_eq!(store.lookup(right_parent, "mixed").await.unwrap(), mixed_file);
+        assert_eq!(store.getattr(left_parent).await.unwrap().nlink, 4);
+        assert_eq!(store.getattr(right_parent).await.unwrap().nlink, 3);
+
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "left-parent",
+                    left_parent,
+                    "left-dir",
+                    RENAME_EXCHANGE,
+                )
+                .await,
+            Err(MetaError::InvalidName(_))
+        ));
+        assert_eq!(store.lookup(ROOT_INODE, "left-parent").await.unwrap(), left_parent);
+        assert_eq!(store.lookup(left_parent, "left-dir").await.unwrap(), right_dir);
     }
 
     #[tokio::test]

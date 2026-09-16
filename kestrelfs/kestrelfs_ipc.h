@@ -539,8 +539,8 @@
  * the following new_name_len bytes hold new_name. Neither is NUL-terminated.
  * Each name is limited to POSIX NAME_MAX (255 bytes), and their combined
  * length MUST fit in KESTRELFS_DATA_BUFFER_SIZE. The event-header flags remain
- * zero; the payload rename flags currently permit only
- * KESTRELFS_RENAME_NOREPLACE.
+ * zero; the payload rename flags permit KESTRELFS_RENAME_NOREPLACE or
+ * KESTRELFS_RENAME_EXCHANGE. The two flags are mutually exclusive.
  *
  * RESPONSE and rename semantics are identical to legacy KESTRELFS_OP_RENAME.
  * The legacy opcode remains in ABI v9 for compatibility tests; normal VFS
@@ -550,6 +550,7 @@
  */
 #define KESTRELFS_RENAME_DATA_NAME_MAX	255
 #define KESTRELFS_RENAME_NOREPLACE	0x00000001U
+#define KESTRELFS_RENAME_EXCHANGE	0x00000002U
 #define KESTRELFS_LIFECYCLE_DEFER_RECLAIM	0x00000001U
 
 /*
@@ -812,8 +813,12 @@ struct kestrelfs_ring_ctrl {
  *  16 - Phase 4/control-plane step 37: Added SETATTR (opcode 23). The first
  *       supported mutation is KESTRELFS_SETATTR_MODE; file type is preserved
  *       and only permission/special bits (07777) are replaced.
+ *
+ *  17 - Phase 4/control-plane step 38: RENAME_DATA accepts the mutually
+ *       exclusive KESTRELFS_RENAME_EXCHANGE flag for atomic dirent swaps.
+ *       The payload and shared-memory layouts are unchanged.
  */
-#define KESTRELFS_ABI_VERSION		16
+#define KESTRELFS_ABI_VERSION		17
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -937,6 +942,10 @@ _Static_assert(8 + 8 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 _Static_assert(2 * KESTRELFS_RENAME_DATA_NAME_MAX <=
 		KESTRELFS_DATA_BUFFER_SIZE,
 		"two maximum-length rename names must fit in data_buffer");
+
+_Static_assert(KESTRELFS_RENAME_NOREPLACE == 1U &&
+		KESTRELFS_RENAME_EXCHANGE == 2U,
+		"rename flag values must match Linux UAPI");
 
 _Static_assert(8 + 2 + 2 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"single-name DATA request fields overflow the event payload");

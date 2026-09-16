@@ -1205,6 +1205,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_exchange_patch_atomically_sets_both_dirents_only() {
+        let mem = MemStore::new();
+        let left = mem.create(ROOT_INODE, "exchange-left", 0o640).await.unwrap();
+        let right = mem.create(ROOT_INODE, "exchange-right", 0o600).await.unwrap();
+        let old = mem.snapshot().await;
+
+        mem.rename_with_flags(
+            ROOT_INODE,
+            "exchange-left",
+            ROOT_INODE,
+            "exchange-right",
+            crate::meta::RENAME_EXCHANGE,
+        )
+        .await
+        .unwrap();
+        let new = mem.snapshot().await;
+        let patch = RedisPatch::between(
+            &SnapshotRecords::from_snapshot(&old).unwrap(),
+            &SnapshotRecords::from_snapshot(&new).unwrap(),
+        );
+
+        assert!(patch.dirents_del.is_empty());
+        assert!(patch.inodes_set.is_empty());
+        assert!(patch.inodes_del.is_empty());
+        assert!(patch.slices_set.is_empty());
+        assert!(patch.slices_del.is_empty());
+        assert!(patch.gc_add.is_empty());
+        assert_eq!(
+            patch.dirents_set,
+            vec![
+                (dirent_field(ROOT_INODE, "exchange-left"), right.to_string()),
+                (dirent_field(ROOT_INODE, "exchange-right"), left.to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn hard_link_patch_atomically_updates_inode_and_dirent() {
         let mem = MemStore::new();
         let inode = mem.create(ROOT_INODE, "source", 0o644).await.unwrap();
@@ -1425,6 +1462,33 @@ mod tests {
             .unwrap();
         assert_eq!(peer.getattr(noreplace_source).await.unwrap().nlink, 2);
 
+        let exchange_left = store
+            .create(directory, "exchange-left", 0o640)
+            .await
+            .unwrap();
+        let exchange_right = store
+            .create(directory, "exchange-right", 0o600)
+            .await
+            .unwrap();
+        store
+            .rename_with_flags(
+                directory,
+                "exchange-left",
+                directory,
+                "exchange-right",
+                crate::meta::RENAME_EXCHANGE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.lookup(directory, "exchange-left").await.unwrap(),
+            exchange_right
+        );
+        assert_eq!(
+            peer.lookup(directory, "exchange-right").await.unwrap(),
+            exchange_left
+        );
+
         let source = store.create(directory, "source", 0o644).await.unwrap();
         assert_eq!(
             store
@@ -1488,6 +1552,14 @@ mod tests {
             S_IFREG | 0o6751
         );
         assert_eq!(restarted.lookup(directory, "victim").await.unwrap(), source);
+        assert_eq!(
+            restarted.lookup(directory, "exchange-left").await.unwrap(),
+            exchange_right
+        );
+        assert_eq!(
+            restarted.lookup(directory, "exchange-right").await.unwrap(),
+            exchange_left
+        );
         assert_eq!(restarted.pending_garbage().await.unwrap(), pending);
         restarted.acknowledge_garbage(&pending).await.unwrap();
         assert!(restarted.pending_garbage().await.unwrap().is_empty());

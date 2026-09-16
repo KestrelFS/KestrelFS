@@ -119,10 +119,10 @@ test "$(stat -c %h "$mnt/hardlink-source-long-name")" -eq 2
 grep -Fx 'step33-hardlink-data' "$mnt/hardlink-alias-long-name"
 echo 'STEP33_NOREPLACE_HARDLINK_VFS_EEXIST_NOOP_PASS'
 
-# Unsupported EXCHANGE is rejected, and neither namespace entry changes.
-if "$helper" "$mnt/collision-source-long-name" "$mnt/collision-target-long-name" 2 \
-	2>"$data_dir/exchange.err"; then
-	echo 'STEP33_FAIL: unsupported EXCHANGE unexpectedly succeeded'
+# Unsupported WHITEOUT is rejected, and neither namespace entry changes.
+if "$helper" "$mnt/collision-source-long-name" "$mnt/collision-target-long-name" 4 \
+	2>"$data_dir/whiteout.err"; then
+	echo 'STEP33_FAIL: unsupported WHITEOUT unexpectedly succeeded'
 	exit 1
 else
 	status=$?

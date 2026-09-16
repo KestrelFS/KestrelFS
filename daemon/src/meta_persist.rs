@@ -527,6 +527,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_exchange_survives_reload_as_one_namespace_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let left;
+        let right;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            left = store.create(ROOT_INODE, "exchange-left", 0o640).await.unwrap();
+            right = store.create(ROOT_INODE, "exchange-right", 0o600).await.unwrap();
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "exchange-left",
+                    ROOT_INODE,
+                    "exchange-right",
+                    crate::meta::RENAME_EXCHANGE,
+                )
+                .await
+                .unwrap();
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(restored.lookup(ROOT_INODE, "exchange-left").await.unwrap(), right);
+        assert_eq!(restored.lookup(ROOT_INODE, "exchange-right").await.unwrap(), left);
+        assert!(restored.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn truncate_and_reload_preserves_size() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("meta.json");

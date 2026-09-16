@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 37 POSIX-CHMOD（`OP_SETATTR` mode）已由 Cursor 验收并纳入本提交（IPC ABI v16、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 38 POSIX-EXCHANGE（原子 `RENAME_EXCHANGE`）已由 Cursor 验收并纳入本提交（IPC ABI v17、cache format v4）。下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 37 chmod 已验收；下一步 Step 38 = POSIX-EXCHANGE（见 remaining-capabilities §8） |
+| 当前阶段 | Step 38 `RENAME_EXCHANGE` 已验收；下一步 Step 39 = POSIX-CHOWN（见 remaining-capabilities §8） |
 
 ---
 
@@ -128,6 +128,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step36-posix-lifecycle.c # Step 36 fd 生命周期测试助手
 ├── test-step37-posix-chmod-vng.sh # Step 37 文件/目录 chmod、重启及 orphan 回归
 ├── test-step37-posix-chmod.c # Step 37 open-unlink fchmod 测试助手
+├── test-step38-posix-exchange-vng.sh # Step 38 原子 EXCHANGE/失败原子性/重启回归
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -180,6 +181,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 35** | **Redis durable revision 轮询 + ABI v14 全 cache 持久失效** | **14** | **✅ 已验收** |
 | **Phase 4/控制面 Step 36** | **open-unlink：显式 open 计数、nlink=0 orphan、last-close GC** | **15** | **✅ 已验收** |
 | **Phase 4/控制面 Step 37** | **文件/目录持久 chmod；ABI v16 `OP_SETATTR`；orphan fchmod** | **16** | **✅ 已验收** |
+| **Phase 4/控制面 Step 38** | **原子 `RENAME_EXCHANGE`；文件/目录/混合类型交换；目录 nlink** | **17** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -199,9 +201,12 @@ Cursor 对照代码、168 tests 与 `STEP36_POSIX_LIFECYCLE_PASS` 确认 Step 36
 Cursor 对照代码、172 tests 与 `STEP37_POSIX_CHMOD_PASS` 确认 Step 37 已验收。
 ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **v16**；format **v4**。
 
-下一步：**Step 38 POSIX-EXCHANGE**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、179 tests 与 `STEP38_POSIX_EXCHANGE_PASS` 确认 Step 38 已验收。
+ABI v17 原子 `RENAME_EXCHANGE`；与 NOREPLACE 互斥；`WHITEOUT` 仍拒绝。ABI **v17**；format **v4**。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 16`（含 `OP_SETATTR`）
+下一步：**Step 39 POSIX-CHOWN**，提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 17`（含 `RENAME_EXCHANGE`）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -217,7 +222,7 @@ ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 16`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 17`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -236,6 +241,7 @@ ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **
 14. Phase 4/控制面 Step 35：新增 daemon→kernel `KESTRELFS_IOC_INVALIDATE_CACHE_ALL`；共享内存与 opcode 布局未变
 15. Phase 4/控制面 Step 36：UNLINK_DATA/RENAME_DATA 增加延迟回收语义；新增 `FINALIZE_ORPHAN`
 16. Phase 4/控制面 Step 37：新增 `SETATTR`；当前 valid mask 仅支持 MODE，保留类型位并替换 `0o7777`
+17. Phase 4/控制面 Step 38：`RENAME_DATA` 接受与 NOREPLACE 互斥的 `RENAME_EXCHANGE`；payload/共享内存布局不变
 
 ### 5.4 已实现 Opcode 列表
 
@@ -254,7 +260,7 @@ ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **
 | 10 | `OP_RENAME` | 重命名/移动文件或目录 | 7 |
 | 11 | `OP_WRITE_DATA` | 从 16 KiB bounce buffer 写入文件 | 8 |
 | 12 | `OP_READ_DATA` | 将文件数据读入 16 KiB bounce buffer | 8 |
-| 13 | `OP_RENAME_DATA` | 从 bounce 读取 old/new name；ABI v13 payload flags 支持 `RENAME_NOREPLACE` | 9（v13 扩展 flags） |
+| 13 | `OP_RENAME_DATA` | 从 bounce 读取 old/new name；payload flags 支持 `RENAME_NOREPLACE` / `RENAME_EXCHANGE`（互斥） | 9（v13/v17 扩展 flags） |
 | 14 | `OP_LOOKUP_DATA` | 从 bounce buffer 读取名字并查找 | 10 |
 | 15 | `OP_CREATE_DATA` | 从 bounce buffer 读取名字并创建文件 | 10 |
 | 16 | `OP_MKDIR_DATA` | 从 bounce buffer 读取名字并创建目录 | 10 |
@@ -299,7 +305,7 @@ ABI v16 `OP_SETATTR` 持久化 mode；uid/gid/时间戳仍 `EOPNOTSUPP`。ABI **
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
 | 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
 | 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
-| 10 | **rename flags 仅支持 NOREPLACE** | Step 33 支持原子 `RENAME_NOREPLACE`；`RENAME_EXCHANGE` / `RENAME_WHITEOUT` / 未知位返回 `-EINVAL`。Linux VFS 对已存在目标（包括同 inode 硬链接别名）会在 `.rename` 回调前返回 `EEXIST`；MetaStore 层同 inode 仍为成功 no-op。 | `kestrelfs/dir.c`、`daemon/src/meta.rs` |
+| 10 | **rename flags 尚无 WHITEOUT** | Step 33 支持原子 `RENAME_NOREPLACE`；Step 38 支持与其互斥的 `RENAME_EXCHANGE`，要求两端存在，并按 Linux 语义允许目录与非目录交换。`RENAME_WHITEOUT`、未知位及 NOREPLACE|EXCHANGE 返回 `-EINVAL`。 | `kestrelfs/dir.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **O_APPEND 手动处理** | 内核用 `f_op->write` 而非 `write_iter`，VFS 不会自动 seek 到 EOF。代码中手动检查 `O_APPEND` 并更新 `*ppos`。 | `kestrelfs/file.c` `kestrelfs_writable_write()` |
@@ -342,7 +348,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 37 验收基线 172 个）
+cargo test                    # 单元测试 + 集成测试（Step 38 验收基线 179 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1266,6 +1272,43 @@ vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
 
 脚本仅在 vng guest + loop、显式 insmod、独立 data_dir/daemon.log。
 
+### 7.32 Phase 4/控制面 Step 38 POSIX-EXCHANGE
+
+复用 `RENAME_DATA` 的 flags@20，ABI v17 增加与 NOREPLACE 互斥的
+`RENAME_EXCHANGE`。两端必须存在；MemStore 在同一写锁内交换两个 dirent，FileMetaStore
+随同一次 JSON 原子替换持久化，RedisMetaStore 由同一 Lua revision-CAS 同时更新两个
+dirent field。交换不删除 inode/slice、不产生 GC 或 lifecycle orphan；cache 按 inode
+标识，故保留有效 entry。跨父目录混合类型交换按 Linux 语义允许，并对两个父目录
+nlink 作对称调整；两个方向的目录祖先环路均在 mutation 前拒绝。
+
+Cursor 验收自检（2026-09-16）：
+
+```text
+cargo test --manifest-path daemon/Cargo.toml
+  179 passed; 0 failed
+cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
+  Finished successfully; 0 warnings
+make -C kestrelfs
+  success; 0 warnings
+REDIS_URL=... cargo test --manifest-path daemon/Cargo.toml \
+  redis_url_gated_full_semantics_and_restart -- --nocapture
+  1 passed; 0 failed
+vng ... --exec ./test-step38-posix-exchange-vng.sh
+  STEP38_FILE_EXCHANGE_PASS
+  STEP38_CACHE_IDENTITY_PASS
+  STEP38_DIRECTORY_EXCHANGE_PASS
+  STEP38_MIXED_TYPE_EXCHANGE_PASS
+  STEP38_HARDLINK_EXCHANGE_PASS
+  STEP38_FAILURE_ATOMICITY_PASS
+  STEP38_EXCHANGE_RESTART_PASS
+  STEP38_POSIX_EXCHANGE_PASS (umount_ms=22)
+```
+
+Cursor 复跑确认上述 STEP38_* marker；Codex 另报告相关回归
+`STEP33_POSIX_RENAME_PASS`、`STEP36_POSIX_LIFECYCLE_PASS`、`STEP37_POSIX_CHMOD_PASS`。
+全部测试仅在 vng guest + loop 执行，脚本显式 `insmod`，使用独立 data_dir 并保留
+daemon.log；未触碰宿主机模块、mount 或 zvol。`RENAME_WHITEOUT` 仍未实现。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1274,8 +1317,8 @@ vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 38 POSIX-EXCHANGE** | 至少 `RENAME_EXCHANGE`；见 §8 |
-| 2 | 其余 / DIST | WHITEOUT、COHERENCE-FINE、DIST-OBJECT… |
+| 1 | **Step 39 POSIX-CHOWN** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | 其余 / DIST | WHITEOUT、utimes、COHERENCE-FINE、DIST-OBJECT… |
 | 3 | 其它 | 须 Cursor 在 remaining-capabilities §6 明示 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1330,10 +1373,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 37 POSIX-CHMOD 已由 Cursor 验收并提交
-- [x] IPC ABI = 16；cache format = v4
-- [x] Step 8–36 + Step 37 已验收状态已写清
-- [x] 下一步明确：Step 38 POSIX-EXCHANGE（`docs/remaining-capabilities.md` §8）
+- [x] Step 38 POSIX-EXCHANGE 已由 Cursor 验收并提交
+- [x] IPC ABI = 17；cache format = v4
+- [x] Step 8–37 + Step 38 已验收状态已写清
+- [x] 下一步明确：Step 39 POSIX-CHOWN（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

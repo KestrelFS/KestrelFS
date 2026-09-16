@@ -601,7 +601,7 @@ static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
  *
  * Sends KESTRELFS_OP_RENAME_DATA to daemon. Supports same-directory rename
  * and cross-directory moves with POSIX semantics (atomic replacement and
- * RENAME_NOREPLACE).
+ * RENAME_NOREPLACE and RENAME_EXCHANGE).
  * Names are concatenated in the shared data bounce buffer, so each may be up
  * to KESTRELFS_RENAME_DATA_NAME_MAX bytes.
  */
@@ -627,17 +627,22 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 		S_ISDIR(d_inode(old_dentry)->i_mode);
 	bool target_is_dir = d_really_is_positive(new_dentry) &&
 		S_ISDIR(d_inode(new_dentry)->i_mode);
+	bool exchange = flags & RENAME_EXCHANGE;
 	int ret;
 
 	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
 		old_dir->i_ino, old_name, new_dir->i_ino, new_name, flags);
 
-	/* EXCHANGE, WHITEOUT, and unknown flag combinations remain unsupported. */
-	if (flags & ~RENAME_NOREPLACE) {
+	/* WHITEOUT/unknown bits and NOREPLACE|EXCHANGE remain unsupported. */
+	if ((flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE)) ||
+	    (flags & RENAME_NOREPLACE && flags & RENAME_EXCHANGE)) {
 		pr_warn("kestrelfs: rename flags 0x%x not supported\n", flags);
 		return -EINVAL;
 	}
 	static_assert(RENAME_NOREPLACE == KESTRELFS_RENAME_NOREPLACE);
+	static_assert(RENAME_EXCHANGE == KESTRELFS_RENAME_EXCHANGE);
+	if (exchange && !replaced)
+		return -ENOENT;
 
 	/* Validate the per-name ABI limit and combined bounce-buffer budget. */
 	if (old_name_len > KESTRELFS_RENAME_DATA_NAME_MAX) {
@@ -651,8 +656,8 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
 		return -ENAMETOOLONG;
 	/* A NOREPLACE request must leave cache state untouched on EEXIST. */
-	if (replaced && replaced != d_inode(old_dentry) &&
-	    !(flags & RENAME_NOREPLACE) && S_ISREG(replaced->i_mode)) {
+	if (replaced && replaced != d_inode(old_dentry) && flags == 0 &&
+	    S_ISREG(replaced->i_mode)) {
 		replaced_state = replaced->i_private;
 		if (!replaced_state)
 			return -EIO;
@@ -662,8 +667,8 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 		defer_reclaim = replaced->i_nlink == 1 &&
 			replaced_state->open_handles > 0;
 	}
-	if (replaced && replaced != d_inode(old_dentry) &&
-	    !(flags & RENAME_NOREPLACE) && !defer_reclaim) {
+	if (replaced && replaced != d_inode(old_dentry) && flags == 0 &&
+	    !defer_reclaim) {
 		ret = kestrelfs_cache_invalidate_inode(replaced->i_ino);
 		if (ret)
 			goto out_unlock_lifecycle;
@@ -708,24 +713,42 @@ out_unlock:
 	pr_info("kestrelfs: rename success\n");
 
 	/* Update VFS metadata. VFS performs the dentry move after this callback. */
-	if (d_really_is_positive(new_dentry) &&
-	    d_inode(new_dentry) != d_inode(old_dentry)) {
-		if (target_is_dir)
-			clear_nlink(replaced);
-		else
-			drop_nlink(replaced);
-		inode_set_ctime_current(replaced);
-	}
-	if (old_dir == new_dir) {
-		if (target_is_dir)
-			drop_nlink(old_dir);
+	if (exchange) {
+		/* Both inodes survive. Only cross-parent mixed-type exchanges change
+		 * the parents' immediate-subdirectory counts. Linux permits exchanging
+		 * a directory and a non-directory when both paths exist.
+		 */
+		if (old_dir != new_dir && source_is_dir != target_is_dir) {
+			if (source_is_dir) {
+				drop_nlink(old_dir);
+				inc_nlink(new_dir);
+			} else {
+				inc_nlink(old_dir);
+				drop_nlink(new_dir);
+			}
+		}
+		if (replaced)
+			inode_set_ctime_current(replaced);
 	} else {
-		if (source_is_dir)
-			drop_nlink(old_dir);
-		if (source_is_dir && !target_is_dir)
-			inc_nlink(new_dir);
-		else if (!source_is_dir && target_is_dir)
-			drop_nlink(new_dir);
+		if (d_really_is_positive(new_dentry) &&
+		    d_inode(new_dentry) != d_inode(old_dentry)) {
+			if (target_is_dir)
+				clear_nlink(replaced);
+			else
+				drop_nlink(replaced);
+			inode_set_ctime_current(replaced);
+		}
+		if (old_dir == new_dir) {
+			if (target_is_dir)
+				drop_nlink(old_dir);
+		} else {
+			if (source_is_dir)
+				drop_nlink(old_dir);
+			if (source_is_dir && !target_is_dir)
+				inc_nlink(new_dir);
+			else if (!source_is_dir && target_is_dir)
+				drop_nlink(new_dir);
+		}
 	}
 	if (d_really_is_positive(old_dentry)) {
 		struct inode *inode = d_inode(old_dentry);

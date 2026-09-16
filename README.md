@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 37 chmod 已验收；下一步 Step 38 POSIX-EXCHANGE；IPC ABI v16；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 38 `RENAME_EXCHANGE` 已验收；下一步 Step 39 POSIX-CHOWN；IPC ABI v17；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -36,10 +36,10 @@
 > daemon→kernel ioctl 保守清空本地 cache，形成远端 mutation 最小闭环。
 > Step 36 已以显式 open 计数、nlink=0 orphan 与 last-close GC 支持
 > open-unlink。Step 37已通过 `OP_SETATTR` 补齐文件/目录持久 chmod，并支持
-> retained orphan 的 fchmod（已验收；chown/完整时间属性仍未实现）。
-> `EXCHANGE`/`WHITEOUT`、真正的异步 completion
-> 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
-> `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
+> retained orphan 的 fchmod（已验收）。Step 38 已支持原子 `RENAME_EXCHANGE`
+> （文件、目录及 Linux 允许的混合类型交换）。chown/完整时间属性、`WHITEOUT`、
+> 真正的异步 completion 流水线与生产级一致性 lease/pubsub 尚未实现。详见
+> [路线图](#路线图)、`HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
 
@@ -138,7 +138,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–37 已验收；下一步 Step 38 POSIX-EXCHANGE（ABI v16 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–38 已验收；下一步 Step 39 POSIX-CHOWN（ABI v17 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -153,7 +153,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（工作树 ABI v16）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（工作树 ABI v17）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -169,6 +169,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
 ├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
 ├── test-step37-posix-chmod.c          # open-unlink fchmod 测试助手
+├── test-step38-posix-exchange-vng.sh  # EXCHANGE、失败原子性、缓存与重启回归
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -437,13 +438,14 @@ offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 Ki
 
 Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
 truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链接，Step 33
-支持 `RENAME_NOREPLACE`；Step 34 支持 create/mkdir mode 与
+支持 `RENAME_NOREPLACE`，Step 38 支持与其互斥的原子 `RENAME_EXCHANGE`；
+Step 34 支持 create/mkdir mode 与
 `2 + 直接子目录数` 的持久化目录 nlink。仍缺：
 
 - Step 36 已支持 open-unlink 与 last-close GC；若最终 close 时 daemon
   不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37已实现
   文件/目录持久 chmod；chown、完整时间属性与 mode+size 单事务仍未实现。
-  symlink 目标目前要求 UTF-8，最长 4095 字节。
+  `RENAME_WHITEOUT` 仍返回 `EINVAL`；symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
 - 数据/名字 IPC 由一把全局 mutex 串行化。
