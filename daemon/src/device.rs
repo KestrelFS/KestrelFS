@@ -230,6 +230,38 @@ impl KestrelDevice {
         Ok(())
     }
 
+    /// Durably retires cache entries for a bounded set of inode ids. The
+    /// Redis coherence poller uses one ioctl per successfully enumerated
+    /// revision window; the kernel serializes the entire batch against cache
+    /// hits, fills, local invalidation, and eviction.
+    pub fn invalidate_cache_inodes(&self, inode_ids: &[u64]) -> io::Result<()> {
+        if inode_ids.is_empty() || inode_ids.len() > ioctl::CACHE_INVALIDATE_INODES_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache inode invalidation batch must contain 1..=64 ids",
+            ));
+        }
+        let mut request = ioctl::CacheInvalidateInodes {
+            count: inode_ids.len() as u32,
+            ..Default::default()
+        };
+        request.inode_ids[..inode_ids.len()].copy_from_slice(inode_ids);
+        // SAFETY: `self.fd` is live and INVALIDATE_CACHE_INODES is an `_IOW`
+        // command whose 520-byte C layout is pinned by Rust/C compile-time
+        // assertions. `request` remains live and immutable for the call.
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd,
+                ioctl::INVALIDATE_CACHE_INODES as _,
+                &request as *const ioctl::CacheInvalidateInodes,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Returns the raw file descriptor, for use in a `libc::pollfd`
     /// (see `main.rs`'s event loop).
     pub fn as_raw_fd(&self) -> RawFd {

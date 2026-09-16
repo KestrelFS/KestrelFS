@@ -33,6 +33,8 @@ const DIR_NONE: u32 = 0;
 /// Mirrors `_IOC_READ` ("userland is reading, kernel is writing" - i.e.
 /// this is a `copy_to_user()` on the kernel side).
 const DIR_READ: u32 = 2;
+/// Mirrors `_IOC_WRITE` (userspace writes an argument copied by the kernel).
+const DIR_WRITE: u32 = 1;
 
 /// Mirrors the generic `_IOC(dir, type, nr, size)` macro.
 const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> libc::c_ulong {
@@ -49,6 +51,11 @@ const fn io(ty: u32, nr: u32) -> libc::c_ulong {
 /// side, i.e. userspace is *reading* the result).
 const fn ior(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
     ioc(DIR_READ, ty, nr, size)
+}
+
+/// Mirrors the generic `_IOW(type, nr, size)` macro.
+const fn iow(ty: u32, nr: u32, size: u32) -> libc::c_ulong {
+    ioc(DIR_WRITE, ty, nr, size)
 }
 
 /// Mirrors `KESTRELFS_IOC_MAGIC` (0xE0).
@@ -78,6 +85,34 @@ pub const GET_REGION_SIZE: libc::c_ulong = ior(MAGIC, 3, 8);
 /// miss after the shared metadata revision changes.
 pub const INVALIDATE_CACHE_ALL: libc::c_ulong = io(MAGIC, 4);
 
+/// Maximum inode ids carried by one fine-grained coherence ioctl.
+pub const CACHE_INVALIDATE_INODES_MAX: usize = 64;
+
+/// Mirrors `struct kestrelfs_cache_invalidate_inodes` exactly.
+#[repr(C)]
+pub struct CacheInvalidateInodes {
+    pub count: u32,
+    pub reserved: u32,
+    pub inode_ids: [u64; CACHE_INVALIDATE_INODES_MAX],
+}
+
+impl Default for CacheInvalidateInodes {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            reserved: 0,
+            inode_ids: [0; CACHE_INVALIDATE_INODES_MAX],
+        }
+    }
+}
+
+/// Mirrors `KESTRELFS_IOC_INVALIDATE_CACHE_INODES` (`_IOW`, nr 5).
+pub const INVALIDATE_CACHE_INODES: libc::c_ulong =
+    iow(MAGIC, 5, std::mem::size_of::<CacheInvalidateInodes>() as u32);
+
+const _: () = assert!(std::mem::size_of::<CacheInvalidateInodes>() == 520);
+const _: () = assert!(std::mem::offset_of!(CacheInvalidateInodes, inode_ids) == 8);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +129,32 @@ mod tests {
         assert_eq!(GET_ABI_VERSION, 0x8004e002);
         assert_eq!(GET_REGION_SIZE, 0x8008e003);
         assert_eq!(INVALIDATE_CACHE_ALL, 0xe004);
+        assert_eq!(INVALIDATE_CACHE_INODES, 0x4208e005);
+        assert_eq!(std::mem::size_of::<CacheInvalidateInodes>(), 520);
+        assert_eq!(std::mem::offset_of!(CacheInvalidateInodes, inode_ids), 8);
+    }
+
+    #[test]
+    fn inode_invalidation_argument_encodes_at_pinned_offsets() {
+        let mut request = CacheInvalidateInodes {
+            count: 2,
+            ..Default::default()
+        };
+        request.inode_ids[..2].copy_from_slice(&[0x1122_3344_5566_7788, 99]);
+        // SAFETY: `request` is a live plain C-layout value and the byte slice
+        // is limited to its exact size. The test only reads those bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&request as *const CacheInvalidateInodes).cast::<u8>(),
+                std::mem::size_of::<CacheInvalidateInodes>(),
+            )
+        };
+        assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(u64::from_ne_bytes(bytes[16..24].try_into().unwrap()), 99);
     }
 }

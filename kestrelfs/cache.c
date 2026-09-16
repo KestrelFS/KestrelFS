@@ -267,6 +267,18 @@ module_param_named(cache_coherence_invalidations,
 MODULE_PARM_DESC(cache_coherence_invalidations,
 		 "successful daemon-requested full cache invalidations");
 
+static unsigned long kestrelfs_cache_coherence_inode_batches;
+module_param_named(cache_coherence_inode_batches,
+		   kestrelfs_cache_coherence_inode_batches, ulong, 0444);
+MODULE_PARM_DESC(cache_coherence_inode_batches,
+		 "successful daemon-requested bounded inode invalidation batches");
+
+static unsigned long kestrelfs_cache_coherence_inode_entries;
+module_param_named(cache_coherence_inode_entries,
+		   kestrelfs_cache_coherence_inode_entries, ulong, 0444);
+MODULE_PARM_DESC(cache_coherence_inode_entries,
+		 "cache entries retired by bounded inode coherence invalidations");
+
 static char kestrelfs_cache_holder;
 static struct file *kestrelfs_cache_file;
 static struct block_device *kestrelfs_cache_bdev;
@@ -1859,6 +1871,76 @@ int kestrelfs_cache_invalidate_inode(u64 inode_id)
 	return ret;
 }
 
+int kestrelfs_cache_invalidate_inodes(const u64 *inode_ids, u32 count)
+{
+	struct kestrelfs_cache_disk_index_entry old_entry;
+	struct kestrelfs_cache_disk_index_entry empty = { 0 };
+	struct kestrelfs_cache_index_entry *entry, *tmp;
+	unsigned long invalidated = 0;
+	u32 index;
+	int ret = 0;
+
+	if (!count || count > KESTRELFS_CACHE_INVALIDATE_INODES_MAX)
+		return -EINVAL;
+	if (!READ_ONCE(kestrelfs_cache_index_ready))
+		return 0;
+	if (down_write_killable(&kestrelfs_cache_lock))
+		return -EINTR;
+	if (!++kestrelfs_cache_mutation_epoch)
+		kestrelfs_cache_mutation_epoch = 1;
+
+	list_for_each_entry_safe(entry, tmp, &kestrelfs_cache_entries, list) {
+		bool match = false;
+
+		for (index = 0; index < count; index++) {
+			if (entry->key.inode_id == inode_ids[index]) {
+				match = true;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+		kestrelfs_cache_entry_to_disk(entry, &old_entry);
+		ret = kestrelfs_cache_journal_replace(
+			KESTRELFS_CACHE_JOURNAL_INVALIDATE, entry->slot,
+			&old_entry, &empty);
+		if (ret)
+			break;
+		if (entry->hashed)
+			rhashtable_remove_fast(&kestrelfs_cache_index, &entry->node,
+					       kestrelfs_cache_index_params);
+		__clear_bit(entry->slot, kestrelfs_cache_slots);
+		list_del(&entry->list);
+		kfree(entry);
+		invalidated++;
+	}
+
+	if (ret) {
+		/* A remote mutation is already authoritative: fail closed. */
+		list_for_each_entry_safe(entry, tmp, &kestrelfs_cache_entries,
+					 list) {
+			if (entry->hashed)
+				rhashtable_remove_fast(&kestrelfs_cache_index,
+					&entry->node,
+					kestrelfs_cache_index_params);
+			list_del(&entry->list);
+			kfree(entry);
+		}
+		rhashtable_destroy(&kestrelfs_cache_index);
+		WRITE_ONCE(kestrelfs_cache_index_ready, false);
+		pr_err("kestrelfs: inode coherence invalidation failed after %lu entries: %d; cache disabled\n",
+		       invalidated, ret);
+	} else {
+		kestrelfs_cache_coherence_inode_batches++;
+		kestrelfs_cache_coherence_inode_entries += invalidated;
+		pr_info("kestrelfs: inode coherence invalidation retired %lu entries for %u inodes\n",
+			invalidated, count);
+	}
+
+	up_write(&kestrelfs_cache_lock);
+	return ret;
+}
+
 int kestrelfs_cache_invalidate_all(void)
 {
 	struct kestrelfs_cache_disk_index_entry old_entry;
@@ -1948,6 +2030,8 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_active_hit_readers = 0;
 	kestrelfs_cache_parallel_hit_peak = 0;
 	kestrelfs_cache_coherence_invalidations = 0;
+	kestrelfs_cache_coherence_inode_batches = 0;
+	kestrelfs_cache_coherence_inode_entries = 0;
 	kestrelfs_cache_journal_sequence = 0;
 	kestrelfs_cache_journal_active = false;
 	ret = kestrelfs_cache_parse_namespace();
@@ -1992,7 +2076,7 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	down_write(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu eviction_batches=%lu eviction_batch_slots=%lu eviction_index_writes=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu coherence_invalidations=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu eviction_batches=%lu eviction_batch_slots=%lu eviction_index_writes=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu coherence_invalidations=%lu coherence_inode_batches=%lu coherence_inode_entries=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
@@ -2003,7 +2087,9 @@ void kestrelfs_cache_exit(void)
 		kestrelfs_cache_checksum_failures,
 		kestrelfs_cache_journal_recoveries,
 		kestrelfs_cache_parallel_hit_peak,
-		kestrelfs_cache_coherence_invalidations);
+		kestrelfs_cache_coherence_invalidations,
+		kestrelfs_cache_coherence_inode_batches,
+		kestrelfs_cache_coherence_inode_entries);
 	kestrelfs_cache_free_index();
 	if (kestrelfs_cache_file) {
 		bdev_fput(kestrelfs_cache_file);

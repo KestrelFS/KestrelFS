@@ -90,6 +90,18 @@ metadata mutation 都会原子递增 durable `control.revision`；daemon 启动�
 ABI v13 bump 到 v14。这个方案用粗粒度和轮询延迟换取不依赖易丢事件的 durable
 检测，不是生产级 lease 或按 inode/range pub/sub。
 
+Step 42 在上述全量回退之上增加 durable 细粒度路径。Redis v2 每次成功 Lua mutation
+除 revision-CAS 和字段 diff 外，还在 `<prefix>:meta:v2:dirty` HASH 中以新 revision
+为 field 原子写入排序去重后的 inode 列表。每条最多 64 inode，并只保留最近 256 个
+revision；这是一份多 reader 可独立消费的 revision log，不是由首个 daemon 全局清空
+的集合，因此多个 daemon 不会互相丢失通知。各 daemon 的成功 probe 游标等价于清空
+自己的待处理集合。probe 合并 `(observed,current]`：历史完整且累计不超过 64 时经 ABI
+v20 `KESTRELFS_IOC_INVALIDATE_CACHE_INODES` 在一次 cache rwsem 写侧临界区退休相关
+inode；任一记录缺失/损坏、单记录 overflow、revision gap 超过 256、累计超过 64 或
+Redis probe 失败，都保留 ABI v14 的 invalidate-all 路径 fail closed。远端提交到
+100 ms probe 前的最终一致窗口仍存在；没有 lease/pubsub 或 range 级消息。共享内存、
+opcode 与 cache format v4 均未改变。
+
 ## 缓存设备
 
 缓存后端必须是 Linux 块设备节点，例如：
@@ -148,9 +160,10 @@ dataset 时必须使用不同 digest。
 同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。六个只读
 观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks`、
 `cache_direct_fallbacks`、`cache_evictions`、`cache_checksum_failures` 和
-`cache_journal_recoveries` 可从 sysfs 读取；Step 35 另有
-`cache_coherence_invalidations` 记录成功的 daemon 全失效次数。它们都不是稳定用户
-ABI。
+`cache_journal_recoveries` 可从 sysfs 读取；Step 35/42 另有
+`cache_coherence_invalidations` 记录成功的 daemon 全失效次数，
+`cache_coherence_inode_batches` / `cache_coherence_inode_entries` 记录细粒度批次与
+实际退休 entry 数。它们都不是稳定用户 ABI。
 
 `cache_evict_batch` 默认为 16，合法范围 1–64；实际单批还限制为总槽位的 1/16
 （至少 1），避免小 cache 被一次扫空。`cache_eviction_batches`、
@@ -336,10 +349,10 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
-- Step 35 能发现其他节点或直接 Redis mutation 对 durable revision 的推进，但它是
-  每 100 ms 轮询后的保守全 cache 失效：远端提交到下一次 probe 前仍可能读到旧
-  hit，daemon 离线期间也没有 lease/通知，因此还不是线性一致的共享 Redis+S3
-  多节点缓存。尚无按 inode/range 精细消息或生产级 pub/sub/reconnect 运维。
+- Step 42 能以有界 durable dirty log 将正常 Redis mutation 收窄到 inode 批量失效，
+  但仍每 100 ms 轮询：远端提交到下一次 probe 前可能读到旧 hit，daemon 离线期间
+  也没有 lease/通知，因此还不是线性一致的共享 Redis+S3 多节点缓存。历史缺失或
+  超限会全量失效；尚无 range 级消息或生产级 pub/sub/reconnect 运维。
 - v1/v2/v3 cache 默认拒绝且不自动迁移；没有自动或模块参数 wipe。Step 27 仅提供
   离线、块设备专用、双确认的 metadata wipe。
 - exclusive holder 防止其他内核 holder 抢占设备，但不能在所有内核配置下阻止

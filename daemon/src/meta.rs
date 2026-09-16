@@ -113,6 +113,33 @@ pub const RENAME_NOREPLACE: u32 = 1;
 /// matches Linux `RENAME_EXCHANGE`.
 pub const RENAME_EXCHANGE: u32 = 2;
 
+/// Result of probing a shared MetaStore for cache-coherence changes after a
+/// previously observed durable revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoherenceProbe {
+    /// This backend is process-local and needs no remote coherence polling.
+    Disabled,
+    /// No mutation occurred after the supplied revision.
+    Unchanged { revision: u64 },
+    /// Every intervening mutation was enumerated and these inode caches must
+    /// be retired before advancing the caller's revision cursor.
+    Inodes { revision: u64, inode_ids: Vec<u64> },
+    /// The intervening dirty set could not be enumerated safely; retire the
+    /// complete local cache before advancing the revision cursor.
+    Full { revision: u64 },
+}
+
+impl CoherenceProbe {
+    pub fn revision(&self) -> Option<u64> {
+        match self {
+            Self::Disabled => None,
+            Self::Unchanged { revision }
+            | Self::Inodes { revision, .. }
+            | Self::Full { revision } => Some(*revision),
+        }
+    }
+}
+
 /// `MetaStore` - async abstraction over the POSIX metadata backing
 /// store.
 ///
@@ -367,11 +394,12 @@ pub trait MetaStore: Send + Sync {
     /// form an at-least-once, crash-safe protocol.
     async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()>;
 
-    /// Returns a backend-wide durable mutation revision when this MetaStore is
-    /// shared between daemons. `None` means no remote-coherence polling is
-    /// required (the in-memory and local-file backends are process-local).
-    async fn coherence_revision(&self) -> Result<Option<u64>> {
-        Ok(None)
+    /// Reports shared-backend mutations after `observed_revision`. Process-
+    /// local implementations return [`CoherenceProbe::Disabled`]. A shared
+    /// backend must return [`CoherenceProbe::Full`] whenever it cannot prove
+    /// that its inode list covers every intervening mutation.
+    async fn coherence_probe(&self, _observed_revision: Option<u64>) -> Result<CoherenceProbe> {
+        Ok(CoherenceProbe::Disabled)
     }
 }
 
@@ -1833,7 +1861,10 @@ mod tests {
 
     #[tokio::test]
     async fn process_local_store_does_not_request_remote_coherence_polling() {
-        assert_eq!(MemStore::new().coherence_revision().await.unwrap(), None);
+        assert_eq!(
+            MemStore::new().coherence_probe(None).await.unwrap(),
+            CoherenceProbe::Disabled
+        );
     }
 
     #[tokio::test]

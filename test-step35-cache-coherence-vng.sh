@@ -141,16 +141,17 @@ start_daemon
 busybox mount -t kestrelfs none "$mnt"
 
 coherence_counter=/sys/module/kestrelfs/parameters/cache_coherence_invalidations
+inode_coherence_counter=/sys/module/kestrelfs/parameters/cache_coherence_inode_batches
 test "$(cat "$coherence_counter")" -ge 1
 
 # The local write advances Redis revision. Wait for that revision to be
 # observed (which conservatively clears the startup/write-era cache), then
 # warm one current entry and prove the second read is a real kernel hit.
-before_local=$(cat "$coherence_counter")
+before_local=$(cat "$inode_coherence_counter")
 cp "$expected_old" "$mnt/coherence-data.bin"
 local_revision=$(redis_cmd HGET "$prefix:meta:v2:control" revision)
-wait_for_counter_gt "$coherence_counter" "$before_local"
-wait_for_log "-> $local_revision; local cache invalidated"
+wait_for_counter_gt "$inode_coherence_counter" "$before_local"
+wait_for_log "-> $local_revision; invalidated"
 cat "$mnt/coherence-data.bin" >"$actual"
 cmp "$expected_old" "$actual"
 hits_before=$(cache_hits)
@@ -194,7 +195,7 @@ commit_result=$(redis_cmd EVAL "$remote_commit" 3 \
 	"$slice_field" "$new_slices")
 test "$commit_result" = 1
 wait_for_counter_gt "$coherence_counter" "$counter_before_remote"
-wait_for_log "coherence revision $old_revision -> $new_revision; local cache invalidated"
+wait_for_log "coherence revision $old_revision -> $new_revision; dirty history unavailable/overflowed, full local cache invalidated"
 echo 'STEP35_REMOTE_REVISION_INVALIDATE_PASS'
 
 # The first post-invalidation read must miss and fetch B through READ_DATA;

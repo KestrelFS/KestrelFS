@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 41 已验收；人类决定后续优先内核 VFS/数据面。Step 42 COHERENCE-FINE 工作树实现暂缓验收（PARKED）。下一步见 `docs/remaining-capabilities.md` §8（Step 43 KERNEL-WRITE-ITER）。
+> **最后更新**：Step 42 COHERENCE-FINE（细粒度 cache 失效）已由 Cursor 验收并纳入本提交（IPC ABI v20、cache format v4）。后续内核优先；下一步见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 41 已验收；Step 42 PARKED；下一步内核优先 Step 43 = KERNEL-WRITE-ITER（见 remaining-capabilities §8） |
+| 当前阶段 | Step 42 COHERENCE-FINE 已验收；下一步内核优先 Step 43 = KERNEL-WRITE-ITER（见 remaining-capabilities §8） |
 
 ---
 
@@ -58,9 +58,9 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 待验收实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 待验收的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无 page-cache/readahead/splice 全覆盖、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -190,7 +190,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/控制面 Step 39** | **文件/目录持久 chown；原子 mode/uid/gid setattr；orphan fchown** | **18** | **✅ 已验收** |
 | **Phase 4/控制面 Step 40** | **显式 atime/mtime；文件/目录重启恢复；orphan futimens** | **19** | **✅ 已验收** |
 | **Phase 4/数据面 Step 41** | **有界 GC delete worker + ObjectStore 长度完整性** | **19（未变）** | **✅ 已验收** |
-| **Phase 4/控制面 Step 42** | **Redis revision 有界 dirty-inode 日志 + 批量 inode cache 失效 + 全量回退** | **20** | **⏳ 待 Cursor 验收** |
+| **Phase 4/控制面 Step 42** | **Redis revision 有界 dirty-inode 日志 + 批量 inode cache 失效 + 全量回退** | **20** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -222,10 +222,12 @@ ABI v19 秒级 atime/mtime + `GETATTR_TIMES`；basic/time layout 互斥。ABI **
 Cursor 对照代码与 191 tests 确认 Step 41 已验收。
 有界 GC delete worker + ObjectStore 长度完整性；IPC ABI **v19** 未变；format **v4**。
 
-Codex 已完成 **Step 42 COHERENCE-FINE**，待 Cursor 对照代码、193 tests、Redis 门控测与
-`STEP42_COHERENCE_FINE_PASS` 验收。实现汇报在 `docs/remaining-capabilities.md` §9。
+Cursor 对照代码、193 tests 与 `STEP42_COHERENCE_FINE_PASS` 确认 Step 42 已验收。
+ABI v20 批量 inode 失效 + Redis dirty log；失败回退全量。ABI **v20**；format **v4**。
 
-> **当前工作树 ABI**：`KESTRELFS_ABI_VERSION = 20`（新增批量 inode cache invalidation ioctl）；cache format 仍为 v4
+下一步：**Step 43 KERNEL-WRITE-ITER**（内核优先），提示词在 `docs/remaining-capabilities.md` §8。
+
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 20`（含 `INVALIDATE_CACHE_INODES`）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -345,7 +347,7 @@ Codex 已完成 **Step 42 COHERENCE-FINE**，待 Cursor 对照代码、193 tests
 | 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 28 已用 `read_iter` / `iov_iter` 覆盖普通 read/pread/readv/preadv。完整、对齐且位于单个当前用户 iovec 段的连续 4 KiB blocks 最多合并 128 KiB 并直达 pinned pages；跨段、partial/unaligned、kernel-backed iter 或 GUP/BIO 构造失败仍走同步 BIO + `copy_to_iter`。没有真正异步 completion、跨 iovec scatter-gather BIO、page-cache/readahead 或 splice 全覆盖；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
 | 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前 v4 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2/v3 不自动迁移；Step 27 工具只提供显式 metadata wipe。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
-| 27 | **远端 cache coherence 仍是最终一致原型** | Step 42 在 Redis 模式每 100 ms 轮询 revision，并用最近 256 revision 的 durable dirty log 把正常变化收窄为最多 64 inode 的 ABI v20 批量失效；记录缺失/损坏、溢出、累计超限或 probe 失败仍全量 fail closed，daemon 启动也先全量清理恢复索引。提交到下一次 probe 前仍有短暂旧 hit 窗口，daemon 离线期间没有 lease，尚无 range/pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
+| 27 | **远端 cache coherence 仍是最终一致原型** | Step 42 用最近 256 revision 的 durable dirty log 将正常变化收窄为最多 64 inode 的 ABI v20 批量失效；记录缺失/损坏、溢出、累计超限或 probe 失败仍全量 fail closed。提交到下一次 probe 前仍有短暂旧 hit 窗口，daemon 离线期间没有 lease，尚无 range/pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
 | 28 | **batch block-LRU 热度仍只在内存** | Step 29 默认一次退休 16 个 LRU victim（至多总槽位 1/16），用一份 journal 并按 index page 合并清零；连续 fill 可消费预回收槽位，MRU 尾部受到小批量保护。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后仍按 generation 恢复 insertion-order 近似。没有分区配额/租户热点隔离；victim 分散时仍需每个 index page 一次同步写，fill/invalidate 仍逐次 journal。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
 
@@ -371,7 +373,7 @@ cd daemon && cargo build --release
 
 ```bash
 cd daemon
-cargo test                    # 单元测试 + 集成测试（Step 42 待验收工作树 193 个）
+cargo test                    # 单元测试 + 集成测试（Step 42 验收基线 193 个）
 cargo clippy --all-targets -- -D warnings   # 零警告
 ```
 
@@ -1429,7 +1431,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 insmod/mount/zvol。Codex 另报告真实 MinIO 门控 `2 passed`；见
 `docs/remaining-capabilities.md` §9。
 
-### 7.36 Phase 4/控制面 Step 42 COHERENCE-FINE（待验收）
+### 7.36 Phase 4/控制面 Step 42 COHERENCE-FINE
 
 Redis v2 mutation 现在把排序去重的 dirty inode 与 revision-CAS、metadata diff 放在同一
 Lua 事务，写入 `<prefix>:meta:v2:dirty`。单 revision 最多 64 inode，保留最近 256 个
@@ -1440,7 +1442,7 @@ mutation epoch 下逐条用 v4 journal 退休匹配 entry。持久化失败会�
 cache。记录缺失/损坏、overflow、gap 超过 256、累计超限或 probe 失败均回退
 `INVALIDATE_CACHE_ALL`；共享内存/opcode 与 cache format v4 不变。
 
-Codex 自检（待 Cursor 复核）：默认 Rust tests `193 passed`；真实 Redis 门控测试
+Cursor 验收自检（2026-09-16）：默认 Rust tests `193 passed`；clippy/make 干净。vng：
 `1 passed`；clippy/make 结果见 `docs/remaining-capabilities.md` §9。专项 vng + loop 输出
 `STEP42_UNCHANGED_INODE_HIT_PASS`、`STEP42_CHANGED_INODE_INVALIDATED_PASS`、
 `STEP42_FAILURE_FALLBACK_ALL_PASS`、`STEP42_COHERENCE_FINE_PASS`，umount 22 ms。
@@ -1456,8 +1458,8 @@ Codex 自检（待 Cursor 复核）：默认 Rust tests `193 passed`；真实 Re
 |---|---|---|
 | 1 | **内核优先战略** | 后续以 VFS/数据面为主；见 remaining-capabilities §2 |
 | 2 | **Step 43 KERNEL-WRITE-ITER** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | **Step 42 COHERENCE-FINE** | 工作树已实现但 **PARKED**（暂缓验收） |
-| 4 | 其后内核 | fsync → aops/page cache → mmap → locks → cache-async |
+| 3 | 其后内核 | fsync → aops/page cache → mmap → locks → cache-async |
+| 4 | 其它 | WHITEOUT、DIST-IO、CACHE-WRITE… |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
 
@@ -1511,12 +1513,13 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 41 DIST-OBJECT 已由 Cursor 验收并提交
-- [x] 当前工作树 IPC ABI = 20；cache format = v4（未变）
-- [x] Step 8–40 + Step 41 已验收状态已写清
-- [x] Step 42 COHERENCE-FINE 已实现并待 Cursor 验收（`docs/remaining-capabilities.md` §9）
+- [x] Step 42 COHERENCE-FINE 已由 Cursor 验收并提交
+- [x] IPC ABI = 20；cache format = v4
+- [x] Step 8–41 + Step 42 已验收状态已写清
+- [x] 下一步明确：内核优先 Step 43 KERNEL-WRITE-ITER（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
+
 
 
 

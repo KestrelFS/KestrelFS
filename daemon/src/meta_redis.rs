@@ -12,15 +12,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::fs_model::{Inode, Slice, S_IFDIR};
-use crate::meta::{MemStore, MetaError, MetaStore, Result};
+use crate::meta::{CoherenceProbe, MemStore, MetaError, MetaStore, Result};
 use crate::meta_persist::MetaSnapshot;
 
 const LEGACY_SNAPSHOT_KEY_SUFFIX: &str = "meta:v1";
 const SCHEMA_VERSION: &str = "2";
 const MAX_CAS_RETRIES: usize = 64;
+const COHERENCE_DIRTY_INODE_MAX: usize = 64;
+const COHERENCE_REVISION_WINDOW: u64 = 256;
 
 const INIT_SCRIPT: &str = r#"
 local function apply_hash(key, sets, dels)
@@ -32,7 +34,7 @@ local function apply_hash(key, sets, dels)
     end
 end
 
-if redis.call('EXISTS', KEYS[7]) ~= 0 then
+if redis.call('EXISTS', KEYS[8]) ~= 0 then
     return -1
 end
 
@@ -44,7 +46,7 @@ if schema then
     return 0
 end
 
-for index = 1, 6 do
+for index = 1, 7 do
     if redis.call('EXISTS', KEYS[index]) ~= 0 then
         return -3
     end
@@ -104,6 +106,11 @@ end
 redis.call('HSET', KEYS[1],
     'revision', ARGV[3],
     'next_inode_id', ARGV[4])
+redis.call('HSET', KEYS[7], ARGV[3], ARGV[6])
+local expired = tonumber(ARGV[3]) - tonumber(ARGV[7])
+if expired >= 1 then
+    redis.call('HDEL', KEYS[7], tostring(expired))
+end
 return 1
 "#;
 
@@ -120,6 +127,38 @@ if revision == ARGV[2] then
     return 1
 end
 return 0
+"#;
+
+const COHERENCE_PROBE_SCRIPT: &str = r#"
+local schema = redis.call('HGET', KEYS[1], 'schema_version')
+if not schema or schema ~= ARGV[1] then
+    return {'error', '-1'}
+end
+local current_text = redis.call('HGET', KEYS[1], 'revision')
+local current = tonumber(current_text)
+if not current then
+    return {'error', '-2'}
+end
+if ARGV[2] == '' then
+    return {'full', current_text}
+end
+local observed = tonumber(ARGV[2])
+local window = tonumber(ARGV[3])
+if not observed or observed > current or current - observed > window then
+    return {'full', current_text}
+end
+if observed == current then
+    return {'unchanged', current_text}
+end
+local result = {'records', current_text}
+for revision = observed + 1, current do
+    local record = redis.call('HGET', KEYS[2], tostring(revision))
+    if not record then
+        return {'full', current_text}
+    end
+    table.insert(result, record)
+end
+return result
 "#;
 
 /// Errors that prevent constructing a Redis metadata backend.
@@ -149,6 +188,7 @@ struct RedisKeys {
     slices: String,
     symlinks: String,
     garbage: String,
+    dirty: String,
     legacy_snapshot: String,
 }
 
@@ -162,11 +202,12 @@ impl RedisKeys {
             slices: format!("{base}:slices"),
             symlinks: format!("{base}:symlinks"),
             garbage: format!("{base}:gc"),
+            dirty: format!("{base}:dirty"),
             legacy_snapshot: format!("{prefix}:{LEGACY_SNAPSHOT_KEY_SUFFIX}"),
         }
     }
 
-    fn data_keys(&self) -> [&str; 6] {
+    fn data_keys(&self) -> [&str; 7] {
         [
             &self.control,
             &self.inodes,
@@ -174,6 +215,7 @@ impl RedisKeys {
             &self.slices,
             &self.symlinks,
             &self.garbage,
+            &self.dirty,
         ]
     }
 }
@@ -279,6 +321,12 @@ struct RedisPatch {
     gc_del: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct DirtyRecord {
+    overflow: bool,
+    inode_ids: Vec<u64>,
+}
+
 impl RedisPatch {
     fn initial(snapshot: &MetaSnapshot) -> std::result::Result<Self, serde_json::Error> {
         Ok(Self::between(
@@ -319,6 +367,55 @@ impl RedisPatch {
             && self.symlinks_del.is_empty()
             && self.gc_add.is_empty()
             && self.gc_del.is_empty()
+    }
+
+    fn dirty_record(&self) -> DirtyRecord {
+        let mut inode_ids = std::collections::BTreeSet::new();
+        for field in self
+            .inodes_set
+            .iter()
+            .map(|(field, _)| field)
+            .chain(self.inodes_del.iter())
+        {
+            match field.parse::<u64>() {
+                Ok(inode_id) => {
+                    inode_ids.insert(inode_id);
+                }
+                Err(_) => {
+                    return DirtyRecord {
+                        overflow: true,
+                        inode_ids: Vec::new(),
+                    };
+                }
+            }
+        }
+        for field in self
+            .slices_set
+            .iter()
+            .map(|(field, _)| field)
+            .chain(self.slices_del.iter())
+        {
+            match parse_slice_field(field) {
+                Ok((inode_id, _)) => {
+                    inode_ids.insert(inode_id);
+                }
+                Err(_) => {
+                    return DirtyRecord {
+                        overflow: true,
+                        inode_ids: Vec::new(),
+                    };
+                }
+            }
+        }
+        let overflow = inode_ids.len() > COHERENCE_DIRTY_INODE_MAX;
+        DirtyRecord {
+            overflow,
+            inode_ids: if overflow {
+                Vec::new()
+            } else {
+                inode_ids.into_iter().collect()
+            },
+        }
     }
 }
 
@@ -475,6 +572,54 @@ impl RedisMetaStore {
         MetaError::Io
     }
 
+    #[cfg(test)]
+    async fn coherence_revision(&self) -> Result<Option<u64>> {
+        Ok(self.coherence_probe(None).await?.revision())
+    }
+
+    fn decode_coherence_response(response: &[String]) -> Result<CoherenceProbe> {
+        if response.len() < 2 {
+            return Err(Self::report_backend_error(
+                "coherence probe failed",
+                "short Redis response",
+            ));
+        }
+        let revision = response[1].parse::<u64>().map_err(|error| {
+            Self::report_backend_error("coherence probe revision invalid", error)
+        })?;
+        match response[0].as_str() {
+            "unchanged" if response.len() == 2 => Ok(CoherenceProbe::Unchanged { revision }),
+            "full" if response.len() == 2 => Ok(CoherenceProbe::Full { revision }),
+            "records" => {
+                let mut inode_ids = std::collections::BTreeSet::new();
+                for encoded in &response[2..] {
+                    let record: DirtyRecord = serde_json::from_str(encoded).map_err(|error| {
+                        Self::report_backend_error("coherence dirty record invalid", error)
+                    })?;
+                    if record.overflow {
+                        return Ok(CoherenceProbe::Full { revision });
+                    }
+                    inode_ids.extend(record.inode_ids);
+                    if inode_ids.len() > COHERENCE_DIRTY_INODE_MAX {
+                        return Ok(CoherenceProbe::Full { revision });
+                    }
+                }
+                Ok(CoherenceProbe::Inodes {
+                    revision,
+                    inode_ids: inode_ids.into_iter().collect(),
+                })
+            }
+            "error" => Err(Self::report_backend_error(
+                "coherence probe failed",
+                format_args!("invalid schema/status {}", response[1]),
+            )),
+            status => Err(Self::report_backend_error(
+                "coherence probe failed",
+                format_args!("unexpected response status {status:?}"),
+            )),
+        }
+    }
+
     fn parse_control(
         control: &HashMap<String, String>,
     ) -> std::result::Result<(u64, u64), RedisMetaStoreError> {
@@ -508,7 +653,7 @@ impl RedisMetaStore {
         let keys = self.keys.data_keys();
         let result: i32 = redis::cmd("EVAL")
             .arg(INIT_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(&keys)
             .arg(&self.keys.legacy_snapshot)
             .arg(SCHEMA_VERSION)
@@ -674,17 +819,21 @@ impl RedisMetaStore {
         })?;
         let encoded = serde_json::to_string(patch)
             .map_err(|error| Self::report_backend_error("patch encode failed", error))?;
+        let dirty = serde_json::to_string(&patch.dirty_record())
+            .map_err(|error| Self::report_backend_error("dirty record encode failed", error))?;
         let keys = self.keys.data_keys();
         let mut connection = self.connection.clone();
         let result: i32 = redis::cmd("EVAL")
             .arg(MUTATE_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(&keys)
             .arg(SCHEMA_VERSION)
             .arg(expected_revision)
             .arg(new_revision)
             .arg(next_inode_id)
             .arg(encoded)
+            .arg(dirty)
+            .arg(COHERENCE_REVISION_WINDOW)
             .query_async(&mut connection)
             .await
             .map_err(|error| Self::report_backend_error("mutation transaction failed", error))?;
@@ -1114,17 +1263,20 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
-    async fn coherence_revision(&self) -> Result<Option<u64>> {
+    async fn coherence_probe(&self, observed_revision: Option<u64>) -> Result<CoherenceProbe> {
         let mut connection = self.connection.clone();
-        let control: HashMap<String, String> = redis::cmd("HGETALL")
+        let response: Vec<String> = redis::cmd("EVAL")
+            .arg(COHERENCE_PROBE_SCRIPT)
+            .arg(2)
             .arg(&self.keys.control)
+            .arg(&self.keys.dirty)
+            .arg(SCHEMA_VERSION)
+            .arg(observed_revision.map_or_else(String::new, |revision| revision.to_string()))
+            .arg(COHERENCE_REVISION_WINDOW)
             .query_async(&mut connection)
             .await
-            .map_err(|error| Self::report_backend_error("coherence revision read failed", error))?;
-        let (revision, _) = Self::parse_control(&control).map_err(|error| {
-            Self::report_backend_error("coherence control record invalid", error)
-        })?;
-        Ok(Some(revision))
+            .map_err(|error| Self::report_backend_error("coherence probe failed", error))?;
+        Self::decode_coherence_response(&response)
     }
 }
 
@@ -1163,6 +1315,67 @@ mod tests {
         );
         assert!(patch.slices_set.is_empty());
         assert!(patch.gc_add.is_empty());
+        let dirty = patch.dirty_record();
+        assert!(!dirty.overflow);
+        assert_eq!(dirty.inode_ids, vec![created]);
+    }
+
+    #[test]
+    fn coherence_dirty_records_accumulate_and_overflow_to_full() {
+        let records = vec![
+            "records".to_owned(),
+            "12".to_owned(),
+            serde_json::to_string(&DirtyRecord {
+                overflow: false,
+                inode_ids: vec![9, 2],
+            })
+            .unwrap(),
+            serde_json::to_string(&DirtyRecord {
+                overflow: false,
+                inode_ids: vec![9, 7],
+            })
+            .unwrap(),
+        ];
+        assert_eq!(
+            RedisMetaStore::decode_coherence_response(&records).unwrap(),
+            CoherenceProbe::Inodes {
+                revision: 12,
+                inode_ids: vec![2, 7, 9],
+            }
+        );
+
+        let overflow = vec![
+            "records".to_owned(),
+            "13".to_owned(),
+            serde_json::to_string(&DirtyRecord {
+                overflow: true,
+                inode_ids: Vec::new(),
+            })
+            .unwrap(),
+        ];
+        assert_eq!(
+            RedisMetaStore::decode_coherence_response(&overflow).unwrap(),
+            CoherenceProbe::Full { revision: 13 }
+        );
+
+        let too_many = vec![
+            "records".to_owned(),
+            "14".to_owned(),
+            serde_json::to_string(&DirtyRecord {
+                overflow: false,
+                inode_ids: (1..=COHERENCE_DIRTY_INODE_MAX as u64).collect(),
+            })
+            .unwrap(),
+            serde_json::to_string(&DirtyRecord {
+                overflow: false,
+                inode_ids: vec![u64::MAX],
+            })
+            .unwrap(),
+        ];
+        assert_eq!(
+            RedisMetaStore::decode_coherence_response(&too_many).unwrap(),
+            CoherenceProbe::Full { revision: 14 }
+        );
     }
 
     #[tokio::test]
@@ -1397,6 +1610,21 @@ mod tests {
 
         let directory = store.mkdir(ROOT_INODE, "redis-dir", 0o1711).await.unwrap();
         let peer = RedisMetaStore::new(&url, &prefix).await.unwrap();
+        let first_dirty = peer
+            .coherence_probe(Some(initial_revision))
+            .await
+            .unwrap();
+        match first_dirty {
+            CoherenceProbe::Inodes {
+                revision,
+                inode_ids,
+            } => {
+                assert!(revision > initial_revision);
+                assert!(inode_ids.contains(&ROOT_INODE));
+                assert!(inode_ids.contains(&directory));
+            }
+            other => panic!("expected bounded dirty inode probe, got {other:?}"),
+        }
         assert!(peer.coherence_revision().await.unwrap().unwrap() > initial_revision);
         assert_eq!(
             peer.getattr(directory).await.unwrap().mode,

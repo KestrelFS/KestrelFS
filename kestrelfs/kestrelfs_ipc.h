@@ -847,8 +847,12 @@ struct kestrelfs_ring_ctrl {
  *  19 - Phase 4/control-plane step 40: SETATTR adds a mutually-exclusive
  *       atime/mtime union layout with second-precision Unix timestamps; added
  *       GETATTR_TIMES (opcode 24) for inode reconstruction after lookup.
+ *
+ *  20 - Phase 4/control-plane step 42: Added the daemon-to-kernel bounded
+ *       KESTRELFS_IOC_INVALIDATE_CACHE_INODES command for fine-grained Redis
+ *       cache coherence. Shared-memory and event layouts are unchanged.
  */
-#define KESTRELFS_ABI_VERSION		19
+#define KESTRELFS_ABI_VERSION		20
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -927,6 +931,25 @@ struct kestrelfs_shared_region {
  */
 #define KESTRELFS_IOC_INVALIDATE_CACHE_ALL _IO(KESTRELFS_IOC_MAGIC, 4)
 
+/* One coherence probe may name at most this many distinct dirty inodes. */
+#define KESTRELFS_CACHE_INVALIDATE_INODES_MAX 64U
+
+/*
+ * Bounded userspace argument for KESTRELFS_IOC_INVALIDATE_CACHE_INODES.
+ * @count must be 1..KESTRELFS_CACHE_INVALIDATE_INODES_MAX and @reserved must
+ * be zero. The kernel durably retires every cache entry for the listed inode
+ * ids under one cache write-side critical section. Any persistence failure
+ * disables the cache so stale data cannot be returned.
+ */
+struct kestrelfs_cache_invalidate_inodes {
+	__u32 count;
+	__u32 reserved;
+	__u64 inode_ids[KESTRELFS_CACHE_INVALIDATE_INODES_MAX];
+};
+
+#define KESTRELFS_IOC_INVALIDATE_CACHE_INODES \
+	_IOW(KESTRELFS_IOC_MAGIC, 5, struct kestrelfs_cache_invalidate_inodes)
+
 /* ------------------------------------------------------------------
  * Compile-time layout guarantees (checked under BOTH kernel-C and
  * plain userspace gcc, see Phase 2 verification notes)
@@ -934,6 +957,13 @@ struct kestrelfs_shared_region {
 
 _Static_assert(sizeof(struct kestrelfs_event) == 64,
 		"kestrelfs_event must be exactly 64 bytes (one cacheline)");
+
+_Static_assert(sizeof(struct kestrelfs_cache_invalidate_inodes) == 520,
+		"cache inode invalidation ioctl layout must be exactly 520 bytes");
+
+_Static_assert(__builtin_offsetof(struct kestrelfs_cache_invalidate_inodes,
+				  inode_ids) == 8,
+		"cache inode invalidation ids must begin at byte 8");
 
 _Static_assert((KESTRELFS_RING_SLOTS & (KESTRELFS_RING_SLOTS - 1)) == 0,
 		"KESTRELFS_RING_SLOTS must be a power of two");

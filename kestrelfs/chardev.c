@@ -375,6 +375,10 @@ static __poll_t kestrelfs_poll(struct file *file, poll_table *wait)
  * KESTRELFS_IOC_INVALIDATE_CACHE_ALL:
  *     Persistently retire all local cache entries after the daemon observes
  *     a shared metadata revision change.
+ *
+ * KESTRELFS_IOC_INVALIDATE_CACHE_INODES:
+ *     Persistently retire a bounded list of dirty inode cache entries after
+ *     the daemon enumerates a shared metadata revision range.
  */
 static long kestrelfs_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
@@ -404,6 +408,20 @@ static long kestrelfs_ioctl(struct file *file, unsigned int cmd,
 
 	case KESTRELFS_IOC_INVALIDATE_CACHE_ALL:
 		return kestrelfs_cache_invalidate_all();
+
+	case KESTRELFS_IOC_INVALIDATE_CACHE_INODES: {
+		struct kestrelfs_cache_invalidate_inodes request;
+
+		if (copy_from_user(&request, (void __user *)arg,
+				   sizeof(request)))
+			return -EFAULT;
+		if (!request.count ||
+		    request.count > KESTRELFS_CACHE_INVALIDATE_INODES_MAX ||
+		    request.reserved)
+			return -EINVAL;
+		return kestrelfs_cache_invalidate_inodes(request.inode_ids,
+						 request.count);
+	}
 
 	default:
 		return -ENOTTY;

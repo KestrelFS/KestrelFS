@@ -68,7 +68,7 @@ use clap::Parser;
 use device::KestrelDevice;
 use fs_model::{Inode, Slice};
 use gc_worker::{DeleteCompletion, GcScheduler, GcWorker};
-use meta::{MetaError, MetaStore};
+use meta::{CoherenceProbe, MetaError, MetaStore};
 use object_store::ObjectStore;
 use std::collections::HashSet;
 use std::io;
@@ -94,8 +94,23 @@ fn next_gc_retry_delay(current: Duration, retry_needed: bool) -> Duration {
     }
 }
 
-fn coherence_revision_changed(observed: Option<u64>, current: Option<u64>) -> bool {
-    matches!((observed, current), (Some(old), Some(new)) if old != new)
+#[derive(Debug, PartialEq, Eq)]
+enum CoherenceInvalidation {
+    None,
+    Inodes(Vec<u64>),
+    All,
+}
+
+fn coherence_invalidation(probe: Option<&CoherenceProbe>) -> CoherenceInvalidation {
+    match probe {
+        Some(CoherenceProbe::Inodes { inode_ids, .. }) if !inode_ids.is_empty() => {
+            CoherenceInvalidation::Inodes(inode_ids.clone())
+        }
+        Some(CoherenceProbe::Full { .. }) | None => CoherenceInvalidation::All,
+        Some(CoherenceProbe::Disabled)
+        | Some(CoherenceProbe::Unchanged { .. })
+        | Some(CoherenceProbe::Inodes { .. }) => CoherenceInvalidation::None,
+    }
 }
 
 /// KestrelFS control-plane daemon.
@@ -367,9 +382,10 @@ fn event_loop(
 
     let mut retry_delay = GC_RETRY_BASE;
     let mut retry_at = Instant::now() + retry_delay;
-    let mut coherence_revision = runtime
-        .block_on(store.coherence_revision())
+    let initial_coherence = runtime
+        .block_on(store.coherence_probe(None))
         .map_err(|error| io::Error::other(format!("initial coherence probe failed: {error}")))?;
+    let mut coherence_revision = initial_coherence.revision();
     let mut coherence_at = coherence_revision.map(|revision| {
         println!("kestrelfs-daemon: Redis coherence polling enabled at revision {revision}");
         Instant::now() + COHERENCE_POLL_INTERVAL
@@ -448,17 +464,30 @@ fn event_loop(
         }
 
         if coherence_at.is_some_and(|deadline| Instant::now() >= deadline) {
-            match runtime.block_on(store.coherence_revision()) {
-                Ok(current) => {
-                    if coherence_revision_changed(coherence_revision, current) {
-                        let previous = coherence_revision.expect("change requires old revision");
-                        let current_revision = current.expect("change requires new revision");
-                        dev.invalidate_cache_all()?;
-                        println!(
-                            "kestrelfs-daemon: coherence revision {previous} -> {current_revision}; local cache invalidated"
-                        );
+            match runtime.block_on(store.coherence_probe(coherence_revision)) {
+                Ok(probe) => {
+                    let previous = coherence_revision;
+                    match coherence_invalidation(Some(&probe)) {
+                        CoherenceInvalidation::None => {}
+                        CoherenceInvalidation::Inodes(inode_ids) => {
+                            dev.invalidate_cache_inodes(&inode_ids)?;
+                            println!(
+                                "kestrelfs-daemon: coherence revision {} -> {}; invalidated {} dirty inode caches",
+                                previous.unwrap_or_default(),
+                                probe.revision().expect("inode probe has revision"),
+                                inode_ids.len()
+                            );
+                        }
+                        CoherenceInvalidation::All => {
+                            dev.invalidate_cache_all()?;
+                            println!(
+                                "kestrelfs-daemon: coherence revision {} -> {}; dirty history unavailable/overflowed, full local cache invalidated",
+                                previous.unwrap_or_default(),
+                                probe.revision().expect("full probe has revision")
+                            );
+                        }
                     }
-                    coherence_revision = current;
+                    coherence_revision = probe.revision();
                 }
                 Err(error) => {
                     // Metadata state is unknown, so retaining hits would be
@@ -2198,12 +2227,23 @@ mod tests {
     }
 
     #[test]
-    fn coherence_revision_change_requires_two_distinct_shared_revisions() {
-        assert!(!coherence_revision_changed(None, None));
-        assert!(!coherence_revision_changed(None, Some(1)));
-        assert!(!coherence_revision_changed(Some(7), None));
-        assert!(!coherence_revision_changed(Some(7), Some(7)));
-        assert!(coherence_revision_changed(Some(7), Some(8)));
+    fn coherence_probe_selects_fine_full_and_failure_fallbacks() {
+        assert_eq!(
+            coherence_invalidation(Some(&CoherenceProbe::Unchanged { revision: 7 })),
+            CoherenceInvalidation::None
+        );
+        assert_eq!(
+            coherence_invalidation(Some(&CoherenceProbe::Inodes {
+                revision: 8,
+                inode_ids: vec![3, 9],
+            })),
+            CoherenceInvalidation::Inodes(vec![3, 9])
+        );
+        assert_eq!(
+            coherence_invalidation(Some(&CoherenceProbe::Full { revision: 9 })),
+            CoherenceInvalidation::All
+        );
+        assert_eq!(coherence_invalidation(None), CoherenceInvalidation::All);
     }
 
     #[test]
