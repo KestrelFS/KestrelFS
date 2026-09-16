@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-16，Cursor（验收 Step 41；选定 Step 42 = COHERENCE-FINE）
+> 最后更新：2026-09-16，Cursor（战略调整：后续优先内核 VFS/数据面；Step 42 搁置验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -13,46 +13,52 @@
 
 ## 1. 当前基线
 
-- Phase 4 cache、DIST（含 Step 41 ObjectStore GC worker）、POSIX、CACHE-COHERENCE 最小闭环（Step 24–41）均已验收。
-- Redis metadata 为 v2 分记录 HASH/SET + Lua revision-CAS；点查定向读。
-- Redis daemon 每 100 ms 轮询 durable revision，经 ABI v14 **全 cache** 失效（Step 35）。
-- 已验收 IPC ABI **v19**，cache format **v4**。
+- Phase 4 cache、DIST（含 Step 41）、POSIX、CACHE-COHERENCE 最小闭环（Step 24–41）均已验收。
+- Step 42 COHERENCE-FINE 已在工作树实现（ABI v20），**人类决定暂缓验收**，不阻塞内核优先路线。
+- 已验收线上基线仍为 IPC ABI **v19** / cache format **v4**（Step 42 未合入前）。
 - cache/mount 测试只允许在 vng guest + loop；禁止触碰宿主机 zvol。
 
-状态约定：`PROPOSED` / `DECIDED` / `IMPLEMENTING` / `REVIEW` / `ACCEPTED` / `DEFERRED`。
+状态约定：`PROPOSED` / `DECIDED` / `IMPLEMENTING` / `REVIEW` / `ACCEPTED` / `DEFERRED` / `PARKED`。
 
-## 2. 建议路线（Cursor 已调整）
+## 2. 建议路线（Cursor 2026-09-16 调整为内核优先）
+
+**战略**：后续步骤优先补齐内核 VFS/数据面（page cache、mmap、fsync、write_iter、锁、异步 cache），
+再回头做细粒度 coherence / WHITEOUT / DIST-IO。理由：产品差异点是「缓存命中走内核」；
+FUSE 式控制面已有 JuiceFS，KestrelFS 必须先把 `.ko` 做到应用可依赖。
 
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
-| 0–17 | cache + DIST + POSIX + DIST-OBJECT | Step 24–41 | **ACCEPTED** | GC 慢路径已隔离 |
-| 18 | COHERENCE-FINE | Step 42 细粒度 cache 失效 | **DECIDED** | 收窄 Step 35 全量 wipe |
-| — | RENAME_WHITEOUT / ASYNC / DIST-IO | 其它 | PROPOSED | 可后补 |
-| — | CACHE-WRITE | 写缓存 | **DEFERRED** | 默认只读 fill cache |
+| 0–17 | cache + DIST + POSIX + DIST-OBJECT | Step 24–41 | **ACCEPTED** | 已合入 main |
+| — | COHERENCE-FINE | Step 42 细粒度失效 | **PARKED** | 工作树已实现；暂缓验收 |
+| 18 | KERNEL-WRITE-ITER | Step 43 写路径 `write_iter` | **DECIDED** | 与已有 `read_iter` 对称，内核优先第一步 |
+| 19 | KERNEL-FSYNC | 真实 fsync/fdatasync/sync_fs | PROPOSED | 纠正空转刷盘语义 |
+| 20 | KERNEL-AOPS | address_space + 读侧 page cache | PROPOSED | mmap/应用兼容基础 |
+| 21 | KERNEL-MMAP | 文件 mmap | PROPOSED | 依赖 aops |
+| 22 | KERNEL-LOCKS | flock / POSIX locks | PROPOSED | 多进程共享 |
+| 23 | KERNEL-CACHE-ASYNC | cache hit 异步 BIO | PROPOSED | 热路径性能 |
+| — | CACHE-WRITE / WHITEOUT / DIST-IO / COHERENCE 恢复 | 其它 | PROPOSED/DEFERRED | 内核主线之后 |
 
 Codex **只实现 §8 当前提示词**。
 
 ## 3. Phase 4 缓存能力
 
-CACHE-* 与 CACHE-COHERENCE 最小闭环已 ACCEPTED；`CACHE-WRITE` 仍 DEFERRED。
-Step 42 目标是把“revision 变化 → 全 cache 失效”推进到可按 inode（或小批量）失效。
+CACHE-* 最小闭环已 ACCEPTED；`CACHE-WRITE` 仍 DEFERRED。
+COHERENCE-FINE（Step 42）PARKED，不作为当前实现目标。
 
 ## 4. 控制面、对象存储与 POSIX
 
-### DIST-OBJECT — Step 41
-
-- 状态：`ACCEPTED`（Cursor，2026-09-16）
-- 实现：有界 GC delete worker；ObjectStore 长度完整性；ABI/format 未变。
+DIST/POSIX 主线暂停扩张；内核缺口优先。
 
 ### COHERENCE-FINE — Step 42
 
+- 状态：`PARKED`（人类，2026-09-16）
+- 工作树已有实现与自检，但先不验收、不作为 §8 目标。
+
+### KERNEL-WRITE-ITER — Step 43
+
 - 状态：`DECIDED`
-- 目标：远端 metadata mutation 后尽量按 inode 失效本地 cache，仅在无法枚举时回退全量。
+- 目标：普通文件写路径从 `.write` 升级为 `.write_iter`，与 `read_iter` 对称。
 - 范围：见 §8。
-
-### WHITEOUT / ASYNC / DIST-IO（同步 put/get 离环）
-
-仍为 `PROPOSED`。
 
 ## 5. 运维、测试与文档
 
@@ -62,29 +68,32 @@ OPS-CONFIG / TEST-PERF / DOC-CLEANUP 仍为 `PROPOSED`。
 
 | 日期 | 记录者 | ID | 决策/问题 | 结论或待办 |
 |---|---|---|---|---|
-| 2026-09-16 | Cursor | POSIX-UTIMES | Step 40 验收 | **ACCEPTED** |
-| 2026-09-16 | Cursor | DIST-OBJECT | 选定 Step 41 | **DECIDED**；见 §8 |
-| 2026-09-16 | Codex | DIST-OBJECT | 开始实现 Step 41 | **IMPLEMENTING** |
-| 2026-09-16 | Codex | DIST-OBJECT | 实现与自检完成 | **REVIEW**；191 tests、MinIO 2 tests、ABI 未变 |
-| 2026-09-16 | Cursor | DIST-OBJECT | Step 41 验收 | **ACCEPTED**；191 tests + clippy |
-| 2026-09-16 | Cursor | COHERENCE-FINE | 选定 Step 42 | **DECIDED**；见 §8 |
+| 2026-09-16 | Cursor | DIST-OBJECT | Step 41 验收 | **ACCEPTED** |
+| 2026-09-16 | Cursor | COHERENCE-FINE | 选定 Step 42 | **DECIDED** |
+| 2026-09-16 | Codex | COHERENCE-FINE | 实现与自检 | **REVIEW**（工作树；未合入） |
+| 2026-09-16 | 人类/Cursor | 战略 | 后续是否优先内核 | **是**；内核 VFS/数据面优先于 coherence/DIST 扩张 |
+| 2026-09-16 | Cursor | COHERENCE-FINE | Step 42 验收 | **PARKED**；暂缓 |
+| 2026-09-16 | Cursor | KERNEL-WRITE-ITER | 选定 Step 43 | **DECIDED**；见 §8 |
 
 ## 7. 不应顺手扩大
 
 - 不自动 wipe；不触碰宿主机 zvol；不擅自 commit/push。
-- Step 42 不顺手做 WHITEOUT、write-back、真正 async BIO、Redis TLS、生产级 pub/sub lease。
+- Step 43 不顺手做 mmap/page cache、fsync 耐久协议、write-back、锁、异步 BIO。
+- 不要继续扩大已 PARKED 的 Step 42；若工作树仍有其改动，实现 Step 43 前先与人类确认基线（建议：基于已验收 Step 41 的 clean tree，或先 stash Step 42）。
 
-## 8. 当前 Codex 提示词（Step 42）
+## 8. 当前 Codex 提示词（Step 43）
 
 > **人类操作**：对 Codex 说「读 `HANDOFF.md` 与 `docs/remaining-capabilities.md`，只执行 §8」。
+>
+> **基线注意**：优先在 **已验收 Step 41（`6204db2`）clean tree** 上开工；若本地仍有未合入的 Step 42 改动，先 stash/另开 worktree，不要混在一起。
 
 ```text
 你是 KestrelFS 实现 agent。路径：/home/roots/work/code/KestrelFS。
-先读 HANDOFF.md 与 docs/remaining-capabilities.md（全文，尤其 §2/§6/§8）以及
-docs/phase4-nvme-cache.md 中失效相关设计。
-HEAD 应含 Step 41（DIST-OBJECT；IPC ABI 仍为 v19）。
+先读 HANDOFF.md 与 docs/remaining-capabilities.md（全文，尤其 §2/§6/§8）。
+战略：内核优先。不要做 COHERENCE-FINE / Redis dirty-log。
+基线：已验收 Step 41（ABI v19）。若工作树混有 Step 42，先停下来在 §9 说明并等待，不要混改。
 
-开工时：COHERENCE-FINE → IMPLEMENTING，§6 追加一行。
+开工时：KERNEL-WRITE-ITER → IMPLEMENTING，§6 追加一行。
 
 ## 测试铁律
 - 涉及内核/mount 的验证只在 vng guest + loop；禁止触碰宿主机 zvol
@@ -92,35 +101,28 @@ HEAD 应含 Step 41（DIST-OBJECT；IPC ABI 仍为 v19）。
 - 一旦改 kestrelfs/*.c 或依赖 mount：必须 vng
 - Redis/S3 门控测可选；默认 cargo test 不依赖外部服务
 
-## 目标：Step 42 — COHERENCE-FINE（细粒度 cache 失效）
-在 Step 35“Redis durable revision 轮询 → 全 cache 失效”之上，尽量改为按受影响 inode
-失效，减少无关命中被清掉。探测失败或脏集不可用时仍必须 fail closed 回退全量失效。
+## 目标：Step 43 — KERNEL-WRITE-ITER
+把普通文件写路径从 `file_operations.write` 升级为 `write_iter`，与已有 `read_iter` 对称，
+便于后续 AIO/io_uring/向量写，并为 page cache 写路径打基础。
 
 必做：
-1. **脏集来源**：为 Redis MetaStore 记录“自上次成功 probe 以来变更的 inode 集合”
-   （或等价：revision 附带有界 dirty-inode 列表）。容量溢出 / 无法枚举时标记为
-   “必须全量失效”。Mem/File 单机路径可不做，但勿破坏既有行为。
-2. **内核接口**：新增或扩展 daemon→kernel ioctl，支持批量按 inode 失效
-  （可复用既有单 inode invalidate 原语）。保留 `INVALIDATE_CACHE_ALL` 作回退。
-   C/Rust 同步；若布局扩展则 bump ABI（预期 v20）+ 编译期断言。
-3. **daemon 轮询**：revision 变化时若脏集可得且未溢出 → 批量 inode 失效并清空脏集；
-   否则走全量失效（与 Step 35 同等安全）。在 §9 写清窗口、上界与失败语义。
-4. 与 rewrite/truncate/unlink 本地失效路径兼容；不要静默漏失效。
+1. `kestrelfs_reg_file_ops` / writable ops：实现 `.write_iter`；保留或删除旧 `.write` 须在 §9 写清
+2. 语义对齐现有写路径：O_APPEND、按 bounce 分片 WRITE_DATA、更新 i_size、触发 cache invalidate
+3. 支持 writev/pwritev 类路径（经 VFS write_iter）；单测或 vng 覆盖向量写与普通 write
+4. 错误与部分写语义写清；不要顺手做 fsync 耐久协议或 mmap
 
 要求：
-1. 单测覆盖：脏集累积、溢出→全量、probe 失败→全量、批量 ioctl 编解码
-2. STEP42_*_PASS vng（需要 Redis 时可在 vng 内起临时 Redis，或门控说明）：
-   远端 mutation 后，未改 inode 的 cache 仍可命中；被改 inode 必须失效；失败回退全量
+1. `make -C kestrelfs` 零警告；相关 cargo test 不回归
+2. STEP43_*_PASS vng：普通写、writev、O_APPEND、写后读回、与 cache invalidate 兼容
 3. 更新 HANDOFF（待验收）、README（中文）、本文 → REVIEW + §9
-4. 不要擅自 commit/push
+4. 不要擅自 commit/push；不要把 PARKED 的 Step 42 改动混进本步
 
 ## 明确不做
-WHITEOUT、write-back、真正 async BIO completion、Redis TLS、生产级 pub/sub lease、
-客户端加密/压缩、自动 wipe、iget5。
+page cache/mmap、真实 fsync 协议、flock、async BIO、write-back、WHITEOUT、COHERENCE-FINE。
 
 ## 验收自检
 - cargo test + clippy -D warnings
-- make -C kestrelfs 零警告 + 相关 vng
+- make -C kestrelfs 零警告 + Step 43 vng
 - 汇报写入本文 §9
 ```
 

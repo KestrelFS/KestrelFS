@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 41 DIST-OBJECT 已验收；下一步 Step 42 COHERENCE-FINE；IPC ABI v19；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 41 已验收；后续优先内核 VFS/数据面；Step 42 暂缓；下一步 Step 43 write_iter；已验收 ABI v19 / format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -39,6 +39,8 @@
 > retained orphan 的 fchmod（已验收）。Step 38 已支持原子 `RENAME_EXCHANGE`
 > （文件、目录及 Linux 允许的混合类型交换）。Step 39 已支持持久 chown/fchown
 > （可与 mode 同事务）。Step 40 已支持秒级显式 atime/mtime 持久化；
+> Step 42 为 Redis revision 附加 256-revision 有界 dirty-inode 日志，正常变化经
+> ABI v20 批量 ioctl 只退休相关 inode，历史缺失、溢出或探测失败仍全量 fail closed；
 > `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -110,8 +112,8 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
   校验、对齐 hit 直达用户页、LRU 回收、CRC 校验、v4 intent journal，以及共享
   读锁下的并行同步 BIO 命中；离线工具可 inspect 并在双确认后重置 metadata；
   `read_iter` 让普通和 vectored read 共用结构化 iov 路径；满盘时可批量退休 LRU
-  victim 并合并同一 index page 的清零写。Step 35 允许 Redis daemon 在
-  durable revision 改变或探测失败时请求内核持久化全 cache 失效。Step 36 在已打开
+  victim 并合并同一 index page 的清零写。Step 42 在 Step 35 全量回退之上允许
+  Redis daemon 批量持久化失效相关 inode，脏历史不可证明完整时仍全量失效。Step 36 在已打开
   文件失去最终目录项时保留 cache/inode，最后 close 才失效并回收。
   详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
@@ -140,7 +142,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–41 已验收；下一步 Step 42 COHERENCE-FINE（ABI v19 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–41 已验收；Step 42 COHERENCE-FINE 待验收（ABI v20 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -155,7 +157,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v19）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v20）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -167,6 +169,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step34-posix-attr-vng.sh   # create/mkdir mode、目录 nlink 与重启恢复
 ├── test-step34-posix-attr.c        # 原始 open/mkdir mode 测试辅助程序
 ├── test-step35-cache-coherence-vng.sh # Redis revision→本地 cache 全失效
+├── test-step42-coherence-fine-vng.sh  # dirty inode 精细失效 + 全量回退
 ├── test-step36-posix-lifecycle-vng.sh # open-unlink/cache/last-close GC
 ├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
 ├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
@@ -320,9 +323,10 @@ S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 C
 Step 31 已验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
 queue 拆到独立 HASH/SET；点查只读取目标 field，复合 mutation 用 Lua
 revision-CAS 原子提交字段级 diff。旧 `<PREFIX>:meta:v1` 默认拒绝且不自动迁移。
-Step 35 复用该 durable revision：Redis daemon 启动时先清空恢复的本地 cache，
-运行中每 100 ms 探测 revision；变化或探测失败时经 ABI v14 ioctl 请求内核以 v4
-journal 保守退休全部 entry。该原型是有短暂窗口的最终一致失效，不是生产级 lease。
+Step 42 继续复用该 durable revision：每次 Lua mutation 同事务写入对应 revision 的
+dirty-inode 记录，保留最近 256 个 revision；daemon 每 100 ms 合并游标后的记录，
+最多经 ABI v20 ioctl 批量退休 64 个 inode。记录缺失、溢出、累计超过 64 或探测失败
+时仍请求全 cache 失效。启动时也先全量退休恢复索引。该原型仍有轮询窗口，不是生产级 lease。
 可选集成测试：
 
 ```bash
@@ -466,9 +470,10 @@ Step 34 支持 create/mkdir mode 与
   重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加 IPC 尾延迟。
 - Phase 4 v4 绑定 namespace；CRC32 非密码学；半提交可安全 miss，但无双
   superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO 仍同步等待，
-  mutation 会等待在途 reader。Step 35（ABI v14）只提供 Redis revision 每 100 ms
-  轮询后的保守全 cache 失效：提交到 probe 前仍可能短暂旧 hit，daemon 离线期间
-  无 lease，也没有按 inode/range 消息或生产级 pub/sub。Step 29 可用一次
+  mutation 会等待在途 reader。Step 42（ABI v20）已把正常 Redis revision 变化
+  收窄为最多 64 inode 的批量失效，并保留全量 fail-closed 回退；提交到 probe 前仍
+  可能短暂旧 hit，daemon 离线期间无 lease，也没有 range 消息或生产级 pub/sub。
+  Step 29 可用一次
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 28 已覆盖 read/pread/readv/preadv；pinned BIO 只在单个当前 iovec 段内合并，
