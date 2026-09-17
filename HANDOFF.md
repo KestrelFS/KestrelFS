@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 46 KERNEL-MMAP 已由 Cursor 验收并纳入本提交（IPC ABI v21、cache format v4）。下一步内核优先见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 47 KERNEL-LOCKS 已由 Cursor 验收并纳入本提交（IPC ABI v21、cache format v4）。下一步内核优先见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 46 文件 mmap 已验收；下一步 Step 47 = KERNEL-LOCKS（见 remaining-capabilities §8） |
+| 当前阶段 | Step 47 本地文件锁已验收；下一步 Step 48 = KERNEL-CACHE-ASYNC（见 remaining-capabilities §8） |
 
 ---
 
@@ -137,6 +137,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step45-kernel-aops-vng.sh # Step 45 folio/pagecache 与写后失效回归
 ├── test-step46-kernel-mmap-vng.sh # Step 46 文件 mmap/失效/共享写拒绝回归
 ├── test-step46-kernel-mmap.c # Step 46 mmap/COW/截断测试助手
+├── test-step47-kernel-locks-vng.sh # Step 47 本地文件锁/进程退出回归
+├── test-step47-kernel-locks.c # Step 47 flock/POSIX/OFD 测试助手
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -198,6 +200,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/内核 Step 44** | **文件 fsync/fdatasync 与挂载 syncfs 后端耐久屏障** | **21** | **✅ 已验收** |
 | **Phase 4/内核 Step 45** | **普通文件读侧 folio page cache/readahead；同步写后清页** | **21（未变）** | **✅ 已验收** |
 | **Phase 4/内核 Step 46** | **文件只读共享/私有 mmap；映射失效与共享写拒绝** | **21（未变）** | **✅ 已验收** |
+| **Phase 4/内核 Step 47** | **本地 flock/POSIX/OFD 文件锁与进程退出清理** | **21（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -244,7 +247,10 @@ Cursor 对照代码、195 tests 与 `STEP45_KERNEL_AOPS_PASS` 确认 Step 45 已
 Cursor 对照代码、195 tests 与 `STEP46_KERNEL_MMAP_PASS` 确认 Step 46 已验收。
 `generic_file_mmap` + 自定义 fault；MAP_PRIVATE/只读 SHARED；可写 SHARED `EOPNOTSUPP`。ABI **v21** 未变；format **v4**。
 
-下一步：**Step 47 KERNEL-LOCKS**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、195 tests 与 `STEP47_KERNEL_LOCKS_PASS` 确认 Step 47 已验收。
+本地 flock/POSIX/OFD advisory 锁；锁类独立；无 daemon IPC。ABI **v21** 未变；format **v4**。
+
+下一步：**Step 48 KERNEL-CACHE-ASYNC**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 21`（含 `FSYNC` / `SYNC_FS`）
 
@@ -374,6 +380,7 @@ Cursor 对照代码、195 tests 与 `STEP46_KERNEL_MMAP_PASS` 确认 Step 46 已
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
 | 31 | **读侧 page cache 的远端失效偏保守** | Redis revision ioctl 推进全局 page-cache epoch：普通读下次访问惰性清页，Step 46 已映射 inode 由异步 worker 撤销 PTE/folio；inode-list 细粒度 NVMe 失效对 VFS page cache 仍退化为挂载级保守失效，避免 ioctl 线程等待 locked folio 与 daemon READ_DATA 死锁。一致性窗口包含原 ~100 ms probe 与 worker 调度。 | `kestrelfs/file.c`、`kestrelfs/chardev.c` |
 | 32 | **mmap 仅支持读侧/私有 COW** | Step 46 已支持 MAP_PRIVATE（可 COW）与只读 MAP_SHARED；可写 MAP_SHARED 返回 `EOPNOTSUPP`，只读共享 VMA 清除 `VM_MAYWRITE` 防 `mprotect` 升级。远端 ioctl 后映射清理由异步 worker 完成，除原 ~100 ms probe 外另有 worker 调度窗口；fault 若先遇到待清理 epoch 会等待重试或 fail-closed SIGBUS，不保证生产级强一致。 | `kestrelfs/file.c` |
+| 33 | **文件锁仅本地 advisory** | Step 47 已把 flock、POSIX 字节锁与 OFD 锁交给 Linux 本地锁管理器；同一挂载节点上的进程可协调，flock 与 POSIX/OFD 锁类彼此独立。不同挂载或节点不共享锁状态；无跨 daemon 分布式锁、远端 lease 或强制锁。 | `kestrelfs/file.c` |
 | 30 | **fsync 的持久性受后端配置限制** | Step 44 fsync 与 fdatasync 同样同步对象和元数据；syncfs 检查所有引用且同步本地对象目录树。Mem 返回仅进程内成功；Redis 仅保证已 ACK 的 mutation 可见，崩溃耐久取决于 AOF/RDB 配置（RDB 不保证逐次 fsync 耐久；本步没有 WAIT/WAITAOF）；S3 以已完成 PUT ACK 为边界；没有分布式跨后端原子事务或目录 file op 的 fsync。 | `daemon/src/main.rs`、`daemon/src/object_store.rs`、`daemon/src/meta_persist.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
@@ -1571,6 +1578,28 @@ Cursor 验收自检（2026-09-17）：195 tests；clippy / make 零警告；复�
 `STEP46_KERNEL_MMAP_PASS`（umount_ms=31）。
 模块/mount/loop 仅在 vng guest；未触碰宿主机 zvol。
 
+### 7.41 Phase 4/内核 Step 47 KERNEL-LOCKS
+
+普通文件 `.flock` 与 `.lock` 复用 Linux 本地锁管理器：BSD flock 使用
+`locks_lock_file_wait`，POSIX `F_SETLK/F_SETLKW` 和 OFD 字节锁经同一等待器，
+`F_GETLK` 经 `posix_test_lock`。同一挂载的进程可正确互斥，阻塞等待在持有者
+释放后唤醒，fd/进程退出由 VFS 自动清理锁。等待期间不持有 data IPC mutex 或
+inode 锁，也不调用 daemon；锁是 advisory、本地 inode 状态，flock 与
+POSIX/OFD 锁类彼此独立。ABI **v21**、cache format **v4** 未变。
+
+Codex 自检：`cargo test` **195 passed**，clippy `-D warnings`、
+`make -C kestrelfs` 零警告。vng guest + loop 输出 `STEP47_FLOCK_PASS`、
+`STEP47_POSIX_FCNTL_PASS`、`STEP47_OFD_FCNTL_PASS`、
+`STEP47_LOCK_CLASS_PASS`、`STEP47_LIFECYCLE_MMAP_WRITE_PASS`、
+`STEP47_KERNEL_LOCKS_PASS`（umount 115 ms）；Step 46/36 回归分别为
+`STEP46_KERNEL_MMAP_PASS`（116 ms）/`STEP36_POSIX_LIFECYCLE_PASS`
+（31 ms）。
+Cursor 验收自检（2026-09-17）：195 tests；clippy / make 零警告；复跑 vng
+`STEP47_KERNEL_LOCKS_PASS`（umount_ms=32）。
+脚本显式 insmod、独立 data-dir/daemon.log；只在 vng guest 内
+操作 loop/mount/module，未触碰物理机 zvol。未实现跨节点/跨挂载分布式锁、
+强制锁或远端 lease。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1580,9 +1609,8 @@ Cursor 验收自检（2026-09-17）：195 tests；clippy / make 零警告；复�
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **内核优先战略** | 后续以 VFS/数据面为主；见 remaining-capabilities §2 |
-| 2 | **Step 47 KERNEL-LOCKS** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | 其后内核 | cache-async |
-| 4 | 其它 | WHITEOUT、DIST-IO、CACHE-WRITE… |
+| 2 | **Step 48 KERNEL-CACHE-ASYNC** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 3 | 其后 | WHITEOUT、DIST-IO、CACHE-WRITE… |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
 
@@ -1636,10 +1664,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 46 KERNEL-MMAP 已由 Cursor 验收并提交
+- [x] Step 47 KERNEL-LOCKS 已由 Cursor 验收并提交
 - [x] IPC ABI = 21；cache format = v4
-- [x] Step 8–45 + Step 46 已验收状态已写清
-- [x] 下一步明确：Step 47 KERNEL-LOCKS（`docs/remaining-capabilities.md` §8）
+- [x] Step 8–46 + Step 47 已验收状态已写清
+- [x] 下一步明确：Step 48 KERNEL-CACHE-ASYNC（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

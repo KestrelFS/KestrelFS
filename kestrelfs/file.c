@@ -38,6 +38,7 @@
 #include <linux/limits.h>
 #include <linux/pagemap.h>
 #include <linux/vmalloc.h>
+#include <linux/filelock.h>
 
 #include "kestrelfs.h"
 
@@ -672,6 +673,31 @@ out_unlock:
 	return ret;
 }
 
+/* Local VFS locks intentionally never enter the daemon/data IPC path.  The
+ * kernel owns waiter queues and close/exit cleanup for this mount's inode.
+ * POSIX and OFD byte-range locks share the POSIX lock context; BSD flock is
+ * a separate lock class, as on a local Linux filesystem.
+ */
+static int kestrelfs_regular_lock(struct file *file, int cmd,
+				   struct file_lock *fl)
+{
+	if (cmd == F_GETLK) {
+		posix_test_lock(file, fl);
+		return 0;
+	}
+	if (cmd != F_SETLK && cmd != F_SETLKW)
+		return -EINVAL;
+	return locks_lock_file_wait(file, fl);
+}
+
+static int kestrelfs_regular_flock(struct file *file, int cmd,
+				    struct file_lock *fl)
+{
+	if (cmd != F_SETLK && cmd != F_SETLKW)
+		return -EINVAL;
+	return locks_lock_file_wait(file, fl);
+}
+
 /*
  * Send an iter write through WRITE_DATA in 16 KiB bounce-buffer chunks.
  * copy_from_iter() lets write(2), writev(2), pwritev(2), and synchronous
@@ -798,6 +824,8 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.owner	= THIS_MODULE,
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
+	.lock	= kestrelfs_regular_lock,
+	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,
 	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
@@ -1077,6 +1105,8 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.owner	= THIS_MODULE,
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
+	.lock	= kestrelfs_regular_lock,
+	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,
 	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
