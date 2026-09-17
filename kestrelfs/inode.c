@@ -57,6 +57,8 @@ static int kestrelfs_statfs(struct dentry *dentry, struct kstatfs *buf)
  */
 static void kestrelfs_evict_inode(struct inode *inode)
 {
+	if (S_ISREG(inode->i_mode) && inode->i_private)
+		kestrelfs_pagecache_unregister_inode(inode);
 	truncate_inode_pages_final(&inode->i_data);
 	kfree(inode->i_private);
 	inode->i_private = NULL;
@@ -166,6 +168,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		}
 		mutex_init(&state->lifecycle_lock);
 		inode->i_private = state;
+		kestrelfs_pagecache_register_inode(inode);
 		/* Read-side page cache only; writes remain synchronous daemon IPC. */
 		inode->i_mapping->a_ops = &kestrelfs_reg_aops;
 		inode->i_op = &kestrelfs_reg_inode_ops;

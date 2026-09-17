@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 45 KERNEL-AOPS 已由 Cursor 验收并纳入本提交（IPC ABI v21、cache format v4）。下一步内核优先见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 46 KERNEL-MMAP 已由 Cursor 验收并纳入本提交（IPC ABI v21、cache format v4）。下一步内核优先见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 45 读侧 page cache 已验收；下一步 Step 46 = KERNEL-MMAP（见 remaining-capabilities §8） |
+| 当前阶段 | Step 46 文件 mmap 已验收；下一步 Step 47 = KERNEL-LOCKS（见 remaining-capabilities §8） |
 
 ---
 
@@ -60,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无完整 mmap/splice、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行同步 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无可写 MAP_SHARED/writeback、完整 splice、真正异步 completion 或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
 
 ---
 
@@ -135,6 +135,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step40-posix-utimes-vng.sh # Step 40 文件/目录时间、重启及 orphan 回归
 ├── test-step40-posix-utimes.c # Step 40 open-unlink futimens 测试助手
 ├── test-step45-kernel-aops-vng.sh # Step 45 folio/pagecache 与写后失效回归
+├── test-step46-kernel-mmap-vng.sh # Step 46 文件 mmap/失效/共享写拒绝回归
+├── test-step46-kernel-mmap.c # Step 46 mmap/COW/截断测试助手
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -195,6 +197,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/内核 Step 43** | **普通文件 write_iter + write/writev/pwritev 统一 iov_iter 写路径** | **20（未变）** | **✅ 已验收** |
 | **Phase 4/内核 Step 44** | **文件 fsync/fdatasync 与挂载 syncfs 后端耐久屏障** | **21** | **✅ 已验收** |
 | **Phase 4/内核 Step 45** | **普通文件读侧 folio page cache/readahead；同步写后清页** | **21（未变）** | **✅ 已验收** |
+| **Phase 4/内核 Step 46** | **文件只读共享/私有 mmap；映射失效与共享写拒绝** | **21（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -238,7 +241,10 @@ ABI v21 `OP_FSYNC`/`OP_SYNC_FS`；File+LocalFs 真 fsync。ABI **v21**；format 
 Cursor 对照代码、195 tests 与 `STEP45_KERNEL_AOPS_PASS` 确认 Step 45 已验收。
 策略 A：`generic_file_read_iter` + `read_folio`/`readahead`；写后清页；Redis page-cache epoch 惰性失效。ABI **v21** 未变；format **v4**。
 
-下一步：**Step 46 KERNEL-MMAP**，提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、195 tests 与 `STEP46_KERNEL_MMAP_PASS` 确认 Step 46 已验收。
+`generic_file_mmap` + 自定义 fault；MAP_PRIVATE/只读 SHARED；可写 SHARED `EOPNOTSUPP`。ABI **v21** 未变；format **v4**。
+
+下一步：**Step 47 KERNEL-LOCKS**，提示词在 `docs/remaining-capabilities.md` §8。
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 21`（含 `FSYNC` / `SYNC_FS`）
 
@@ -350,7 +356,7 @@ Cursor 对照代码、195 tests 与 `STEP45_KERNEL_AOPS_PASS` 确认 Step 45 已
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **write_iter 仍是同步 bounce IPC** | Step 43 已删除旧 `.write`，普通 write/writev/pwritev 统一经 `.write_iter`；O_APPEND 由 `generic_write_checks()` 解析，并在 bounce 锁内重新读取 EOF 以串行并发追加。每个 16 KiB WRITE_DATA IPC 仍同步等待 daemon；Step 45 仅引入读侧 page cache，没有脏页/write-back 或异步 completion。 | `kestrelfs/file.c` `kestrelfs_writable_write_iter()` |
-| 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
+| 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+显式时间/其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`；普通 truncate 随带的 VFS 隐式 mtime/ctime 由 TRUNCATE 处理。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
 | 17 | **open-unlink 离线 final-close 只保证不误删** | Step 36 用 mount-local open 计数和持久 nlink=0 orphan 延迟回收；daemon 重启时 open fd 仍可继续。若最终 close 时 daemon/IPC 不可用，当前保留 orphan，不在 `evict_inode` 发 IPC，因此可能安全泄漏且尚无自动 sweep。 | `kestrelfs/file.c`、`daemon/src/meta.rs` |
@@ -360,13 +366,14 @@ Cursor 对照代码、195 tests 与 `STEP45_KERNEL_AOPS_PASS` 确认 Step 45 已
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 41 用容量 32、每项最多 64 keys、delete 并发 4 的 worker 隔离慢 S3；背压/失败不丢 durable key，成功结果由串行 metadata 线程确认。多 daemon 仍可能重复处理同一 Redis `gc` SET，幂等 delete/revision-CAS ack 可容忍；尚无跨 Redis/S3 事务、dead-letter 或运维限额。 | `daemon/src/gc_worker.rs`、`daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
-| 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 45 已让普通文件 warm read 优先命中 VFS page cache，冷 folio 可由 NVMe cache 或 READ_DATA 填充；Step 28 的 pinned-page 直达用户页路径不再用于普通热读，冷 folio 的 kernel-backed iterator 使用同步 BIO + 拷贝。没有真正异步 completion、跨 iovec scatter-gather BIO、完整 mmap/splice；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 24 | **NVMe cache hit 是并行但仍同步的受限少拷贝原型** | Step 45 已让普通文件 warm read 优先命中 VFS page cache，冷 folio 可由 NVMe cache 或 READ_DATA 填充；Step 28 的 pinned-page 直达用户页路径不再用于普通热读，冷 folio 的 kernel-backed iterator 使用同步 BIO + 拷贝。Step 46 仅有读侧/私有 COW mmap；没有真正异步 completion、跨 iovec scatter-gather BIO、可写共享 mmap 或完整 splice；mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
 | 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前 v4 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2/v3 不自动迁移；Step 27 工具只提供显式 metadata wipe。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 27 | **远端 cache coherence 仍是最终一致原型** | Step 42 用最近 256 revision 的 durable dirty log 将正常变化收窄为最多 64 inode 的 ABI v20 批量失效；记录缺失/损坏、溢出、累计超限或 probe 失败仍全量 fail closed。提交到下一次 probe 前仍有短暂旧 hit 窗口，daemon 离线期间没有 lease，尚无 range/pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
 | 28 | **batch block-LRU 热度仍只在内存** | Step 29 默认一次退休 16 个 LRU victim（至多总槽位 1/16），用一份 journal 并按 index page 合并清零；连续 fill 可消费预回收槽位，MRU 尾部受到小批量保护。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后仍按 generation 恢复 insertion-order 近似。没有分区配额/租户热点隔离；victim 分散时仍需每个 index page 一次同步写，fill/invalidate 仍逐次 journal。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
-| 31 | **读侧 page cache 的远端失效偏保守** | Step 45 在 Redis revision ioctl 上推进全局 page-cache epoch，下次读惰性 `truncate_inode_pages`；inode-list 细粒度 NVMe 失效对 VFS page cache 退化为挂载级保守失效，避免 ioctl 线程等待 locked folio 与 daemon READ_DATA 死锁。一致性窗口仍由原 ~100 ms probe 决定。 | `kestrelfs/file.c`、`kestrelfs/chardev.c` |
+| 31 | **读侧 page cache 的远端失效偏保守** | Redis revision ioctl 推进全局 page-cache epoch：普通读下次访问惰性清页，Step 46 已映射 inode 由异步 worker 撤销 PTE/folio；inode-list 细粒度 NVMe 失效对 VFS page cache 仍退化为挂载级保守失效，避免 ioctl 线程等待 locked folio 与 daemon READ_DATA 死锁。一致性窗口包含原 ~100 ms probe 与 worker 调度。 | `kestrelfs/file.c`、`kestrelfs/chardev.c` |
+| 32 | **mmap 仅支持读侧/私有 COW** | Step 46 已支持 MAP_PRIVATE（可 COW）与只读 MAP_SHARED；可写 MAP_SHARED 返回 `EOPNOTSUPP`，只读共享 VMA 清除 `VM_MAYWRITE` 防 `mprotect` 升级。远端 ioctl 后映射清理由异步 worker 完成，除原 ~100 ms probe 外另有 worker 调度窗口；fault 若先遇到待清理 epoch 会等待重试或 fail-closed SIGBUS，不保证生产级强一致。 | `kestrelfs/file.c` |
 | 30 | **fsync 的持久性受后端配置限制** | Step 44 fsync 与 fdatasync 同样同步对象和元数据；syncfs 检查所有引用且同步本地对象目录树。Mem 返回仅进程内成功；Redis 仅保证已 ACK 的 mutation 可见，崩溃耐久取决于 AOF/RDB 配置（RDB 不保证逐次 fsync 耐久；本步没有 WAIT/WAITAOF）；S3 以已完成 PUT ACK 为边界；没有分布式跨后端原子事务或目录 file op 的 fsync。 | `daemon/src/main.rs`、`daemon/src/object_store.rs`、`daemon/src/meta_persist.rs` |
 
 > ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
@@ -1535,6 +1542,35 @@ Cursor 验收自检（2026-09-16）：195 tests；clippy / make 零警告；复�
 `STEP45_KERNEL_AOPS_PASS`（umount_ms=46；`STEP45_BACKING_CACHE_HIT_PASS delta=32`）。
 所有模块/mount/loop 操作只在 vng guest；未触碰宿主机 zvol。
 
+### 7.40 Phase 4/内核 Step 46 KERNEL-MMAP
+
+普通文件 `.mmap` 复用 `generic_file_mmap` 的 filemap/page-cache 读侧路径；
+`MAP_PRIVATE` 支持私有 COW，`MAP_SHARED` 只允许只读，显式拒绝可写共享并清除
+`VM_MAYWRITE` 防止后续 `mprotect` 升级。同步 `write_iter` 与 truncate 通过已存在的
+`truncate_inode_pages` 撤销旧 PTE/folio，使既有未 COW 映射下次访问重新 fault。
+为让标准 `ftruncate`/`O_TRUNC` 工作，`setattr` 允许 SIZE 附带 VFS 自动设置的
+mtime/ctime，但继续拒绝显式时间+SIZE 组合；daemon 的 TRUNCATE 仍更新持久 mtime。
+
+Redis revision ioctl 不同步等待 locked folio（同线程 daemon 可能还须回答 READ_DATA）；
+它推进全局 page-cache epoch 后为已有映射排队清页 worker。worker 在 inode 写锁下
+撤销映射 PTE/folio；期间新 fault 释放 mmap/VMA 锁等待完成再重试，无法重试时
+fail-closed SIGBUS。ioctl 返回到 worker 完成之间仍有短暂旧 PTE 可见窗口，加上
+既有 ~100 ms probe 窗口，不能宣称分布式强一致。页缓存的 inode-list 远端失效仍
+保守按所有已映射 inode 清理。ABI **v21**、cache format **v4** 未变；fsync 仍为
+Step 44 后端屏障，无脏页/writeback。
+
+Codex 自检：Rust `cargo test` **195 passed**；clippy `-D warnings`、
+`make -C kestrelfs` 零警告。vng guest + loop 输出
+`STEP46_MMAP_READ_PASS`、`STEP46_PRIVATE_COW_PASS`、
+`STEP46_SHARED_WRITE_REJECT_PASS`、`STEP46_REWRITE_INVALIDATE_PASS`、
+`STEP46_TRUNCATE_INVALIDATE_PASS`、`STEP46_COHERENCE_REFAULT_PASS`、
+`STEP46_KERNEL_MMAP_PASS`（umount 118 ms）；Step 45/44 回归分别输出
+`STEP45_KERNEL_AOPS_PASS`（169 ms）/`STEP44_KERNEL_FSYNC_PASS`（132 ms）。
+Step 40 属性回归 `STEP40_POSIX_UTIMES_PASS`（74 ms）。
+Cursor 验收自检（2026-09-17）：195 tests；clippy / make 零警告；复跑 vng
+`STEP46_KERNEL_MMAP_PASS`（umount_ms=31）。
+模块/mount/loop 仅在 vng guest；未触碰宿主机 zvol。
+
 ---
 
 ## 8. 路线图（未做）
@@ -1544,8 +1580,8 @@ Cursor 验收自检（2026-09-16）：195 tests；clippy / make 零警告；复�
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **内核优先战略** | 后续以 VFS/数据面为主；见 remaining-capabilities §2 |
-| 2 | **Step 46 KERNEL-MMAP** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | 其后内核 | locks → cache-async |
+| 2 | **Step 47 KERNEL-LOCKS** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 3 | 其后内核 | cache-async |
 | 4 | 其它 | WHITEOUT、DIST-IO、CACHE-WRITE… |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1600,10 +1636,10 @@ mkdir -p "$data_dir"
 
 ## 10. 交接检查清单
 
-- [x] Step 45 KERNEL-AOPS 已由 Cursor 验收并提交
+- [x] Step 46 KERNEL-MMAP 已由 Cursor 验收并提交
 - [x] IPC ABI = 21；cache format = v4
-- [x] Step 8–44 + Step 45 已验收状态已写清
-- [x] 下一步明确：Step 46 KERNEL-MMAP（`docs/remaining-capabilities.md` §8）
+- [x] Step 8–45 + Step 46 已验收状态已写清
+- [x] 下一步明确：Step 47 KERNEL-LOCKS（`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

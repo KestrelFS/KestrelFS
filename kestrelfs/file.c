@@ -44,14 +44,94 @@
 /* One shared bounce buffer means at most one bulk data IPC may be in flight. */
 DEFINE_MUTEX(kestrelfs_data_ipc_lock);
 static atomic64_t kestrelfs_pagecache_coherence_epoch = ATOMIC64_INIT(0);
+static DEFINE_MUTEX(kestrelfs_coherence_inodes_lock);
+static LIST_HEAD(kestrelfs_coherence_inodes);
+
+/* The daemon's ioctl must not wait for a folio whose READ_DATA request is
+ * waiting on that same daemon. Retire mapped folios on a worker instead.
+ * The per-inode scheduled flag and epoch comparison close the queue_work()
+ * race when a second revision arrives while a worker is still running.
+ */
+static void kestrelfs_pagecache_coherence_work(struct work_struct *work)
+{
+	struct kestrelfs_inode_state *state = container_of(work,
+			struct kestrelfs_inode_state, coherence_work);
+	u64 epoch;
+
+	for (;;) {
+		epoch = atomic64_read(&kestrelfs_pagecache_coherence_epoch);
+		inode_lock(state->inode);
+		truncate_inode_pages(state->inode->i_mapping, 0);
+		WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+		inode_unlock(state->inode);
+		wake_up_all(&state->coherence_wait);
+
+		mutex_lock(&kestrelfs_coherence_inodes_lock);
+		if (epoch == atomic64_read(&kestrelfs_pagecache_coherence_epoch)) {
+			state->coherence_work_scheduled = false;
+			mutex_unlock(&kestrelfs_coherence_inodes_lock);
+			return;
+		}
+		mutex_unlock(&kestrelfs_coherence_inodes_lock);
+	}
+}
+
+void kestrelfs_pagecache_register_inode(struct inode *inode)
+{
+	struct kestrelfs_inode_state *state = inode->i_private;
+
+	state->inode = inode;
+	INIT_LIST_HEAD(&state->coherence_link);
+	INIT_WORK(&state->coherence_work, kestrelfs_pagecache_coherence_work);
+	init_waitqueue_head(&state->coherence_wait);
+	state->pagecache_coherence_epoch =
+		atomic64_read(&kestrelfs_pagecache_coherence_epoch);
+	mutex_lock(&kestrelfs_coherence_inodes_lock);
+	list_add(&state->coherence_link, &kestrelfs_coherence_inodes);
+	mutex_unlock(&kestrelfs_coherence_inodes_lock);
+}
+
+void kestrelfs_pagecache_unregister_inode(struct inode *inode)
+{
+	struct kestrelfs_inode_state *state = inode->i_private;
+
+	mutex_lock(&kestrelfs_coherence_inodes_lock);
+	list_del(&state->coherence_link);
+	mutex_unlock(&kestrelfs_coherence_inodes_lock);
+	cancel_work_sync(&state->coherence_work);
+}
+
+static void kestrelfs_pagecache_schedule_coherence(
+	struct kestrelfs_inode_state *state)
+{
+	mutex_lock(&kestrelfs_coherence_inodes_lock);
+	if (!state->coherence_work_scheduled) {
+		state->coherence_work_scheduled = true;
+		queue_work(system_unbound_wq, &state->coherence_work);
+	}
+	mutex_unlock(&kestrelfs_coherence_inodes_lock);
+}
 
 /* Remote Redis revision retirement must also retire read-side filemap pages.
- * The daemon's ioctl cannot synchronously wait for a folio locked by a
- * READ_DATA request serviced by that same daemon, so defer to the next read.
+ * The daemon's ioctl cannot wait for a folio locked by a READ_DATA request
+ * serviced by that same daemon. Plain reads retire lazily; mapped inodes use
+ * a worker to zap existing PTEs without blocking the daemon's ioctl.
  */
 void kestrelfs_pagecache_coherence_advance(void)
 {
+	struct kestrelfs_inode_state *state;
+
 	atomic64_inc(&kestrelfs_pagecache_coherence_epoch);
+	mutex_lock(&kestrelfs_coherence_inodes_lock);
+	list_for_each_entry(state, &kestrelfs_coherence_inodes,
+			    coherence_link) {
+		if (!mapping_mapped(state->inode->i_mapping) ||
+		    state->coherence_work_scheduled)
+			continue;
+		state->coherence_work_scheduled = true;
+		queue_work(system_unbound_wq, &state->coherence_work);
+	}
+	mutex_unlock(&kestrelfs_coherence_inodes_lock);
 }
 
 static ssize_t kestrelfs_regular_read_iter(struct kiocb *iocb,
@@ -73,10 +153,64 @@ static ssize_t kestrelfs_regular_read_iter(struct kiocb *iocb,
 		if (state->pagecache_coherence_epoch != epoch) {
 			truncate_inode_pages(inode->i_mapping, 0);
 			WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+			wake_up_all(&state->coherence_wait);
 		}
 		inode_unlock(inode);
 	}
 	return generic_file_read_iter(iocb, to);
+}
+
+static vm_fault_t kestrelfs_regular_mmap_fault(struct vm_fault *vmf)
+{
+	struct kestrelfs_inode_state *state =
+		file_inode(vmf->vma->vm_file)->i_private;
+
+	if (!state)
+		return VM_FAULT_SIGBUS;
+	if (READ_ONCE(state->pagecache_coherence_epoch) !=
+	    atomic64_read(&kestrelfs_pagecache_coherence_epoch)) {
+		kestrelfs_pagecache_schedule_coherence(state);
+		/* A fault cannot wait with mmap_lock/VMA lock held: the worker
+		 * needs that lock to zap an old PTE. Retry after it retires pages.
+		 */
+		if (!fault_flag_allow_retry_first(vmf->flags))
+			return VM_FAULT_SIGBUS;
+		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+			return VM_FAULT_RETRY;
+		release_fault_lock(vmf);
+		wait_event(state->coherence_wait,
+			READ_ONCE(state->pagecache_coherence_epoch) ==
+			atomic64_read(&kestrelfs_pagecache_coherence_epoch));
+		return VM_FAULT_RETRY;
+	}
+	return filemap_fault(vmf);
+}
+
+static const struct vm_operations_struct kestrelfs_regular_vm_ops = {
+	.fault = kestrelfs_regular_mmap_fault,
+};
+
+static int kestrelfs_regular_mmap(struct file *file,
+				  struct vm_area_struct *vma)
+{
+	struct kestrelfs_inode_state *state = file_inode(file)->i_private;
+	int ret;
+
+	if (!state)
+		return -EIO;
+	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+		return -EOPNOTSUPP;
+	/* A read-only shared VMA must not become writable via mprotect(). */
+	if (vma->vm_flags & VM_SHARED)
+		vm_flags_clear(vma, VM_MAYWRITE);
+	ret = generic_file_mmap(file, vma);
+	if (ret)
+		return ret;
+	vma->vm_ops = &kestrelfs_regular_vm_ops;
+	if (READ_ONCE(state->pagecache_coherence_epoch) !=
+	    atomic64_read(&kestrelfs_pagecache_coherence_epoch))
+		kestrelfs_pagecache_schedule_coherence(state);
+	return 0;
 }
 
 /* Must mirror daemon/src/fs_model.rs::CHUNK_SIZE for write slicing. */
@@ -665,6 +799,7 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_regular_read_iter,
+	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
 	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,
@@ -735,11 +870,13 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (!(attr->ia_valid & (ATTR_SIZE | ATTR_MODE | ATTR_UID | ATTR_GID |
 			      ATTR_ATIME | ATTR_MTIME)))
 		return -EOPNOTSUPP;
-	/* TRUNCATE remains a separate mutation and the ABI v19 basic/time layouts
-	 * overlap, so neither combination can be one atomic request. */
+	/* A normal truncate carries an implicit ATTR_MTIME/ATTR_CTIME from VFS.
+	 * OP_TRUNCATE already updates mtime in MetaStore. Explicit time changes
+	 * (ATTR_MTIME_SET) and other attributes still cannot be one mutation.
+	 */
 	if ((attr->ia_valid & ATTR_SIZE) &&
 	    (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID |
-			      ATTR_ATIME | ATTR_MTIME)))
+			      ATTR_ATIME | ATTR_MTIME_SET)))
 		return -EOPNOTSUPP;
 	if ((attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)) &&
 	    (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME)))
@@ -856,7 +993,8 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		i_gid_write(inode, persisted_gid);
 	}
 
-	if (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME)) {
+	if (!(attr->ia_valid & ATTR_SIZE) &&
+	    (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME))) {
 		u64 inode_id = inode->i_ino;
 		u64 requested_atime;
 		u64 requested_mtime;
@@ -940,6 +1078,7 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
 	.read_iter	= kestrelfs_regular_read_iter,
+	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
 	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,

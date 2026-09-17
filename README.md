@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 45 读侧 page cache 已验收；下一步 Step 46 KERNEL-MMAP；IPC ABI v21；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 46 文件 mmap 已验收；下一步 Step 47 KERNEL-LOCKS；IPC ABI v21；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -45,7 +45,9 @@
 > Step 44 的普通文件 fsync/fdatasync 与挂载 syncfs 已经同步等待 daemon 后端耐久屏障；
 > Step 45 已把普通读接到 `read_folio`/`readahead` 与 VFS page cache，
 > 冷页仍由内核块缓存或 `READ_DATA` 填充，写仍同步 IPC 并在成功后清理旧页；
-> 本步没有脏页写回或完整文件 `mmap`，热读也不再走 Step 28 直达用户页路径。
+> 热读不再走 Step 28 直达用户页路径。Step 46 已支持普通文件
+> `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`，拒绝共享写入/`mprotect` 升级；
+> 写后旧映射重新 fault，远端 revision 触发异步映射清理。仍无脏页写回或可写共享 mmap。
 > `WHITEOUT`、真正的异步 completion
 > 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -149,7 +151,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–45 已验收；下一步 Step 46 KERNEL-MMAP（ABI v21 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–46 已验收；下一步 Step 47 KERNEL-LOCKS（ABI v21 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -182,6 +184,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step44-fsync-vng.sh           # fsync/syncfs 与强杀 daemon 后重启验证
 ├── test-step44-fsync.c                # 文件同步、离线拒绝和读回辅助程序
 ├── test-step45-kernel-aops-vng.sh     # 读侧 folio/page cache 与写后清页 vng 回归
+├── test-step46-kernel-mmap-vng.sh     # 文件 mmap/COW/失效/共享写拒绝 vng 回归
+├── test-step46-kernel-mmap.c          # mmap 行为测试助手
 ├── test-step36-posix-lifecycle-vng.sh # open-unlink/cache/last-close GC
 ├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
 ├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
@@ -488,8 +492,9 @@ Step 34 支持 create/mkdir mode 与
   Step 29 可用一次
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
-- Step 28 已覆盖 read/pread/readv/preadv；pinned BIO 只在单个当前 iovec 段内合并，
-  跨段或非对齐范围仍用 `copy_to_iter`。尚无 page-cache/readahead/splice 全覆盖。
+- Step 45 已让普通文件读经 page cache/readahead；冷 folio 才访问 NVMe 或 daemon。
+  Step 46 的 mmap 仅允许私有 COW 与只读共享，不支持共享脏页写回；
+  远端失效还受 probe 与异步清页调度窗口影响。splice 仍未覆盖。
 - Step 43 已把普通 write/writev/pwritev 统一为 `.write_iter`，但 WRITE_DATA 仍通过
   全局 bounce 锁逐块同步等待 daemon；尚无异步 completion、page-cache write-back。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有

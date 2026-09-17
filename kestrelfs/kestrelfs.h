@@ -16,6 +16,9 @@
 #include <linux/fs.h>
 #include <linux/magic.h>
 #include <linux/mutex.h>
+#include <linux/list.h>
+#include <linux/workqueue.h>
+#include <linux/wait.h>
 
 #include "kestrelfs_ipc.h"
 
@@ -26,6 +29,11 @@ struct kestrelfs_inode_state {
 	struct mutex lifecycle_lock;
 	unsigned int open_handles;
 	u64 pagecache_coherence_epoch;
+	struct inode *inode;
+	struct list_head coherence_link;
+	struct work_struct coherence_work;
+	wait_queue_head_t coherence_wait;
+	bool coherence_work_scheduled;
 };
 
 #define KESTRELFS_NAME		"kestrelfs"
@@ -64,6 +72,8 @@ int kestrelfs_cache_invalidate_all(void);
 /* file.c: serialized daemon durability barrier for inode or mount. */
 int kestrelfs_sync_daemon(u32 opcode, u64 inode_id);
 void kestrelfs_pagecache_coherence_advance(void);
+void kestrelfs_pagecache_register_inode(struct inode *inode);
+void kestrelfs_pagecache_unregister_inode(struct inode *inode);
 
 /* super.c */
 extern struct file_system_type kestrelfs_fs_type;
