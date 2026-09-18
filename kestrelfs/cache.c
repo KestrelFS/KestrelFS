@@ -18,6 +18,7 @@
 #include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/build_bug.h>
+#include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -261,6 +262,19 @@ module_param_named(cache_parallel_hit_peak,
 MODULE_PARM_DESC(cache_parallel_hit_peak,
 		 "peak concurrent cache-hit readers since module load");
 
+static unsigned long kestrelfs_cache_async_hit_submissions;
+module_param_named(cache_async_hit_submissions,
+		   kestrelfs_cache_async_hit_submissions, ulong, 0444);
+MODULE_PARM_DESC(cache_async_hit_submissions,
+		 "cache-hit BIOs submitted with end_io completion");
+
+static unsigned long kestrelfs_cache_async_hit_inflight;
+static unsigned long kestrelfs_cache_async_hit_peak;
+module_param_named(cache_async_hit_peak,
+		   kestrelfs_cache_async_hit_peak, ulong, 0444);
+MODULE_PARM_DESC(cache_async_hit_peak,
+		 "peak cache-hit BIOs in flight since module load");
+
 static unsigned long kestrelfs_cache_coherence_invalidations;
 module_param_named(cache_coherence_invalidations,
 		   kestrelfs_cache_coherence_invalidations, ulong, 0444);
@@ -400,6 +414,48 @@ static void kestrelfs_cache_account_fallback(void)
 	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
 }
 
+struct kestrelfs_cache_hit_bio_wait {
+	struct completion done;
+	blk_status_t status;
+};
+
+static void kestrelfs_cache_hit_end_io(struct bio *bio)
+{
+	struct kestrelfs_cache_hit_bio_wait *wait = bio->bi_private;
+	unsigned long flags;
+
+	wait->status = bio->bi_status;
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_async_hit_inflight--;
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+	complete(&wait->done);
+}
+
+/* VFS read_folio remains synchronous, but hit BIOs use independent async
+ * completions. The cache rwsem read side pins index/slot identity until the
+ * completion has fired and checksum validation has finished.
+ */
+static int kestrelfs_cache_submit_hit_bio(struct bio *bio)
+{
+	struct kestrelfs_cache_hit_bio_wait wait;
+	unsigned long flags;
+
+	init_completion(&wait.done);
+	wait.status = BLK_STS_OK;
+	bio->bi_private = &wait;
+	bio->bi_end_io = kestrelfs_cache_hit_end_io;
+	spin_lock_irqsave(&kestrelfs_cache_runtime_lock, flags);
+	kestrelfs_cache_async_hit_submissions++;
+	kestrelfs_cache_async_hit_inflight++;
+	kestrelfs_cache_async_hit_peak =
+		max(kestrelfs_cache_async_hit_peak,
+		    kestrelfs_cache_async_hit_inflight);
+	spin_unlock_irqrestore(&kestrelfs_cache_runtime_lock, flags);
+	submit_bio(bio);
+	wait_for_completion(&wait.done);
+	return blk_status_to_errno(wait.status);
+}
+
 static u32 kestrelfs_cache_pinned_checksum(struct page **pages,
 					    unsigned int first_offset,
 					    size_t start, size_t length)
@@ -476,7 +532,8 @@ static sector_t kestrelfs_cache_slot_lba(u32 slot)
 	       (sector_t)slot * KESTRELFS_CACHE_SECTORS_PER_BLOCK;
 }
 
-static int kestrelfs_cache_rw_block(void *buffer, sector_t sector, bool write)
+static int kestrelfs_cache_rw_block_common(void *buffer, sector_t sector,
+					   bool write, bool hit)
 {
 	struct page *page;
 	struct bio *bio;
@@ -509,7 +566,7 @@ static int kestrelfs_cache_rw_block(void *buffer, sector_t sector, bool write)
 		goto out_bio;
 	}
 
-	ret = submit_bio_wait(bio);
+	ret = hit ? kestrelfs_cache_submit_hit_bio(bio) : submit_bio_wait(bio);
 	if (ret)
 		goto out_bio;
 
@@ -526,6 +583,16 @@ out_bio:
 out_page:
 	__free_page(page);
 	return ret;
+}
+
+static int kestrelfs_cache_rw_block(void *buffer, sector_t sector, bool write)
+{
+	return kestrelfs_cache_rw_block_common(buffer, sector, write, false);
+}
+
+static int kestrelfs_cache_read_hit_block(void *buffer, sector_t sector)
+{
+	return kestrelfs_cache_rw_block_common(buffer, sector, false, true);
 }
 
 /*
@@ -605,7 +672,7 @@ static int kestrelfs_cache_read_user_blocks(sector_t sector, char __user *buf,
 	}
 
 	submitted = true;
-	ret = submit_bio_wait(bio);
+	ret = kestrelfs_cache_submit_hit_bio(bio);
 	if (!ret) {
 		for (i = 0; i < nr_blocks; i++) {
 			u32 actual = kestrelfs_cache_pinned_checksum(
@@ -1746,7 +1813,7 @@ ssize_t kestrelfs_cache_read_iter(struct inode *inode, struct iov_iter *to,
 			ret = -ENODATA;
 			goto out;
 		}
-		if (kestrelfs_cache_rw_block(block, entry->lba, false)) {
+		if (kestrelfs_cache_read_hit_block(block, entry->lba)) {
 			ret = -ENODATA;
 			goto out;
 		}
@@ -2029,6 +2096,9 @@ int kestrelfs_cache_init(void)
 	kestrelfs_cache_journal_recoveries = 0;
 	kestrelfs_cache_active_hit_readers = 0;
 	kestrelfs_cache_parallel_hit_peak = 0;
+	kestrelfs_cache_async_hit_submissions = 0;
+	kestrelfs_cache_async_hit_inflight = 0;
+	kestrelfs_cache_async_hit_peak = 0;
 	kestrelfs_cache_coherence_invalidations = 0;
 	kestrelfs_cache_coherence_inode_batches = 0;
 	kestrelfs_cache_coherence_inode_entries = 0;
@@ -2076,7 +2146,7 @@ err_release:
 void kestrelfs_cache_exit(void)
 {
 	down_write(&kestrelfs_cache_lock);
-	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu eviction_batches=%lu eviction_batch_slots=%lu eviction_index_writes=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu coherence_invalidations=%lu coherence_inode_batches=%lu coherence_inode_entries=%lu\n",
+	pr_info("kestrelfs: cache stats direct_blocks=%lu copied_blocks=%lu direct_fallbacks=%lu evictions=%lu eviction_batches=%lu eviction_batch_slots=%lu eviction_index_writes=%lu checksum_failures=%lu journal_recoveries=%lu parallel_hit_peak=%lu async_hit_submissions=%lu async_hit_peak=%lu coherence_invalidations=%lu coherence_inode_batches=%lu coherence_inode_entries=%lu\n",
 		kestrelfs_cache_direct_hit_blocks,
 		kestrelfs_cache_copy_hit_blocks,
 		kestrelfs_cache_direct_fallbacks,
@@ -2087,6 +2157,8 @@ void kestrelfs_cache_exit(void)
 		kestrelfs_cache_checksum_failures,
 		kestrelfs_cache_journal_recoveries,
 		kestrelfs_cache_parallel_hit_peak,
+		kestrelfs_cache_async_hit_submissions,
+		kestrelfs_cache_async_hit_peak,
 		kestrelfs_cache_coherence_invalidations,
 		kestrelfs_cache_coherence_inode_batches,
 		kestrelfs_cache_coherence_inode_entries);

@@ -499,8 +499,9 @@ const struct file_operations kestrelfs_remote_file_ops = {
 };
 
 /* Fill one locked folio from the kernel block cache or authoritative daemon.
- * The bounce mutex also orders this cold-page fill against synchronous writes
- * and truncate. Warm filemap reads never need the mutex or daemon.
+ * Cache hits use the cache rwsem and can overlap on different folios. Only a
+ * miss needs the bounce mutex; recheck the cache once acquired because another
+ * reader may have filled it while this folio waited.
  */
 static int kestrelfs_read_folio(struct file *file, struct folio *folio)
 {
@@ -518,7 +519,6 @@ static int kestrelfs_read_folio(struct file *file, struct folio *folio)
 		ret = -ENOMEM;
 		goto out_unlock_folio;
 	}
-	mutex_lock(&kestrelfs_data_ipc_lock);
 	size = i_size_read(inode);
 	wanted = offset < size ? min_t(u64, length, size - offset) : 0;
 	while (done < wanted) {
@@ -541,7 +541,32 @@ static int kestrelfs_read_folio(struct file *file, struct folio *folio)
 		if (hit >= 0) {
 			if (hit != chunk) {
 				ret = -EIO;
-				goto out_unlock_mutex;
+				goto out_copy;
+			}
+			done += hit;
+			continue;
+		}
+		if (hit != -ENODATA) {
+			ret = hit;
+			goto out_copy;
+		}
+
+		mutex_lock(&kestrelfs_data_ipc_lock);
+		size = i_size_read(inode);
+		if (pos >= size) {
+			mutex_unlock(&kestrelfs_data_ipc_lock);
+			break;
+		}
+		chunk = min_t(u64, chunk, size - pos);
+		vec.iov_len = chunk;
+		iov_iter_kvec(&iter, ITER_DEST, &vec, 1, chunk);
+		hit = kestrelfs_cache_read_iter(inode, &iter, &pos,
+						&miss_epoch);
+		if (hit >= 0) {
+			mutex_unlock(&kestrelfs_data_ipc_lock);
+			if (hit != chunk) {
+				ret = -EIO;
+				goto out_copy;
 			}
 			done += hit;
 			continue;
@@ -579,9 +604,12 @@ static int kestrelfs_read_folio(struct file *file, struct folio *folio)
 		kestrelfs_cache_fill(inode, pos, region->data_buffer, actual,
 					miss_epoch);
 		done += actual;
+		mutex_unlock(&kestrelfs_data_ipc_lock);
 	}
+	goto out_copy;
 out_unlock_mutex:
 	mutex_unlock(&kestrelfs_data_ipc_lock);
+out_copy:
 	if (!ret) {
 		memcpy_to_folio(folio, 0, buffer, length);
 		folio_mark_uptodate(folio);

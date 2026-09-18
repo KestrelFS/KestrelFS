@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 47 本地文件锁已验收；下一步 Step 48 KERNEL-CACHE-ASYNC；IPC ABI v21；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 48 cache hit 异步 BIO 已验收；下一步 Step 49 CACHE-WRITE；IPC ABI v21；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -49,8 +49,8 @@
 > `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`，拒绝共享写入/`mprotect` 升级；
 > 写后旧映射重新 fault，远端 revision 触发异步映射清理。Step 47 已在同一挂载节点支持普通文件 flock、POSIX `fcntl` 字节锁和 OFD 锁；锁由内核
 > 本地管理，进程退出自动释放，不跨节点或跨挂载协调。仍无脏页写回或可写共享 mmap。
-> `WHITEOUT`、真正的异步 completion
-> 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
+> Step 48 的 cache hit 已采用异步 BIO completion；VFS 读调用仍等待结果。
+> `WHITEOUT`、跨 BIO 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -152,7 +152,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–47 已验收；下一步 Step 48 KERNEL-CACHE-ASYNC（ABI v21 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–48 已验收；下一步 Step 49 CACHE-WRITE（ABI v21 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -488,8 +488,9 @@ Step 34 支持 create/mkdir mode 与
   尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。S3 delete 失败会保留队列并
   重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加 IPC 尾延迟。
 - Phase 4 v4 绑定 namespace；CRC32 非密码学；半提交可安全 miss，但无双
-  superblock/metadata 镜像；不同 reader 的 hit 可并行，但每个 BIO 仍同步等待，
-  mutation 会等待在途 reader。Step 42（ABI v20）已把正常 Redis revision 变化
+  superblock/metadata 镜像；Step 48 已实现多个 hit BIO 异步提交、分别
+  completion 唤醒，但 VFS 调用仍等待自己的 BIO，mutation 会等待在途 reader。
+  Step 42（ABI v20）已把正常 Redis revision 变化
   收窄为最多 64 inode 的批量失效，并保留全量 fail-closed 回退；提交到 probe 前仍
   可能短暂旧 hit，daemon 离线期间无 lease，也没有 range 消息或生产级 pub/sub。
   Step 29 可用一次
@@ -501,7 +502,8 @@ Step 34 支持 create/mkdir mode 与
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
 - Step 43 已把普通 write/writev/pwritev 统一为 `.write_iter`，但 WRITE_DATA 仍通过
-  全局 bounce 锁逐块同步等待 daemon；尚无异步 completion、page-cache write-back。
+  全局 bounce 锁逐块同步等待 daemon；Step 48 只改变 cache hit BIO，未实现
+  WRITE_DATA 的异步 completion 或 page-cache write-back。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有
   引用对象和本地对象目录树。FileMetaStore/LocalFs 同步文件与目录项；Mem 仅内存生效，
   Redis 已 ACK 的 mutation 崩溃耐久仍取决于 AOF/RDB 设置（RDB 不保证逐次 fsync），

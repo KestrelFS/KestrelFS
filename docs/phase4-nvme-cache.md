@@ -55,6 +55,17 @@ journal 和损坏 entry 退休持有写侧。写侧取得锁之前会等待所�
 取得写锁，仅在 generation 仍相同时退休 entry，避免误删期间重填的新版本。该步
 不改变 IPC ABI v11 或 cache format v4。
 
+Step 48（待 Cursor 验收）在上述 rwsem 生命周期内，把 read hit 的 buffered
+4 KiB BIO 与 pinned-page BIO 改为 `submit_bio`、独立 `end_io`/completion 和
+按请求唤醒；`cache_async_hit_submissions`/`cache_async_hit_peak` 统计提交数
+与峰值在途 BIO。CRC 仍在 completion 后校验，损坏条目按原 generation 检查退休；
+写侧 invalidate/fill/evict 直到所有持读锁的 BIO 完成后才可复用 slot。Step 45
+的冷 folio 先不持 bounce 锁查 cache，miss 进入 bounce 锁后重查并执行同步
+`READ_DATA`/fill，允许同 inode 不同 folio 真正重叠提交 hit BIO。VFS
+`read_folio` 仍同步等待自己的 completion；metadata/index/journal/fill 写入仍用
+同步等待，未提供用户态异步接口或单请求多 BIO 流水线。IPC ABI v21、format v4
+未变；验证见 `test-step48-cache-async-vng.sh`。
+
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
 open，避免模块持有期间读取不一致快照。它报告 namespace、geometry、
@@ -317,12 +328,13 @@ Redis 共享 MetaStore 还有一条 daemon→kernel 远端失效路径：daemon 
 fill、evict 共享 rwsem 写侧，所以 pinned-page hit 要么在失效前完整结束，要么在
 失效后 miss。FileMetaStore/MemStore 没有共享 revision，不启用这一路径。
 
-`kestrelfs_cache_lock` 是 rwsem。hit 的读侧覆盖 index 检查、用户页 pin、整个同步
-BIO、CRC 和 unpin；invalidate/fill/evict/journal mutation 必须取得写侧。因此正在
+`kestrelfs_cache_lock` 是 rwsem。hit 的读侧覆盖 index 检查、用户页 pin、整个 BIO
+completion、CRC 和 unpin；invalidate/fill/evict/journal mutation 必须取得写侧。因此正在
 进行的 hit 要么在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot
 不会在 DMA 期间被驱逐、释放或复用。LRU touch 和 reader/counter 更新用独立短时
-spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutation 会等待慢 reader，
-当前还不是异步 completion pipeline，也没有 per-entry refcount/RCU。
+spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。Step 48 待验收的 hit
+`end_io`/completion 让请求独立提交与唤醒，但 VFS 读仍等待自己的结果；代价是
+mutation 会等待慢 reader，也没有 per-entry refcount/RCU。
 
 ## 故障与安全原则
 
@@ -342,9 +354,9 @@ spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。代价是 mutat
   存在碰撞概率；当前没有双 superblock 或 metadata 镜像，单 journal 还会给每次
   metadata mutation 增加两次同步写/flush。
 - Step 22/26 是 read hit 的受限少拷贝并行路径：完整、对齐、连续块可以直达用户
-  页，多个调用者可并行等待各自的同步 BIO；Step 28 通过 `read_iter` 覆盖
+  页，Step 48 待验收改为多个调用者异步提交 BIO、分别等待 completion；Step 28 通过 `read_iter` 覆盖
   read/pread/readv/preadv，但跨 iovec、partial block 和不能 pin/对齐的 buffer 仍有
-  一次 `copy_to_iter()`。它不是异步 completion、page-cache/readahead/splice 全覆盖，
+  一次 `copy_to_iter()`。Step 45 的普通读已改经 page-cache/readahead；仍无 splice 全覆盖、
   也没有跨 iovec scatter-gather BIO 或单次请求内的多 BIO pipeline。
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
