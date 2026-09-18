@@ -354,7 +354,7 @@ mutation 会等待慢 reader，也没有 per-entry refcount/RCU。
   存在碰撞概率；当前没有双 superblock 或 metadata 镜像，单 journal 还会给每次
   metadata mutation 增加两次同步写/flush。
 - Step 22/26 是 read hit 的受限少拷贝并行路径：完整、对齐、连续块可以直达用户
-  页，Step 48 待验收改为多个调用者异步提交 BIO、分别等待 completion；Step 28 通过 `read_iter` 覆盖
+  页，Step 48 改为多个调用者异步提交 BIO、分别等待 completion；Step 28 通过 `read_iter` 覆盖
   read/pread/readv/preadv，但跨 iovec、partial block 和不能 pin/对齐的 buffer 仍有
   一次 `copy_to_iter()`。Step 45 的普通读已改经 page-cache/readahead；仍无 splice 全覆盖、
   也没有跨 iovec scatter-gather BIO 或单次请求内的多 BIO pipeline。
