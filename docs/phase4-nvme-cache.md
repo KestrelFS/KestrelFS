@@ -332,7 +332,7 @@ fill、evict 共享 rwsem 写侧，所以 pinned-page hit 要么在失效前完�
 completion、CRC 和 unpin；invalidate/fill/evict/journal mutation 必须取得写侧。因此正在
 进行的 hit 要么在 mutation 前完整读到旧版本，要么在失效完成后看不到条目；slot
 不会在 DMA 期间被驱逐、释放或复用。LRU touch 和 reader/counter 更新用独立短时
-spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。Step 48 待验收的 hit
+spinlock 保护，使读侧持锁的多个 BIO 能实际重叠。Step 48 的 hit
 `end_io`/completion 让请求独立提交与唤醒，但 VFS 读仍等待自己的结果；代价是
 mutation 会等待慢 reader，也没有 per-entry refcount/RCU。
 
