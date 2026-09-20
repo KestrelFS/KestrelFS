@@ -13,6 +13,7 @@
 #include <linux/time.h>
 #include <linux/delay.h>
 #include <linux/unaligned.h>
+#include <linux/capability.h>
 
 #include "kestrelfs.h"
 #include "kestrelfs_ipc.h"
@@ -627,7 +628,7 @@ static int kestrelfs_inode_rmdir(struct inode *dir, struct dentry *dentry)
  *
  * Sends KESTRELFS_OP_RENAME_DATA to daemon. Supports same-directory rename
  * and cross-directory moves with POSIX semantics (atomic replacement and
- * RENAME_NOREPLACE and RENAME_EXCHANGE).
+ * RENAME_NOREPLACE, RENAME_EXCHANGE, and RENAME_WHITEOUT).
  * Names are concatenated in the shared data bounce buffer, so each may be up
  * to KESTRELFS_RENAME_DATA_NAME_MAX bytes.
  */
@@ -654,19 +655,25 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	bool target_is_dir = d_really_is_positive(new_dentry) &&
 		S_ISDIR(d_inode(new_dentry)->i_mode);
 	bool exchange = flags & RENAME_EXCHANGE;
+	bool whiteout = flags & RENAME_WHITEOUT;
 	int ret;
 
 	pr_info("kestrelfs: rename old_parent=%lu old_name=\"%s\" new_parent=%lu new_name=\"%s\" flags=0x%x\n",
 		old_dir->i_ino, old_name, new_dir->i_ino, new_name, flags);
 
-	/* WHITEOUT/unknown bits and NOREPLACE|EXCHANGE remain unsupported. */
-	if ((flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE)) ||
-	    (flags & RENAME_NOREPLACE && flags & RENAME_EXCHANGE)) {
+	/* Linux permits WHITEOUT|NOREPLACE, but EXCHANGE is exclusive. */
+	if ((flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE |
+		       RENAME_WHITEOUT)) ||
+	    (flags & RENAME_EXCHANGE &&
+	     flags & (RENAME_NOREPLACE | RENAME_WHITEOUT))) {
 		pr_warn("kestrelfs: rename flags 0x%x not supported\n", flags);
 		return -EINVAL;
 	}
 	static_assert(RENAME_NOREPLACE == KESTRELFS_RENAME_NOREPLACE);
 	static_assert(RENAME_EXCHANGE == KESTRELFS_RENAME_EXCHANGE);
+	static_assert(RENAME_WHITEOUT == KESTRELFS_RENAME_WHITEOUT);
+	if (whiteout && !capable(CAP_MKNOD))
+		return -EPERM;
 	if (exchange && !replaced)
 		return -ENOENT;
 
@@ -682,7 +689,8 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 	if (old_name_len + new_name_len > KESTRELFS_DATA_BUFFER_SIZE)
 		return -ENAMETOOLONG;
 	/* A NOREPLACE request must leave cache state untouched on EEXIST. */
-	if (replaced && replaced != d_inode(old_dentry) && flags == 0 &&
+	if (replaced && replaced != d_inode(old_dentry) &&
+	    !(flags & (RENAME_NOREPLACE | RENAME_EXCHANGE)) &&
 	    S_ISREG(replaced->i_mode)) {
 		replaced_state = replaced->i_private;
 		if (!replaced_state)
@@ -693,7 +701,8 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 		defer_reclaim = replaced->i_nlink == 1 &&
 			replaced_state->open_handles > 0;
 	}
-	if (replaced && replaced != d_inode(old_dentry) && flags == 0 &&
+	if (replaced && replaced != d_inode(old_dentry) &&
+	    !(flags & (RENAME_NOREPLACE | RENAME_EXCHANGE)) &&
 	    !defer_reclaim) {
 		ret = kestrelfs_cache_invalidate_inode(replaced->i_ino);
 		if (ret)

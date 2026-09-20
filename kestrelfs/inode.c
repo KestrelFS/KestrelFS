@@ -180,6 +180,12 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
 		set_nlink(inode, nlink);
+	} else if (S_ISCHR(mode)) {
+		/* RENAME_WHITEOUT is persisted as Linux's conventional 0:0
+		 * character device. No arbitrary mknod path is exposed.
+		 */
+		init_special_inode(inode, mode, WHITEOUT_DEV);
+		set_nlink(inode, nlink);
 	} else {
 		/* Unsupported file type */
 		iget_failed(inode);

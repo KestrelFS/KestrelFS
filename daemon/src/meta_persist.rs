@@ -355,7 +355,7 @@ impl MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{ROOT_INODE, S_IFDIR, S_IFLNK, S_IFREG};
+    use crate::fs_model::{ROOT_INODE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFREG};
     use crate::meta::{REMOTE_TXT_INODE, WRITABLE_DAT_INODE};
     use tempfile::TempDir;
 
@@ -606,6 +606,39 @@ mod tests {
         assert_eq!(restored.lookup(ROOT_INODE, "exchange-left").await.unwrap(), right);
         assert_eq!(restored.lookup(ROOT_INODE, "exchange-right").await.unwrap(), left);
         assert!(restored.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_whiteout_marker_survives_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let source;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            source = store.create(ROOT_INODE, "whiteout-old", 0o640).await.unwrap();
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "whiteout-old",
+                    ROOT_INODE,
+                    "whiteout-new",
+                    crate::meta::RENAME_WHITEOUT,
+                )
+                .await
+                .unwrap();
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(restored.lookup(ROOT_INODE, "whiteout-new").await.unwrap(), source);
+        let marker = restored.lookup(ROOT_INODE, "whiteout-old").await.unwrap();
+        assert_ne!(marker, source);
+        assert_eq!(restored.getattr(marker).await.unwrap().mode, S_IFCHR);
+        assert!(restored
+            .readdir(ROOT_INODE)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(ino, name)| *ino == marker && name == "whiteout-old"));
     }
 
     #[tokio::test]

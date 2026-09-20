@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 49 write-through 已验收；下一步 Step 50 双包：可写 MAP_SHARED + WHITEOUT；IPC ABI v21；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 50 可写 MAP_SHARED + WHITEOUT 已验收；下一步 Step 51 双包 WRITE-BEHIND + OPS/DOC；IPC ABI v22；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -47,11 +47,13 @@
 > 冷页仍由内核块缓存或 `READ_DATA` 填充；Step 49 已落地 write-through aops（脏 folio → writepages/WRITE_DATA；fsync 先写回再屏障）；
 > 标脏和 `writepages` 同步写回 daemon，成功后保留干净 page-cache 页；
 > 热读不再走 Step 28 直达用户页路径。Step 46 已支持普通文件
-> `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`，拒绝共享写入/`mprotect` 升级；
+> `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`；Step 50 已在同一 write-through
+> 路径上启用可写 `MAP_SHARED`，覆盖 `msync`/`fsync`/`munmap`；
 > 写后旧映射重新 fault，远端 revision 触发异步映射清理。Step 47 已在同一挂载节点支持普通文件 flock、POSIX `fcntl` 字节锁和 OFD 锁；锁由内核
-> 本地管理，进程退出自动释放，不跨节点或跨挂载协调。可写共享 mmap 仍未实现。
+> 本地管理，进程退出自动释放，不跨节点或跨挂载协调。
 > Step 48 的 cache hit 已采用异步 BIO completion；VFS 读调用仍等待结果。
-> `WHITEOUT`、跨 BIO 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
+> Step 50 同时支持原子 `RENAME_WHITEOUT`，在旧路径持久化 0:0 字符设备 marker。
+> 跨 BIO 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -153,7 +155,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–49 已验收；下一步 Step 50 双包 MAP-SHARED-WRITE+WHITEOUT（ABI v21 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–50 已验收；下一步 Step 51 双包 WRITE-BEHIND+OPS/DOC（ABI v22 / format v4） |
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -168,7 +170,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v21）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v22）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -186,7 +188,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step44-fsync-vng.sh           # fsync/syncfs 与强杀 daemon 后重启验证
 ├── test-step44-fsync.c                # 文件同步、离线拒绝和读回辅助程序
 ├── test-step45-kernel-aops-vng.sh     # 读侧 folio/page cache 与写后清页 vng 回归
-├── test-step46-kernel-mmap-vng.sh     # 文件 mmap/COW/失效/共享写拒绝 vng 回归
+├── test-step46-kernel-mmap-vng.sh     # 文件 mmap/COW/失效/共享写能力 vng 回归
 ├── test-step46-kernel-mmap.c          # mmap 行为测试助手
 ├── test-step47-kernel-locks-vng.sh    # 本地文件锁争用/等待/退出清理 vng 回归
 ├── test-step47-kernel-locks.c         # flock/POSIX/OFD 锁测试助手
@@ -199,6 +201,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step39-posix-chown.c          # open-unlink fchown 测试助手
 ├── test-step40-posix-utimes-vng.sh    # 文件/目录时间、重启与 orphan 回归
 ├── test-step40-posix-utimes.c         # open-unlink futimens 测试助手
+├── test-step50-vng.sh                 # 可写 MAP_SHARED + WHITEOUT 双包回归
+├── test-step50-map-shared.c           # mmap 写、同步、COW 与重启测试助手
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -471,7 +475,8 @@ offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 Ki
 
 Phase 3 已支持 create/mkdir/unlink/rmdir/rename/symlink、16 KiB bounce 读写、
 truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链接，Step 33
-支持 `RENAME_NOREPLACE`，Step 38 支持与其互斥的原子 `RENAME_EXCHANGE`；
+支持 `RENAME_NOREPLACE`，Step 38 支持原子 `RENAME_EXCHANGE`，Step 50 支持
+`RENAME_WHITEOUT`（`WHITEOUT|NOREPLACE` 合法，`EXCHANGE` 与二者互斥）；
 Step 34 支持 create/mkdir mode 与
 `2 + 直接子目录数` 的持久化目录 nlink。仍缺：
 
@@ -479,7 +484,8 @@ Step 34 支持 create/mkdir mode 与
   不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37/39 已实现文件/目录
   持久 chmod 与 chown/fchown。Step 40 已实现显式 atime/mtime，当前
   仅有秒级精度，自动读 atime 与 ctime 不持久化；mode/owner/time 与 size 的单事务仍未实现。
-  `RENAME_WHITEOUT` 仍返回 `EINVAL`；symlink 目标目前要求 UTF-8，最长 4095 字节。
+  whiteout 是 rename 内部生成的 0:0 字符设备 marker，不开放通用 `mknod`；
+  symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
 - 数据/名字 IPC 由一把全局 mutex 串行化。
@@ -499,8 +505,10 @@ Step 34 支持 create/mkdir mode 与
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 45 已让普通文件读经 page cache/readahead；冷 folio 才访问 NVMe 或 daemon。
   Step 49 已落地的 buffered write 使用 dirty folio/writepages，但写调用仍等待 daemon，
-  成功后保留干净 folio；Step 46 的 mmap 仅允许私有 COW 与只读共享，不支持共享写入；
-  远端失效还受 probe 与异步清页调度窗口影响。splice 仍未覆盖。
+  成功后保留干净 folio；Step 50 已启用可写 `MAP_SHARED`，共享脏页沿同一同步
+  write-through 路径经 `msync`/`fsync`/VMA close 写回。`munmap` 本身没有 errno
+  返回通道，失败依赖 mapping errseq 与后续 `fsync`/`flush` 报告；远端失效还受
+  probe 与异步清页调度窗口影响。splice 仍未覆盖。
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
 - Step 49 的普通 write/writev/pwritev 先写入 VFS folio，再由 aops 经

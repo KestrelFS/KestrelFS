@@ -563,8 +563,11 @@
  * the following new_name_len bytes hold new_name. Neither is NUL-terminated.
  * Each name is limited to POSIX NAME_MAX (255 bytes), and their combined
  * length MUST fit in KESTRELFS_DATA_BUFFER_SIZE. The event-header flags remain
- * zero; the payload rename flags permit KESTRELFS_RENAME_NOREPLACE or
- * KESTRELFS_RENAME_EXCHANGE. The two flags are mutually exclusive.
+ * zero; the payload rename flags permit KESTRELFS_RENAME_NOREPLACE,
+ * KESTRELFS_RENAME_EXCHANGE, and KESTRELFS_RENAME_WHITEOUT. EXCHANGE is
+ * mutually exclusive with both other flags; WHITEOUT may be combined with
+ * NOREPLACE, matching renameat2(2). WHITEOUT atomically installs a persistent
+ * S_IFCHR(0,0) inode at the old name after moving the source.
  *
  * RESPONSE and rename semantics are identical to legacy KESTRELFS_OP_RENAME.
  * The legacy opcode remains in ABI v9 for compatibility tests; normal VFS
@@ -575,6 +578,7 @@
 #define KESTRELFS_RENAME_DATA_NAME_MAX	255
 #define KESTRELFS_RENAME_NOREPLACE	0x00000001U
 #define KESTRELFS_RENAME_EXCHANGE	0x00000002U
+#define KESTRELFS_RENAME_WHITEOUT	0x00000004U
 #define KESTRELFS_LIFECYCLE_DEFER_RECLAIM	0x00000001U
 
 /*
@@ -855,8 +859,11 @@ struct kestrelfs_ring_ctrl {
  *       cache coherence. Shared-memory and event layouts are unchanged.
  *  21 - Phase 4 step 44: FSYNC (inode_id@0) and SYNC_FS (zero payload)
  *       durability barriers; event/shared-memory layouts are unchanged.
+ *  22 - Phase 4 step 50: RENAME_DATA accepts RENAME_WHITEOUT and metadata
+ *       may return persistent S_IFCHR(0,0) whiteout inodes. Payload and
+ *       shared-memory layouts are unchanged.
  */
-#define KESTRELFS_ABI_VERSION		21
+#define KESTRELFS_ABI_VERSION		22
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.

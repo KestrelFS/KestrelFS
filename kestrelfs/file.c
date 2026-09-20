@@ -189,8 +189,56 @@ static vm_fault_t kestrelfs_regular_mmap_fault(struct vm_fault *vmf)
 	return filemap_fault(vmf);
 }
 
+static vm_fault_t kestrelfs_regular_page_mkwrite(struct vm_fault *vmf)
+{
+	struct kestrelfs_inode_state *state =
+		file_inode(vmf->vma->vm_file)->i_private;
+
+	if (!state)
+		return VM_FAULT_SIGBUS;
+	/* Do not dirty a folio from a stale writable PTE after a remote
+	 * namespace revision.  The worker zaps old PTEs/pages first, then the
+	 * fault is retried against the current authoritative contents.
+	 */
+	if (READ_ONCE(state->pagecache_coherence_epoch) !=
+	    atomic64_read(&kestrelfs_pagecache_coherence_epoch)) {
+		kestrelfs_pagecache_schedule_coherence(state);
+		if (!fault_flag_allow_retry_first(vmf->flags))
+			return VM_FAULT_SIGBUS;
+		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+			return VM_FAULT_RETRY;
+		release_fault_lock(vmf);
+		wait_event(state->coherence_wait,
+			READ_ONCE(state->pagecache_coherence_epoch) ==
+			atomic64_read(&kestrelfs_pagecache_coherence_epoch));
+		return VM_FAULT_RETRY;
+	}
+	return filemap_page_mkwrite(vmf);
+}
+
+static void kestrelfs_regular_mmap_close(struct vm_area_struct *vma)
+{
+	struct file *file = vma->vm_file;
+	loff_t start = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
+	loff_t length = vma->vm_end - vma->vm_start;
+	loff_t end;
+
+	/* VM_WRITE may have been cleared by mprotect() after the mapping dirtied
+	 * pages. VM_MAYWRITE records that this shared VMA could have written.
+	 */
+	if (!(vma->vm_flags & VM_SHARED) || !(vma->vm_flags & VM_MAYWRITE))
+		return;
+	end = length > LLONG_MAX - start ? LLONG_MAX : start + length - 1;
+	/* munmap has no errno channel.  Attempt write-through here and retain any
+	 * failure in mapping errseq so a later fsync/close observes it.
+	 */
+	filemap_write_and_wait_range(file->f_mapping, start, end);
+}
+
 static const struct vm_operations_struct kestrelfs_regular_vm_ops = {
 	.fault = kestrelfs_regular_mmap_fault,
+	.page_mkwrite = kestrelfs_regular_page_mkwrite,
+	.close = kestrelfs_regular_mmap_close,
 };
 
 static int kestrelfs_regular_mmap(struct file *file,
@@ -201,11 +249,6 @@ static int kestrelfs_regular_mmap(struct file *file,
 
 	if (!state)
 		return -EIO;
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
-		return -EOPNOTSUPP;
-	/* A read-only shared VMA must not become writable via mprotect(). */
-	if (vma->vm_flags & VM_SHARED)
-		vm_flags_clear(vma, VM_MAYWRITE);
 	ret = generic_file_mmap(file, vma);
 	if (ret)
 		return ret;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Step 46: file mmap, mapped invalidation, COW and shared-write rejection.
+# Step 46 regression, updated by Step 50 for writable shared mappings.
 set -euo pipefail
 ulimit -c 0
 

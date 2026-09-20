@@ -66,7 +66,7 @@ Step 48 在上述 rwsem 生命周期内，把 read hit 的 buffered
 同步等待，未提供用户态异步接口或单请求多 BIO 流水线。IPC ABI v21、format v4
 未变；验证见 `test-step48-cache-async-vng.sh`。
 
-Step 49（待 Cursor 验收）让普通 write/writev 经 VFS folio 的
+Step 49（已验收）让普通 write/writev 经 VFS folio 的
 `write_begin`/`write_end` 标 dirty；注册可写回 BDI 后，`writepages` 对每个
 folio 先失效 NVMe read index，再通过已有 16 KiB bounce `WRITE_DATA` 提交
 权威 daemon。`write_iter` 在返回前等待 writeback，成功后保留 clean filemap
@@ -74,8 +74,20 @@ folio 先失效 NVMe read index，再通过已有 16 KiB bounce `WRITE_DATA` 提
 写回，再调用 daemon 对象/元数据屏障；close `.flush` 也等待写回但不是
 fsync。失败时 redirty folio、记录 mapping/superblock 错误并返回错误，
 不宣称仅内存脏页已经持久。写入 dirtying 前后与实际提交前都按 inode 保守
-失效 NVMe 读索引；truncate 先写回再更改 size。可写 `MAP_SHARED` 仍拒绝。
+失效 NVMe 读索引；truncate 先写回再更改 size。Step 49 本身仍拒绝可写
+`MAP_SHARED`。
 IPC ABI v21、cache format v4 不变；测试见 `test-step49-cache-write-vng.sh`。
+
+Step 50 在相同 write-through aops 上启用可写 `MAP_SHARED`。共享 VMA 的
+`page_mkwrite` 在 filemap 页首次变脏前检查挂载 page-cache epoch；若 Redis
+revision 或本地 mutation 已令映射过期，则先调度既有 mapping 清理并重试，清理
+失败时以 `SIGBUS` fail closed。共享脏 folio 继续由 `writepages` 失效 NVMe 读索引，
+再经 `WRITE_DATA` 同步写入权威 daemon；`msync`/`fsync` 使用标准 filemap 写回，
+writable VMA 的 close 也同步等待映射范围，防止普通 `munmap` 静默遗留脏页。
+后者没有向 `munmap` 返回 errno 的 VFS 通道，因此失败会保留 mapping errseq/脏页，
+由后续 `fsync`/`flush` 暴露，而不会标记为已持久。IPC ABI 因同一步的 whiteout
+inode 类型变为 v22；缓存磁盘布局不变，仍为 format v4。测试见
+`test-step50-vng.sh` 与 `test-step50-map-shared.c`。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive

@@ -119,10 +119,11 @@ test "$(stat -c %h "$mnt/hardlink-source-long-name")" -eq 2
 grep -Fx 'step33-hardlink-data' "$mnt/hardlink-alias-long-name"
 echo 'STEP33_NOREPLACE_HARDLINK_VFS_EEXIST_NOOP_PASS'
 
-# Unsupported WHITEOUT is rejected, and neither namespace entry changes.
-if "$helper" "$mnt/collision-source-long-name" "$mnt/collision-target-long-name" 4 \
-	2>"$data_dir/whiteout.err"; then
-	echo 'STEP33_FAIL: unsupported WHITEOUT unexpectedly succeeded'
+# Unknown rename flags are rejected, and neither namespace entry changes.
+# Positive WHITEOUT behavior is covered by the Step 50 script.
+if "$helper" "$mnt/collision-source-long-name" "$mnt/collision-target-long-name" 8 \
+	2>"$data_dir/unknown-flags.err"; then
+	echo 'STEP33_FAIL: unknown rename flag unexpectedly succeeded'
 	exit 1
 else
 	status=$?

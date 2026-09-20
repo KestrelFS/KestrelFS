@@ -164,14 +164,17 @@ test "$(stat -c %h "$mnt/hard-right")" -eq 2
 grep -Fx 'hard-left-data' "$mnt/hard-alias"
 echo 'STEP38_HARDLINK_EXCHANGE_PASS'
 
-# Missing target, mutually exclusive flags, WHITEOUT and ancestry cycles must
-# fail before either dirent changes.
+# Missing target, mutually exclusive EXCHANGE combinations, unknown flags and
+# ancestry cycles must fail before either dirent changes. WHITEOUT itself is
+# covered by the Step 50 script.
 expect_errno 2 "$mnt/file-left-long-name" "$mnt/missing" 2 \
 	"$data_dir/missing.err"
 expect_errno 22 "$mnt/file-left-long-name" "$mnt/file-right-long-name" 3 \
 	"$data_dir/conflicting-flags.err"
-expect_errno 22 "$mnt/file-left-long-name" "$mnt/file-right-long-name" 4 \
-	"$data_dir/whiteout.err"
+expect_errno 22 "$mnt/file-left-long-name" "$mnt/file-right-long-name" 6 \
+	"$data_dir/exchange-whiteout.err"
+expect_errno 22 "$mnt/file-left-long-name" "$mnt/file-right-long-name" 8 \
+	"$data_dir/unknown-flags.err"
 expect_errno 22 "$mnt/parent-left" "$mnt/parent-left/dir-left" 2 \
 	"$data_dir/cycle.err"
 test "$(stat -c %i "$mnt/file-left-long-name")" = "$right_inode"

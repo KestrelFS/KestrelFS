@@ -1297,7 +1297,7 @@ impl MetaStore for RedisMetaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{ROOT_INODE, S_IFDIR, S_IFREG};
+    use crate::fs_model::{ROOT_INODE, S_IFCHR, S_IFDIR, S_IFREG};
     use uuid::Uuid;
 
     #[test]
@@ -1854,6 +1854,28 @@ mod tests {
             exchange_left
         );
 
+        let whiteout_source = store
+            .create(directory, "whiteout-source", 0o640)
+            .await
+            .unwrap();
+        store
+            .rename_with_flags(
+                directory,
+                "whiteout-source",
+                directory,
+                "whiteout-target",
+                crate::meta::RENAME_WHITEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.lookup(directory, "whiteout-target").await.unwrap(),
+            whiteout_source
+        );
+        let whiteout = peer.lookup(directory, "whiteout-source").await.unwrap();
+        assert_ne!(whiteout, whiteout_source);
+        assert_eq!(peer.getattr(whiteout).await.unwrap().mode, S_IFCHR);
+
         let source = store.create(directory, "source", 0o644).await.unwrap();
         assert_eq!(
             store
@@ -1925,6 +1947,15 @@ mod tests {
             restarted.lookup(directory, "exchange-right").await.unwrap(),
             exchange_left
         );
+        assert_eq!(
+            restarted.lookup(directory, "whiteout-target").await.unwrap(),
+            whiteout_source
+        );
+        let restored_whiteout = restarted
+            .lookup(directory, "whiteout-source")
+            .await
+            .unwrap();
+        assert_eq!(restarted.getattr(restored_whiteout).await.unwrap().mode, S_IFCHR);
         assert_eq!(restarted.pending_garbage().await.unwrap(), pending);
         restarted.acknowledge_garbage(&pending).await.unwrap();
         assert!(restarted.pending_garbage().await.unwrap().is_empty());

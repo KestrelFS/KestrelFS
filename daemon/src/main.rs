@@ -4092,6 +4092,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_data_whiteout_moves_source_and_exposes_char_marker() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        let source = store
+            .create(fs_model::ROOT_INODE, "whiteout-source", fs_model::S_IFREG | 0o640)
+            .await
+            .unwrap();
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_rename_data_req_with_flags(
+            708,
+            fs_model::ROOT_INODE,
+            "whiteout-source",
+            fs_model::ROOT_INODE,
+            "whiteout-target",
+            abi::RENAME_WHITEOUT,
+            &mut data_buffer,
+        );
+
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        assert_eq!(response.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            store.lookup(fs_model::ROOT_INODE, "whiteout-target").await.unwrap(),
+            source
+        );
+        let marker = store
+            .lookup(fs_model::ROOT_INODE, "whiteout-source")
+            .await
+            .unwrap();
+        assert_ne!(marker, source);
+        assert_eq!(store.getattr(marker).await.unwrap().mode, fs_model::S_IFCHR);
+    }
+
+    #[tokio::test]
     async fn rename_data_noreplace_same_inode_aliases_is_successful_noop() {
         let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
         let object_store: Arc<dyn ObjectStore> =

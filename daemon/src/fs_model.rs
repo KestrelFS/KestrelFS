@@ -121,6 +121,9 @@ pub const S_IFDIR: FileMode = 0o040000;
 pub const S_IFREG: FileMode = 0o100000;
 /// `S_IFLNK` from `<linux/stat.h>` - symbolic-link file type bits.
 pub const S_IFLNK: FileMode = 0o120000;
+/// `S_IFCHR` from `<linux/stat.h>` - character-device file type bits.  The
+/// only character inode currently created is the persistent 0:0 whiteout.
+pub const S_IFCHR: FileMode = 0o020000;
 /// Permission and special mode bits accepted from create/mkdir callers.
 pub const MODE_PERMISSIONS_MASK: FileMode = 0o7777;
 
@@ -227,6 +230,21 @@ impl Inode {
             inode_id,
             size: target_len as u64,
             mode: S_IFLNK | 0o777,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime: mtime,
+            mtime,
+        }
+    }
+
+    /// Builds the Linux rename whiteout representation: a mode-000 character
+    /// device whose implicit device number is 0:0.
+    pub fn new_whiteout(inode_id: u64, mtime: u64) -> Self {
+        Inode {
+            inode_id,
+            size: 0,
+            mode: S_IFCHR,
             uid: 0,
             gid: 0,
             nlink: 1,

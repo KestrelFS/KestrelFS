@@ -38,9 +38,8 @@ int main(int argc, char **argv)
 	unsigned char old[DATA_LEN];
 	unsigned char new_data[DATA_LEN];
 	unsigned char check[DATA_LEN];
-	unsigned char *private_read, *private_cow, *shared_read;
+	unsigned char *private_read, *private_cow, *shared_read, *shared_write;
 	unsigned char resident;
-	void *rejected;
 	pid_t child;
 	int fd, ctl, status;
 	int i;
@@ -77,16 +76,12 @@ int main(int argc, char **argv)
 		"private COW changed file");
 	puts("STEP46_PRIVATE_COW_PASS");
 
-	errno = 0;
-	rejected = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
-			MAP_SHARED, fd, 0);
-	require(rejected == MAP_FAILED &&
-		(errno == EOPNOTSUPP || errno == EINVAL),
-		"writable shared mmap was not rejected");
-	errno = 0;
-	require(mprotect(shared_read, 4096, PROT_READ | PROT_WRITE) == -1 &&
-		errno == EACCES, "shared mapping mprotect bypass");
-	puts("STEP46_SHARED_WRITE_REJECT_PASS");
+	shared_write = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+			    MAP_SHARED, fd, 0);
+	require(shared_write != MAP_FAILED, "writable shared mmap");
+	require(mprotect(shared_read, 4096, PROT_READ | PROT_WRITE) == 0,
+		"shared mapping mprotect upgrade");
+	puts("STEP46_SHARED_WRITE_AVAILABLE_PASS");
 
 	write_exact(fd, new_data, sizeof(new_data));
 	require(memcmp(private_read, new_data, sizeof(new_data)) == 0,
@@ -136,6 +131,7 @@ int main(int argc, char **argv)
 	require(munmap(private_read, MAP_LEN) == 0, "munmap private read");
 	require(munmap(private_cow, MAP_LEN) == 0, "munmap private COW");
 	require(munmap(shared_read, MAP_LEN) == 0, "munmap shared read");
+	require(munmap(shared_write, 4096) == 0, "munmap shared write");
 	require(close(fd) == 0, "close file");
 	return 0;
 }

@@ -112,6 +112,9 @@ pub const RENAME_NOREPLACE: u32 = 1;
 /// Atomically swap two existing directory entries. This value intentionally
 /// matches Linux `RENAME_EXCHANGE`.
 pub const RENAME_EXCHANGE: u32 = 2;
+/// Atomically replace the source name with a persistent 0:0 character-device
+/// whiteout after moving its inode to the destination.
+pub const RENAME_WHITEOUT: u32 = 4;
 
 /// Result of probing a shared MetaStore for cache-coherence changes after a
 /// previously observed durable revision.
@@ -371,10 +374,10 @@ pub trait MetaStore: Send + Sync {
         new_name: &str,
     ) -> Result<Vec<String>>;
 
-    /// Rename with Linux-compatible flags. [`RENAME_NOREPLACE`] and
-    /// [`RENAME_EXCHANGE`] are individually supported and mutually exclusive;
-    /// implementations must perform all checks and dirent changes in one
-    /// atomic metadata mutation.
+    /// Rename with Linux-compatible flags. EXCHANGE is mutually exclusive
+    /// with NOREPLACE and WHITEOUT; WHITEOUT may be combined with NOREPLACE.
+    /// Implementations perform the move, replacement, and whiteout creation
+    /// in one atomic metadata mutation.
     async fn rename_with_flags(
         &self,
         old_parent: u64,
@@ -1289,8 +1292,9 @@ impl MetaStore for MemStore {
         flags: u32,
         defer_reclaim: bool,
     ) -> Result<Vec<String>> {
-        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0
-            || flags == (RENAME_NOREPLACE | RENAME_EXCHANGE)
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+            || flags & RENAME_EXCHANGE != 0
+                && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0
         {
             return Err(MetaError::UnsupportedRenameFlags(flags));
         }
@@ -1516,6 +1520,18 @@ impl MetaStore for MemStore {
             .or_insert_with(HashMap::new)
             .insert(new_name.to_string(), source_inode_id);
 
+        if flags & RENAME_WHITEOUT != 0 {
+            let whiteout_inode_id = self.allocate_inode_id();
+            let whiteout = Inode::new_whiteout(whiteout_inode_id, current_unix_time());
+
+            inner.inodes.insert(whiteout_inode_id, whiteout);
+            inner
+                .dir_entries
+                .entry(old_parent)
+                .or_insert_with(HashMap::new)
+                .insert(old_name.to_string(), whiteout_inode_id);
+        }
+
         // Update mtime of both parent directories
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1561,7 +1577,7 @@ impl MetaStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_model::{S_IFDIR, S_IFLNK, S_IFREG};
+    use crate::fs_model::{S_IFCHR, S_IFDIR, S_IFLNK, S_IFREG};
 
     #[tokio::test]
     async fn deferred_unlink_keeps_data_through_last_hardlink_until_finalize() {
@@ -2448,6 +2464,84 @@ mod tests {
         assert_eq!(store.getattr(left).await.unwrap().nlink, 1);
         assert_eq!(store.getattr(right).await.unwrap().nlink, 1);
         assert!(store.pending_garbage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_whiteout_moves_source_and_persists_visible_marker() {
+        let store = MemStore::new();
+        let source = store
+            .create(ROOT_INODE, "whiteout-source", S_IFREG | 0o640)
+            .await
+            .unwrap();
+
+        store
+            .rename_with_flags(
+                ROOT_INODE,
+                "whiteout-source",
+                ROOT_INODE,
+                "whiteout-target",
+                RENAME_WHITEOUT,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.lookup(ROOT_INODE, "whiteout-target").await.unwrap(), source);
+        let marker = store.lookup(ROOT_INODE, "whiteout-source").await.unwrap();
+        assert_ne!(marker, source);
+        let attrs = store.getattr(marker).await.unwrap();
+        assert_eq!(attrs.mode, S_IFCHR);
+        assert_eq!(attrs.size, 0);
+        assert_eq!(attrs.nlink, 1);
+        let entries = store.readdir(ROOT_INODE).await.unwrap();
+        assert!(entries.iter().any(|(ino, name)| {
+            *ino == marker && name == "whiteout-source"
+        }));
+    }
+
+    #[tokio::test]
+    async fn rename_whiteout_noreplace_and_exchange_rules_are_atomic() {
+        let store = MemStore::new();
+        let source = store
+            .create(ROOT_INODE, "whiteout-flags-source", S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let victim = store
+            .create(ROOT_INODE, "whiteout-flags-victim", S_IFREG | 0o600)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "whiteout-flags-source",
+                    ROOT_INODE,
+                    "whiteout-flags-victim",
+                    RENAME_WHITEOUT | RENAME_NOREPLACE,
+                )
+                .await,
+            Err(MetaError::AlreadyExists)
+        ));
+        assert_eq!(
+            store.lookup(ROOT_INODE, "whiteout-flags-source").await.unwrap(),
+            source
+        );
+        assert_eq!(
+            store.lookup(ROOT_INODE, "whiteout-flags-victim").await.unwrap(),
+            victim
+        );
+        assert!(matches!(
+            store
+                .rename_with_flags(
+                    ROOT_INODE,
+                    "whiteout-flags-source",
+                    ROOT_INODE,
+                    "whiteout-flags-victim",
+                    RENAME_WHITEOUT | RENAME_EXCHANGE,
+                )
+                .await,
+            Err(MetaError::UnsupportedRenameFlags(_))
+        ));
     }
 
     #[tokio::test]
