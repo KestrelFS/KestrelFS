@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 52 已验收；Step 53 DIST-NOTIFY + REDIS-HARDEN 待验收；IPC ABI v22；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 53 DIST-NOTIFY + REDIS-HARDEN 已验收；IPC ABI v22；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -58,7 +58,7 @@
 > Step 52 已用两个独立 vng guest 验证共享 Redis+S3 的 write+fsync 后远端可见、
 > dirty-inode/page-cache/NVMe 失效与 daemon-free 新 cache hit，并加入可重复的
 > write-behind、page-cache 和 loop cache 粗测基线（见 `docs/perf-baseline.md`）。
-> Step 53 待验收实现以 Redis Pub/Sub 提示 durable revision 对账（100 ms poll 保底）、
+> Step 53 已验收实现以 Redis Pub/Sub 提示 durable revision 对账（100 ms poll 保底）、
 > 自动重连命令连接和 `rediss://` 自签 CA 路径；它不是 lease 或线性一致性协议。
 > 跨 BIO 流水线与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -362,7 +362,7 @@ revision-CAS 原子提交字段级 diff。旧 `<PREFIX>:meta:v1` 默认拒绝且
 Step 42 继续复用该 durable revision：每次 Lua mutation 同事务写入对应 revision 的
 dirty-inode 记录，保留最近 256 个 revision；daemon 每 100 ms 合并游标后的记录，
 最多经 ABI v20 ioctl 批量退休 64 个 inode。记录缺失、溢出、累计超过 64 或探测失败
-时仍请求全 cache 失效。启动时也先全量退休恢复索引。Step 53 待验收路径在同一 Lua
+时仍请求全 cache 失效。启动时也先全量退休恢复索引。Step 53 已验收路径在同一 Lua
 mutation 提交后发布 revision，订阅端立即走同一 durable probe；100 ms poll 继续对账。
 Redis 命令连接可自动重连，`rediss://` 可用 `--redis-ca-cert` 信任私有 CA。该原型不是
 生产级 lease，通知丢失只会退化为轮询延迟。
@@ -506,7 +506,7 @@ Step 34 支持 create/mkdir mode 与
 - 数据/名字 IPC 由一把全局 mutex 串行化。
 - Step 31 已验收的 Redis 元数据为 v2 分记录 HASH/SET，点查不再全量读取；但
   mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
-  引用确认也仍需聚合扫描。Step 53 待验收路径支持 `redis://` / `rediss://`、私有 CA、
+  引用确认也仍需聚合扫描。Step 53 已验收路径支持 `redis://` / `rediss://`、私有 CA、
   命令连接自动重连及 Pub/Sub 重订阅；中断中的单次请求仍可能返回 EIO，尚无独立健康
   检查、请求幂等重放或 v1 自动迁移。Step 41 已把 S3 delete 移到
   有界 worker；失败保留 durable queue 重试，但尚无 dead-letter 或管理限额。
