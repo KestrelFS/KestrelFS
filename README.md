@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 48 cache hit 异步 BIO 已验收；下一步 Step 49 CACHE-WRITE；IPC ABI v21；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 49 write-through 已验收；下一步 Step 50 双包：可写 MAP_SHARED + WHITEOUT；IPC ABI v21；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -44,11 +44,12 @@
 > Step 43 已将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
 > Step 44 的普通文件 fsync/fdatasync 与挂载 syncfs 已经同步等待 daemon 后端耐久屏障；
 > Step 45 已把普通读接到 `read_folio`/`readahead` 与 VFS page cache，
-> 冷页仍由内核块缓存或 `READ_DATA` 填充，写仍同步 IPC 并在成功后清理旧页；
+> 冷页仍由内核块缓存或 `READ_DATA` 填充；Step 49 已落地 write-through aops（脏 folio → writepages/WRITE_DATA；fsync 先写回再屏障）；
+> 标脏和 `writepages` 同步写回 daemon，成功后保留干净 page-cache 页；
 > 热读不再走 Step 28 直达用户页路径。Step 46 已支持普通文件
 > `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`，拒绝共享写入/`mprotect` 升级；
 > 写后旧映射重新 fault，远端 revision 触发异步映射清理。Step 47 已在同一挂载节点支持普通文件 flock、POSIX `fcntl` 字节锁和 OFD 锁；锁由内核
-> 本地管理，进程退出自动释放，不跨节点或跨挂载协调。仍无脏页写回或可写共享 mmap。
+> 本地管理，进程退出自动释放，不跨节点或跨挂载协调。可写共享 mmap 仍未实现。
 > Step 48 的 cache hit 已采用异步 BIO completion；VFS 读调用仍等待结果。
 > `WHITEOUT`、跨 BIO 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
@@ -152,7 +153,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–48 已验收；下一步 Step 49 CACHE-WRITE（ABI v21 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–49 已验收；下一步 Step 50 双包 MAP-SHARED-WRITE+WHITEOUT（ABI v21 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -497,13 +498,14 @@ Step 34 支持 create/mkdir mode 与
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 45 已让普通文件读经 page cache/readahead；冷 folio 才访问 NVMe 或 daemon。
-  Step 46 的 mmap 仅允许私有 COW 与只读共享，不支持共享脏页写回；
+  Step 49 已落地的 buffered write 使用 dirty folio/writepages，但写调用仍等待 daemon，
+  成功后保留干净 folio；Step 46 的 mmap 仅允许私有 COW 与只读共享，不支持共享写入；
   远端失效还受 probe 与异步清页调度窗口影响。splice 仍未覆盖。
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
-- Step 43 已把普通 write/writev/pwritev 统一为 `.write_iter`，但 WRITE_DATA 仍通过
-  全局 bounce 锁逐块同步等待 daemon；Step 48 只改变 cache hit BIO，未实现
-  WRITE_DATA 的异步 completion 或 page-cache write-back。
+- Step 49 的普通 write/writev/pwritev 先写入 VFS folio，再由 aops 经
+  全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；这是同步 write-through，不是
+  延迟写缓存或 WRITE_DATA 异步 completion。失败会保留 dirty folio 并向调用者报错。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有
   引用对象和本地对象目录树。FileMetaStore/LocalFs 同步文件与目录项；Mem 仅内存生效，
   Redis 已 ACK 的 mutation 崩溃耐久仍取决于 AOF/RDB 设置（RDB 不保证逐次 fsync），

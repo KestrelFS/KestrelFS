@@ -55,7 +55,7 @@ journal 和损坏 entry 退休持有写侧。写侧取得锁之前会等待所�
 取得写锁，仅在 generation 仍相同时退休 entry，避免误删期间重填的新版本。该步
 不改变 IPC ABI v11 或 cache format v4。
 
-Step 48（待 Cursor 验收）在上述 rwsem 生命周期内，把 read hit 的 buffered
+Step 48 在上述 rwsem 生命周期内，把 read hit 的 buffered
 4 KiB BIO 与 pinned-page BIO 改为 `submit_bio`、独立 `end_io`/completion 和
 按请求唤醒；`cache_async_hit_submissions`/`cache_async_hit_peak` 统计提交数
 与峰值在途 BIO。CRC 仍在 completion 后校验，损坏条目按原 generation 检查退休；
@@ -65,6 +65,17 @@ Step 48（待 Cursor 验收）在上述 rwsem 生命周期内，把 read hit 的
 `read_folio` 仍同步等待自己的 completion；metadata/index/journal/fill 写入仍用
 同步等待，未提供用户态异步接口或单请求多 BIO 流水线。IPC ABI v21、format v4
 未变；验证见 `test-step48-cache-async-vng.sh`。
+
+Step 49（待 Cursor 验收）让普通 write/writev 经 VFS folio 的
+`write_begin`/`write_end` 标 dirty；注册可写回 BDI 后，`writepages` 对每个
+folio 先失效 NVMe read index，再通过已有 16 KiB bounce `WRITE_DATA` 提交
+权威 daemon。`write_iter` 在返回前等待 writeback，成功后保留 clean filemap
+页，因此是最小 write-through aops，不是异步/延迟写缓存。`fsync` 先等待脏页
+写回，再调用 daemon 对象/元数据屏障；close `.flush` 也等待写回但不是
+fsync。失败时 redirty folio、记录 mapping/superblock 错误并返回错误，
+不宣称仅内存脏页已经持久。写入 dirtying 前后与实际提交前都按 inode 保守
+失效 NVMe 读索引；truncate 先写回再更改 size。可写 `MAP_SHARED` 仍拒绝。
+IPC ABI v21、cache format v4 不变；测试见 `test-step49-cache-write-vng.sh`。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive

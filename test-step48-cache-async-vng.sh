@@ -72,6 +72,9 @@ start_daemon
 busybox mount -t kestrelfs none "$mnt"
 file="$mnt/async.dat"
 "$io_helper" prepare "$file" 1048576
+# Step 49 retains clean filemap folios after writeback. Drop them once so
+# this verification fetches from the daemon and warms the NVMe read cache.
+drop_file_pages
 "$io_helper" verify "$file" 0 1048576 0 1
 
 drop_file_pages

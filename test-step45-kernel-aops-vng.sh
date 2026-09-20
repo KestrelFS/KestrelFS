@@ -73,6 +73,11 @@ cp "$data_dir/old" "$mnt/folio.dat"
 cmp "$data_dir/old" "$mnt/folio.dat"
 echo STEP45_WRITE_READ_PASS
 
+# Step 49 retains clean written folios, so force a daemon read to warm NVMe
+# before testing daemon-offline fallback through that backing cache.
+echo 1 >/proc/sys/vm/drop_caches
+cmp "$data_dir/old" "$mnt/folio.dat"
+
 stop_daemon
 before=$(hit_count)
 cmp "$data_dir/old" "$mnt/folio.dat"

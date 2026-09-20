@@ -39,6 +39,8 @@
 #include <linux/pagemap.h>
 #include <linux/vmalloc.h>
 #include <linux/filelock.h>
+#include <linux/writeback.h>
+#include <linux/highmem.h>
 
 #include "kestrelfs.h"
 
@@ -284,8 +286,19 @@ int kestrelfs_sync_daemon(u32 opcode, u64 inode_id)
 static int kestrelfs_regular_fsync(struct file *file, loff_t start,
 				   loff_t end, int datasync)
 {
-	/* No page-cache writes exist; both flavors sync data AND metadata. */
+	int ret;
+
+	ret = file_write_and_wait_range(file, start, end);
+	if (ret)
+		return ret;
+	/* The daemon barrier follows successful folio writeback. */
 	return kestrelfs_sync_daemon(KESTRELFS_OP_FSYNC, file_inode(file)->i_ino);
+}
+
+static int kestrelfs_regular_flush(struct file *file, fl_owner_t id)
+{
+	/* Preserve close/reopen behavior without claiming fsync durability. */
+	return file_write_and_wait(file);
 }
 
 /*
@@ -503,7 +516,8 @@ const struct file_operations kestrelfs_remote_file_ops = {
  * miss needs the bounce mutex; recheck the cache once acquired because another
  * reader may have filled it while this folio waited.
  */
-static int kestrelfs_read_folio(struct file *file, struct folio *folio)
+static int kestrelfs_fill_folio_locked(struct file *file,
+				      struct folio *folio)
 {
 	struct inode *inode = file_inode(file);
 	struct kestrelfs_shared_region *region;
@@ -517,7 +531,7 @@ static int kestrelfs_read_folio(struct file *file, struct folio *folio)
 	buffer = kvzalloc(length, GFP_KERNEL);
 	if (!buffer) {
 		ret = -ENOMEM;
-		goto out_unlock_folio;
+		goto out;
 	}
 	size = i_size_read(inode);
 	wanted = offset < size ? min_t(u64, length, size - offset) : 0;
@@ -615,7 +629,14 @@ out_copy:
 		folio_mark_uptodate(folio);
 	}
 	kvfree(buffer);
-out_unlock_folio:
+out:
+	return ret;
+}
+
+static int kestrelfs_read_folio(struct file *file, struct folio *folio)
+{
+	int ret = kestrelfs_fill_folio_locked(file, folio);
+
 	folio_unlock(folio);
 	return ret;
 }
@@ -628,9 +649,126 @@ static void kestrelfs_readahead(struct readahead_control *ractl)
 		kestrelfs_read_folio(ractl->file, folio);
 }
 
+static int kestrelfs_write_begin(struct file *file,
+				 struct address_space *mapping, loff_t pos,
+				 unsigned int len, struct folio **foliop,
+				 void **fsdata)
+{
+	struct folio *folio;
+	int ret;
+
+	folio = filemap_grab_folio(mapping, pos >> PAGE_SHIFT);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+	if (!folio_test_uptodate(folio)) {
+		ret = kestrelfs_fill_folio_locked(file, folio);
+		if (ret) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return ret;
+		}
+	}
+	*foliop = folio;
+	return 0;
+}
+
+static int kestrelfs_write_end(struct file *file,
+			       struct address_space *mapping, loff_t pos,
+			       unsigned int len, unsigned int copied,
+			       struct folio *folio, void *fsdata)
+{
+	struct inode *inode = mapping->host;
+
+	if (copied) {
+		loff_t end = pos + copied;
+
+		if (end > i_size_read(inode))
+			i_size_write(inode, end);
+		folio_mark_uptodate(folio);
+		folio_mark_dirty(folio);
+	}
+	folio_unlock(folio);
+	folio_put(folio);
+	return copied;
+}
+
+static int kestrelfs_write_folio(struct folio *folio,
+				 struct writeback_control *wbc, void *data)
+{
+	struct inode *inode = folio->mapping->host;
+	struct kestrelfs_shared_region *region;
+	loff_t offset = folio_pos(folio);
+	loff_t size = i_size_read(inode);
+	size_t length = offset < size ? min_t(u64, folio_size(folio),
+							 size - offset) : 0;
+	size_t done = 0;
+	int ret = 0;
+
+	if (!length)
+		goto out_unlock;
+	folio_start_writeback(folio);
+	mutex_lock(&kestrelfs_data_ipc_lock);
+	region = kestrelfs_shm_region();
+	if (!region) {
+		ret = -ENOTCONN;
+		goto out_mutex;
+	}
+	/* A dirty folio must not leave a stale persistent read-cache entry. */
+	ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
+	if (ret)
+		goto out_mutex;
+	while (done < length) {
+		struct kestrelfs_event req = { 0 };
+		struct kestrelfs_event resp = { 0 };
+		size_t chunk = min_t(size_t, length - done,
+					  KESTRELFS_DATA_BUFFER_SIZE);
+		u64 chunk_boundary = KESTRELFS_MODEL_CHUNK_SIZE -
+			((u64)(offset + done) % KESTRELFS_MODEL_CHUNK_SIZE);
+
+		chunk = min_t(u64, chunk, chunk_boundary);
+		memcpy_from_folio(region->data_buffer, folio, done, chunk);
+		req.opcode = KESTRELFS_OP_WRITE_DATA;
+		put_unaligned_le64(inode->i_ino, &req.payload[0]);
+		put_unaligned_le64(offset + done, &req.payload[8]);
+		put_unaligned_le32(chunk, &req.payload[16]);
+		ret = kestrelfs_ipc_sync_call(&req, &resp);
+		if (ret)
+			break;
+		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
+			ret = resp.error_code < 0 ? resp.error_code : -EIO;
+			break;
+		}
+		if (resp.opcode != KESTRELFS_OP_RESULT_OK) {
+			ret = -EPROTO;
+			break;
+		}
+		done += chunk;
+	}
+out_mutex:
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret) {
+		folio_redirty_for_writepage(wbc, folio);
+		mapping_set_error(folio->mapping, ret);
+	}
+	folio_end_writeback(folio);
+out_unlock:
+	folio_unlock(folio);
+	return ret;
+}
+
+static int kestrelfs_writepages(struct address_space *mapping,
+				struct writeback_control *wbc)
+{
+	return write_cache_pages(mapping, wbc, kestrelfs_write_folio, NULL);
+}
+
 const struct address_space_operations kestrelfs_reg_aops = {
 	.read_folio = kestrelfs_read_folio,
 	.readahead = kestrelfs_readahead,
+	.write_begin = kestrelfs_write_begin,
+	.write_end = kestrelfs_write_end,
+	.writepages = kestrelfs_writepages,
+	.dirty_folio = filemap_dirty_folio,
 };
 
 /*
@@ -726,124 +864,57 @@ static int kestrelfs_regular_flock(struct file *file, int cmd,
 	return locks_lock_file_wait(file, fl);
 }
 
-/*
- * Send an iter write through WRITE_DATA in 16 KiB bounce-buffer chunks.
- * copy_from_iter() lets write(2), writev(2), pwritev(2), and synchronous
- * kiocb callers share the same path without flattening userspace iovecs.
- *
- * A failure before any committed chunk is returned as a negative errno.  If
- * an earlier chunk was committed, the byte count wins, matching normal VFS
- * partial-write semantics.  A short copy_from_iter() is committed as a short
- * final chunk and terminates the call.
+/* Buffered writes dirty filemap folios. A writeback callback persists each
+ * folio through WRITE_DATA; this minimal write-through policy waits before
+ * returning from write_iter and keeps clean pages in filemap thereafter.
+ * fsync and close also wait, so future dirty-folio sources stay covered.
+ * Invalidate the NVMe read cache before and after the dirtying operation, so
+ * concurrent old READ_DATA fills cannot remain indexed after this write.
  */
 static ssize_t kestrelfs_writable_write_iter(struct kiocb *iocb,
 					      struct iov_iter *from)
 {
-	struct file *filp = iocb->ki_filp;
-	struct inode *inode = file_inode(filp);
-	struct kestrelfs_shared_region *region;
-	size_t done = 0;
+	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t checked;
 	int ret;
 
 	inode_lock(inode);
 	checked = generic_write_checks(iocb, from);
 	if (checked <= 0)
-		goto out_unlock_inode_checked;
-	/* This implementation waits for daemon IPC and cannot honor NOWAIT. */
+		goto out_checked;
+	/* write_begin may fetch an old partial folio from the daemon. */
 	if (iocb->ki_flags & IOCB_NOWAIT) {
 		ret = -EOPNOTSUPP;
-		goto out_unlock_inode;
+		goto out;
 	}
-
 	ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 	if (ret)
-		goto out_unlock_inode;
-
-	region = kestrelfs_shm_region();
-	if (!region) {
-		ret = -ENOTCONN;
-		goto out_unlock;
-	}
-
-	/*
-	 * generic_write_checks() resolves IOCB_APPEND, but it runs before the
-	 * bounce lock.  Re-read i_size under that lock so concurrent appenders
-	 * cannot select the same offset.
-	 */
-	if (iocb->ki_flags & IOCB_APPEND)
-		iocb->ki_pos = i_size_read(filp->f_inode);
-
-	/*
-	 * Keep invalidation before the authoritative commit, and under the same
-	 * lock as READ_DATA misses.  A miss begun before this point carries an
-	 * old epoch and cannot publish stale data after the write.
-	 */
-	ret = kestrelfs_cache_invalidate_inode(filp->f_inode->i_ino);
-	if (ret)
-		goto out_unlock;
-
-	while (iov_iter_count(from)) {
-		struct kestrelfs_event req = { 0 };
-		struct kestrelfs_event resp = { 0 };
-		size_t chunk = min_t(size_t, iov_iter_count(from),
-					 KESTRELFS_DATA_BUFFER_SIZE);
-		u64 chunk_boundary = KESTRELFS_MODEL_CHUNK_SIZE -
-			((u64)iocb->ki_pos % KESTRELFS_MODEL_CHUNK_SIZE);
-		size_t copied;
-		bool short_copy;
-
-		/* A daemon Slice belongs to exactly one 64 MiB logical chunk. */
-		chunk = min_t(u64, chunk, chunk_boundary);
-		copied = copy_from_iter(region->data_buffer, chunk, from);
-		if (!copied) {
-			ret = -EFAULT;
-			goto out_unlock;
-		}
-		short_copy = copied != chunk;
-
-		req.opcode = KESTRELFS_OP_WRITE_DATA;
-		put_unaligned_le64((u64)filp->f_inode->i_ino, &req.payload[0]);
-		put_unaligned_le64((u64)iocb->ki_pos, &req.payload[8]);
-		put_unaligned_le32((u32)copied, &req.payload[16]);
-
-		ret = kestrelfs_ipc_sync_call(&req, &resp);
-		if (ret)
-			goto out_unlock;
-		if (resp.opcode == KESTRELFS_OP_RESULT_ERROR) {
-			ret = resp.error_code < 0 ? resp.error_code : -EIO;
-			goto out_unlock;
-		}
-		if (resp.opcode != KESTRELFS_OP_RESULT_OK) {
-			ret = -EPROTO;
-			goto out_unlock;
-		}
-
-		done += copied;
-		iocb->ki_pos += copied;
-		if (iocb->ki_pos > i_size_read(filp->f_inode))
-			i_size_write(filp->f_inode, iocb->ki_pos);
-		if (short_copy)
-			break;
-	}
-
-	ret = 0;
-
-out_unlock:
+		goto out;
+	ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
 	mutex_unlock(&kestrelfs_data_ipc_lock);
-	/* A read_folio waiting on the bounce mutex may own a folio lock. Drop
-	 * the mutex before waiting for page-cache invalidation, while i_rwsem
-	 * still serializes other writes and setattr mutations.
-	 */
-	if (done)
-		truncate_inode_pages(inode->i_mapping, 0);
+	if (ret)
+		goto out;
+	ret = file_update_time(iocb->ki_filp);
+	if (ret)
+		goto out;
+	checked = generic_perform_write(iocb, from);
+	mutex_lock(&kestrelfs_data_ipc_lock);
+	ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
+	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (ret) {
+		if (checked > 0)
+			mapping_set_error(inode->i_mapping, ret);
+		goto out;
+	}
+	if (checked > 0) {
+		ret = filemap_write_and_wait(inode->i_mapping);
+		if (ret)
+			goto out;
+	}
+out_checked:
 	inode_unlock(inode);
-	return done ? (ssize_t)done : ret;
-
-out_unlock_inode_checked:
-	inode_unlock(inode);
-	return checked;
-out_unlock_inode:
+	return checked > 0 ? generic_write_sync(iocb, checked) : checked;
+out:
 	inode_unlock(inode);
 	return ret;
 }
@@ -852,6 +923,7 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.owner	= THIS_MODULE,
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
+	.flush = kestrelfs_regular_flush,
 	.lock	= kestrelfs_regular_lock,
 	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,
@@ -951,6 +1023,10 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
 
+		/* Commit dirty folios before changing the authoritative size. */
+		ret = filemap_write_and_wait(inode->i_mapping);
+		if (ret)
+			return ret;
 		/* Order a cold folio fill against truncate just like a write. */
 		ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
 		if (ret)
@@ -1133,6 +1209,7 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.owner	= THIS_MODULE,
 	.open	= kestrelfs_regular_open,
 	.release = kestrelfs_regular_release,
+	.flush = kestrelfs_regular_flush,
 	.lock	= kestrelfs_regular_lock,
 	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,

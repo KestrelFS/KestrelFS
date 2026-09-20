@@ -73,9 +73,9 @@ static void kestrelfs_evict_inode(struct inode *inode)
  * VFS may call this during umount or sync even if we don't call mark_inode_dirty().
  * notify_change() can mark inodes dirty internally.
  * 
- * The daemon is authoritative: all write/setattr IPC is committed before VFS
- * acknowledges it. Explicit durability uses file.c's ->fsync and ->sync_fs,
- * not this writeback callback (which may also run during inode teardown).
+ * File data folio writeback is handled by the address-space ->writepages
+ * callback. This inode callback is metadata-only and can run during teardown;
+ * explicit durability uses file.c's ->fsync and ->sync_fs instead.
  *
  * MUST NOT send IPC here - daemon may be shutting down during umount.
  */
@@ -135,7 +135,13 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		inode->i_mode = mode;
 		i_uid_write(inode, uid);
 		i_gid_write(inode, gid);
-		i_size_write(inode, size);
+		/* A buffered append may be dirty in filemap while the daemon still
+		 * reports its previous size. Do not shrink the local inode on lookup.
+		 */
+		if (!S_ISREG(mode) ||
+		    (!mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
+		     !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK)))
+			i_size_write(inode, size);
 		set_nlink(inode, nlink);
 		return inode;
 	}
@@ -169,7 +175,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		mutex_init(&state->lifecycle_lock);
 		inode->i_private = state;
 		kestrelfs_pagecache_register_inode(inode);
-		/* Read-side page cache only; writes remain synchronous daemon IPC. */
+		/* Folio reads and write-through data writeback share this mapping. */
 		inode->i_mapping->a_ops = &kestrelfs_reg_aops;
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;
@@ -201,8 +207,12 @@ static int kestrelfs_fill_super(struct super_block *sb, void *data, int silent)
 {
 	struct inode *root_inode;
 	struct dentry *root_dentry;
+	int ret;
 
 	/* Set up superblock parameters */
+	ret = super_setup_bdi(sb);
+	if (ret)
+		return ret;
 	sb->s_magic = KESTRELFS_MAGIC;
 	sb->s_op = &kestrelfs_super_ops;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;

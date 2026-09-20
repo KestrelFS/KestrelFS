@@ -90,6 +90,9 @@ busybox mount -t kestrelfs none "$mnt"
 
 "$helper" normal "$mnt/normal-write.dat"
 "$helper" create "$mnt/vector-write.dat"
+# Step 49 writeback retains clean filemap folios. Drop them before warming
+# the lower cache from the authoritative daemon.
+echo 1 >/proc/sys/vm/drop_caches
 "$helper" warm "$mnt/vector-write.dat"
 
 hit_count() {
@@ -117,6 +120,9 @@ invalidate_after=$(hit_count)
 test "$invalidate_after" -eq "$invalidate_before"
 echo "STEP43_CACHE_INVALIDATE_PASS first_read_hit_delta=0"
 
+echo 1 >/proc/sys/vm/drop_caches
+"$helper" verify-overwrite "$mnt/vector-write.dat"
+test "$(hit_count)" -eq "$invalidate_after"
 echo 1 >/proc/sys/vm/drop_caches
 "$helper" verify-overwrite "$mnt/vector-write.dat"
 refill_after=$(hit_count)
