@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 51 双包（WRITE-BEHIND + OPS/DOC）已由 Cursor 验收并纳入本提交（IPC ABI v22、cache format v4）。下一步双包 Step 52 见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 52 双包（DIST-IO + TEST-PERF）已验收（IPC ABI v22、cache format v4 未变）。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 51 write-behind 已验收；下一步 Step 52 = DIST-IO + TEST-PERF（双包，见 remaining-capabilities §8） |
+| 当前阶段 | Step 52 DIST-IO + TEST-PERF 双包已验收；下一步见 remaining-capabilities §8 |
 
 ---
 
@@ -214,6 +214,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/内核 Step 49** | **普通文件 dirty folio + writepages/WRITE_DATA 的最小 write-through** | **21（未变）** | **✅ 已验收** |
 | **Phase 4/内核+控制面 Step 50** | **可写 MAP_SHARED write-through + 原子 RENAME_WHITEOUT** | **22** | **✅ 已验收** |
 | **Phase 4/内核+文档 Step 51** | **普通 buffered/MAP_SHARED write-behind + 权威配置表/文档清理** | **22（未变）** | **✅ 已验收** |
+| **Phase 4/分布式+测试 Step 52** | **双 daemon Redis+S3 数据面闭环 + vng 粗测基线** | **22（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -275,7 +276,11 @@ Cursor 对照代码、200 tests 与 `STEP50_DOUBLE_PACK_PASS` 确认 Step 50 已
 Cursor 对照代码、200 tests 与 `STEP51_WRITE_BEHIND_PASS` 确认 Step 51 已验收。
 write-behind；`docs/configuration.md`；ABI **v22** 未变；format **v4**。
 
-下一步：**Step 52**（DIST-IO + TEST-PERF 双包），提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、200 tests 与 `STEP52_DIST_TWO_NODE_PASS` / `STEP52_PERF_PASS`
+确认 Step 52 已验收。双 vng Redis+S3 数据面闭环 + `docs/perf-baseline.md`；
+ABI **v22** 未变；format **v4**。
+
+待验收：见 `docs/remaining-capabilities.md` §8（Step 53 双包）。
 
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 22`（`RENAME_DATA` 支持 whiteout inode 类型）
@@ -1759,6 +1764,40 @@ vng 回归结果见 `docs/remaining-capabilities.md` §9。所有 insmod、loop 
 Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复跑 vng
 `STEP51_WRITE_BEHIND_PASS`（umount_ms=11；`STEP51_ASYNC_WRITE_LATENCY_MS=0`）。
 
+### 7.46 Phase 4/分布式+测试 Step 52 DIST-IO + TEST-PERF（已验收）
+
+DIST-IO 选择两个并行 vng guest，而不是同一 guest 双 mount：A/B 各自加载模块、创建
+loop cache、运行独立 daemon 和挂载，只有 Redis MetaStore 与 S3 ObjectStore 共享。
+A 完成 write+fsync 后，B 经既有约 100 ms durable revision probe 消费 dirty-inode
+记录，推进 page-cache epoch 并退休对应 NVMe entry；B 读取新版本并重新 fill，随后
+停 daemon、drop_caches 后仍从新 entry 命中。测试明确保留 probe 前的最终一致窗口，
+不宣称 lease 或线性一致。
+
+TEST-PERF 新增独立 vng+loop 粗测，分别记录普通 write-behind 返回与 fsync、VFS
+page-cache 热读、drop_caches 后 daemon-free cache hit。2026-09-20 的一次
+Linux 6.12.38 guest / 64 MiB loop / 1 MiB workload 样本为：普通写 1.53 ms
+（653.58 MiB/s）、fsync 116.41 ms；64 次 page-cache 热读 2104.47 MiB/s；
+daemon-free cache hit 6.30 ms（158.62 MiB/s，256 async BIO）。这些数字包含数据校验，
+只作回归数量级，不是 SLA；完整方法见 `docs/perf-baseline.md`。
+
+Codex 自检：`cargo test` **200 passed**，clippy `-D warnings` 通过，
+`make -C kestrelfs` 零警告；真实 Redis/MinIO 门控测各 **1 passed**。vng 输出
+`STEP52_DIST_A_FSYNC_PASS`、`STEP52_DIST_REMOTE_VISIBLE_PASS`
+（本轮 latency 10 ms）、`STEP52_DIST_DAEMON_FREE_NEW_HIT_PASS`、
+`STEP52_DIST_TWO_NODE_PASS` 与 `STEP52_PERF_PASS`。Step 51 回归
+`STEP51_WRITE_BEHIND_PASS`（umount 15 ms）；Step 42 缺 dirty-history 的全量回退
+输出 `STEP42_FAILURE_FALLBACK_ALL_PASS` / `STEP42_COHERENCE_FINE_PASS`。该脚本的
+二次 cache-hit 断言在读前 drop page cache，以适配 Step 45 后的 VFS 热读路径。
+所有 insmod、loop、mount 都只在 vng guest；daemon 使用独立 data-dir 并保留
+daemon.log。无 ABI/盘格式变化：IPC ABI
+**v22**、cache format **v4**。
+
+Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复跑
+`STEP52_PERF_PASS`（write-behind ~1324 MiB/s、page-cache ~2153 MiB/s、
+NVMe/loop hit ~178 MiB/s / async bios=256、umount_ms=23）与
+`STEP52_DIST_TWO_NODE_PASS`（`STEP52_DIST_VISIBILITY_LATENCY_MS=35`；
+Redis `10.0.2.2:16379` + MinIO `10.0.2.2:19000`）。
+
 
 ## 8. 路线图（未做）
 
@@ -1767,7 +1806,7 @@ Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复�
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **双包交付** | 自 Step 50 起每步约 2× 既往体量；见 remaining-capabilities §2 |
-| 2 | **Step 52 DIST-IO + TEST-PERF** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 2 | **Step 53 DIST-NOTIFY + REDIS-HARDEN** | 见 remaining-capabilities §8 |
 | 3 | 其后 | 视需要继续双包 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1824,10 +1863,11 @@ mkdir -p "$data_dir"
 
 - [x] Step 50 双包已由 Cursor 验收并提交
 - [x] IPC ABI = 22；cache format = v4
-- [x] Step 8–50 + Step 51 已验收状态已写清
+- [x] Step 8–52 已验收状态已写清
 - [x] Step 51 双包已由 Cursor 验收并提交
+- [x] Step 52 双包已由 Cursor 验收并提交
 - [x] 权威配置表：`docs/configuration.md`
-- [x] 下一步明确：Step 52 双包（DIST-IO + TEST-PERF；`docs/remaining-capabilities.md` §8）
+- [x] 当前待验收：Step 53 双包（DIST-NOTIFY + REDIS-HARDEN；见 remaining-capabilities §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

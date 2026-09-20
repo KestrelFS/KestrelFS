@@ -207,6 +207,10 @@ cat "$mnt/changed.bin" >"$actual"
 cmp "$new" "$actual"
 hits_after=$(cache_hits)
 test "$hits_after" = "$hits_before"
+# Step 45 routes the immediate second read through VFS page cache. Retire
+# those pages before asserting that the newly filled NVMe entry is usable.
+sync
+echo 3 >/proc/sys/vm/drop_caches
 cat "$mnt/changed.bin" >"$actual"
 cmp "$new" "$actual"
 test "$(cache_hits)" -gt "$hits_after"

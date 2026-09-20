@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 51 write-behind 已验收；下一步 Step 52 双包 DIST-IO + TEST-PERF；IPC ABI v22；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 52 DIST-IO + TEST-PERF 已验收；IPC ABI v22；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -55,6 +55,9 @@
 > 本地管理，进程退出自动释放，不跨节点或跨挂载协调。
 > Step 48 的 cache hit 已采用异步 BIO completion；VFS 读调用仍等待结果。
 > Step 50 同时支持原子 `RENAME_WHITEOUT`，在旧路径持久化 0:0 字符设备 marker。
+> Step 52 已用两个独立 vng guest 验证共享 Redis+S3 的 write+fsync 后远端可见、
+> dirty-inode/page-cache/NVMe 失效与 daemon-free 新 cache hit，并加入可重复的
+> write-behind、page-cache 和 loop cache 粗测基线（见 `docs/perf-baseline.md`）。
 > 跨 BIO 流水线与生产级一致性 lease/pubsub 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
@@ -157,7 +160,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–51 已验收；下一步 Step 52 双包 DIST-IO+TEST-PERF（ABI v22 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–52 已验收（含 DIST-IO+TEST-PERF；ABI v22 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -177,6 +180,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
 ├── docs/configuration.md           # 模块/挂载/daemon 唯一权威配置表
+├── docs/perf-baseline.md           # vng/loop 路径粗测方法与回归样本（非 SLA）
 ├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
 ├── test-step19-cache-vng.sh … test-step29-cache-evict-vng.sh
 ├── test-step32-posix-core-vng.sh   # 硬链接、持久 nlink 与末引用 GC
@@ -208,6 +212,11 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step50-map-shared.c           # mmap 写、同步、COW 与重启测试助手
 ├── test-step51-write-behind-vng.sh     # 延迟写回、显式同步、失败/重启回归
 ├── test-step51-write-behind.c          # write-behind 时序与读回测试助手
+├── test-step52-dist-vng.sh              # 两个 vng guest 的 Redis+S3 数据面编排
+├── test-step52-dist-node-vng.sh         # 单个 DIST-IO guest 节点脚本（显式 insmod）
+├── test-step52-dist-io.c                # 跨节点 generation/fsync/可见性助手
+├── test-step52-perf-vng.sh              # write/page-cache/NVMe loop 粗测
+├── test-step52-perf.c                   # 定时与数据校验助手
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs

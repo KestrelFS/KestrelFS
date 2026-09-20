@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–35）
+## 当前边界（Step 18–52）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -104,6 +104,16 @@ flusher、内存回收或显式同步路径调用既有 `writepages` → `WRITE_
 或自有线程。
 IPC ABI 仍为 v22，cache format 仍为 v4；验证见
 `test-step51-write-behind-vng.sh`。
+
+Step 52 没有改变数据路径或一致性协议，而是用两个并行 vng guest 验证现有最小
+多节点闭环。两个节点各有独立 daemon、挂载、page cache 与 loop cache，共享同一
+Redis MetaStore 和 S3 ObjectStore。A 的 write+fsync 先完成对象写入和 Redis
+revision-CAS；B 的约 100 ms probe 消费 durable dirty-inode log，推进 page-cache
+epoch 并退休对应 NVMe entry，随后从共享 ObjectStore 读取新 slice 并重新 fill。
+B 停止 daemon 后仍能从新 entry 命中，证明旧 entry 没有越过失效边界。该验证不把
+轮询窗口包装成线性一致：提交到下一次 probe 前仍可能读到旧页；probe 失败或历史
+不完整时继续全量 fail closed。IPC ABI v22、cache format v4 均未改变。粗测方法与
+环境见 `perf-baseline.md`。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
@@ -522,3 +532,21 @@ STEP35_CACHE_COHERENCE_PASS
 `STEP20_CACHE_PASS` 和 `STEP34_POSIX_ATTR_PASS`。本轮提供的远端 Redis 凭据返回
 `WRONGPASS`，因此测试临时使用退出即删除、无持久卷的 Redis 7.4.11 容器；guest
 经 QEMU user-network host gateway 连接，容器在测试后停止删除。
+
+## Step 52 两节点闭环与性能基线
+
+`test-step52-dist-vng.sh` 并行启动两个 vng guest；guest 脚本显式 `insmod`，只使用
+独立 loop cache，并把 daemon 输出保存在各自 PID 隔离 data-dir 的 `daemon.log`。
+2026-09-20 的共享 Redis+MinIO 自检输出：
+
+```text
+STEP52_DIST_A_FSYNC_PASS
+STEP52_DIST_VISIBILITY_LATENCY_MS=10
+STEP52_DIST_REMOTE_VISIBLE_PASS
+STEP52_DIST_DAEMON_FREE_NEW_HIT_PASS
+STEP52_DIST_TWO_NODE_PASS
+```
+
+`test-step52-perf-vng.sh` 在单 guest 中分别测 write-behind 返回、page-cache 热读与
+drop_caches 后 daemon-free cache hit，并输出 `STEP52_PERF_*_PASS`。完整 workload、
+复现命令、一次通过样本和非 SLA 边界见 [`perf-baseline.md`](perf-baseline.md)。
