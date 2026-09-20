@@ -69,7 +69,7 @@ static int write_and_fsync(const char *path)
 	return close(fd) != 0;
 }
 
-static int failure_write(int fd)
+static int failure_writeback(int fd)
 {
 	unsigned char block[FAIL_LEN];
 	ssize_t got;
@@ -77,10 +77,18 @@ static int failure_write(int fd)
 	memset(block, 'Q', sizeof(block));
 	errno = 0;
 	got = pwrite(fd, block, sizeof(block), 0);
-	if (got != -1 || (errno != ENOTCONN && errno != EIO &&
-			 errno != ETIMEDOUT)) {
-		fprintf(stderr, "offline write returned %zd errno=%d\n", got,
-			errno);
+	if (got != (ssize_t)sizeof(block)) {
+		fprintf(stderr, "delayed offline write returned %zd errno=%d\n",
+			got, errno);
+		return 1;
+	}
+	errno = 0;
+	if (!fsync(fd)) {
+		fprintf(stderr, "offline fsync unexpectedly succeeded\n");
+		return 1;
+	}
+	if (errno != ENOTCONN && errno != EIO && errno != ETIMEDOUT) {
+		fprintf(stderr, "offline fsync errno=%d\n", errno);
 		return 1;
 	}
 	return 0;
@@ -125,7 +133,7 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "verify-fd"))
 		return verify_fd(atoi(argv[2]));
 	if (!strcmp(argv[1], "fail-write-fd"))
-		return failure_write(atoi(argv[2]));
+		return failure_writeback(atoi(argv[2]));
 	if (!strcmp(argv[1], "fsync-fd"))
 		return fsync(atoi(argv[2])) != 0;
 	if (!strcmp(argv[1], "verify-failure"))

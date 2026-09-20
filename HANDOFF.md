@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 50 双包（可写 MAP_SHARED + RENAME_WHITEOUT）已由 Cursor 验收并纳入本提交（IPC ABI v22、cache format v4）。下一步双包 Step 51 见 `docs/remaining-capabilities.md` §8。
+> **最后更新**：Step 51 双包（WRITE-BEHIND + OPS/DOC）已由 Cursor 验收并纳入本提交（IPC ABI v22、cache format v4）。下一步双包 Step 52 见 `docs/remaining-capabilities.md` §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 50 已验收；下一步 Step 51 = WRITE-BEHIND + OPS/DOC（双包，见 remaining-capabilities §8） |
+| 当前阶段 | Step 51 write-behind 已验收；下一步 Step 52 = DIST-IO + TEST-PERF（双包，见 remaining-capabilities §8） |
 
 ---
 
@@ -60,7 +60,7 @@
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
 - **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 48 已落地 hit BIO 的异步 completion，同 inode 冷 folio 可并发提交。Step 49 已落地普通 buffered write 的同步 write-through；Step 50 在同一 dirty folio/writepages/WRITE_DATA 路径上启用可写 MAP_SHARED，并以 page-cache epoch 守住 stale mapping。仍无延迟写缓存。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无完整 splice、用户态异步读接口或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 48 已落地 hit BIO 的异步 completion，同 inode 冷 folio 可并发提交。Step 49/50 落地 dirty folio/writepages/WRITE_DATA 与可写 MAP_SHARED；Step 51 去掉普通 write_iter 的强制等待，交给 BDI flusher 或显式同步推进，保留 NVMe cache 失效、page-cache epoch 与 mapping errseq 语义。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无完整 splice、用户态异步读接口或生产级多节点 lease/pubsub。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`；配置参数唯一权威表见 `docs/configuration.md`。
 
 ---
 
@@ -99,6 +99,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── HANDOFF.md                   # ★ 本文件（已验收事实）
 ├── docs/remaining-capabilities.md # ★ 规划/决策/当前 Codex 提示词/实现日志
 ├── docs/phase4-nvme-cache.md    # Phase 4 缓存归属、设备、索引与失效设计
+├── docs/configuration.md        # ★ 模块/挂载/daemon 唯一权威配置表
 ├── tools/                       # cache 离线运维工具（不进入内核/IPC）
 │   ├── Makefile
 │   └── kestrelfs-cache-admin.c  # v4 inspect + 双确认 metadata wipe
@@ -145,6 +146,8 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step49-cache-write.c # Step 49 写回/重启/错误测试助手
 ├── test-step50-vng.sh # Step 50 可写 MAP_SHARED + WHITEOUT 双包回归
 ├── test-step50-map-shared.c # Step 50 mmap 写/同步/COW/重启测试助手
+├── test-step51-write-behind-vng.sh # Step 51 延迟写回/错误/重启回归
+├── test-step51-write-behind.c # Step 51 write-behind 测试助手
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -210,6 +213,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/内核 Step 48** | **cache hit 异步 BIO completion 与冷 folio 并发命中** | **21（未变）** | **✅ 已验收** |
 | **Phase 4/内核 Step 49** | **普通文件 dirty folio + writepages/WRITE_DATA 的最小 write-through** | **21（未变）** | **✅ 已验收** |
 | **Phase 4/内核+控制面 Step 50** | **可写 MAP_SHARED write-through + 原子 RENAME_WHITEOUT** | **22** | **✅ 已验收** |
+| **Phase 4/内核+文档 Step 51** | **普通 buffered/MAP_SHARED write-behind + 权威配置表/文档清理** | **22（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -268,7 +272,11 @@ write-through aops；fsync 先写回再 `OP_FSYNC`。ABI **v21** 未变；format
 Cursor 对照代码、200 tests 与 `STEP50_DOUBLE_PACK_PASS` 确认 Step 50 已验收。
 可写 MAP_SHARED + `RENAME_WHITEOUT`；ABI **v22**；format **v4**。
 
-下一步：**Step 51**（WRITE-BEHIND + OPS/DOC 双包），提示词在 `docs/remaining-capabilities.md` §8。
+Cursor 对照代码、200 tests 与 `STEP51_WRITE_BEHIND_PASS` 确认 Step 51 已验收。
+write-behind；`docs/configuration.md`；ABI **v22** 未变；format **v4**。
+
+下一步：**Step 52**（DIST-IO + TEST-PERF 双包），提示词在 `docs/remaining-capabilities.md` §8。
+
 
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 22`（`RENAME_DATA` 支持 whiteout inode 类型）
 
@@ -354,14 +362,9 @@ Cursor 对照代码、200 tests 与 `STEP50_DOUBLE_PACK_PASS` 确认 Step 50 已
 | 元数据 (MetaStore) | `MemStore`（纯 HashMap，重启丢失） | `FileMetaStore`（全量 JSON 到 `{data_dir}/meta.json`） | `RedisMetaStore`（`--meta redis://...`；v2 control/inode/dirent/slice/symlink/GC/dirty HASH/SET + Lua revision-CAS） |
 | 块数据 (ObjectStore) | `MemObjectStore`（纯 HashMap，支持幂等 delete） | `LocalFsObjectStore`（`{data_dir}/{slice_uuid}/{block_idx}`） | `S3ObjectStore`（`--objects s3://bucket/prefix`；AWS S3 或 MinIO） |
 
-**CLI 参数**（`daemon/src/main.rs`）：
-- `--data-dir <PATH>`：持久化目录（默认 `./.kestrelfs-data`），meta.json 和块数据均存于此
-- `--memory`：纯内存模式（元数据 + 块数据均不持久化）
-- `--meta <REDIS_URL>`：将 metadata 切到 Redis，例如 `redis://127.0.0.1:6379/0`；与 `--memory` 冲突
-- `--redis-prefix <PREFIX>`：Redis key 命名空间，默认 `kestrelfs`，v2 keys 为 `<PREFIX>:meta:v2:{control,inodes,dirents,slices,symlinks,gc,dirty}`
-- `--objects <S3_URL>`：将对象数据切到 S3，例如 `s3://bucket/kestrelfs-data`；与 `--memory` 冲突，可与 FileMetaStore 或 RedisMetaStore 任意组合
-- `--s3-endpoint <URL>`：可选 S3 兼容 endpoint；设置后强制 path-style，适配 MinIO。未传时读取 `S3_ENDPOINT`，再回退到 AWS SDK 默认 endpoint
-- S3 凭据/region：走 AWS SDK provider chain；常用环境变量为 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、可选 `AWS_SESSION_TOKEN` 与 `AWS_REGION`
+模块参数、挂载选项、daemon CLI、环境变量、互斥关系和安全默认值的唯一权威表见
+[`docs/configuration.md`](docs/configuration.md)。本节只记录已验收的存储组合，不再
+复制易漂移的参数清单。
 
 ---
 
@@ -381,7 +384,7 @@ Cursor 对照代码、200 tests 与 `STEP50_DOUBLE_PACK_PASS` 确认 Step 50 已
 | 10 | **whiteout 仅支持 rename 生成** | Step 50 让 `RENAME_DATA` 支持 `RENAME_WHITEOUT`：目标接收原源 inode，旧路径原子创建持久 `S_IFCHR` 0:0 marker；`WHITEOUT|NOREPLACE` 合法，`EXCHANGE` 与二者互斥，未知位返回 `-EINVAL`。内核要求 `CAP_MKNOD`，但尚未开放通用 `mknod`；readdir d_type 仍为 `DT_UNKNOWN`，lookup/stat 可识别 marker。 | `kestrelfs/dir.c`、`kestrelfs/inode.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
-| 13 | **write-through aops 仍同步等待 daemon** | Step 49 已落地普通 write/writev/pwritev，Step 50 让可写 `MAP_SHARED` 的脏 folio 也经同一 `writepages` → 16 KiB bounce `WRITE_DATA` 写回；write_iter、msync/fsync 与 writable VMA close 均同步等待。成功后保留 clean page cache；没有延迟写缓存或异步 WRITE_DATA。 | `kestrelfs/file.c`、`kestrelfs/inode.c` |
+| 13 | **write-behind 仍以同步 WRITE_DATA 为底层提交** | Step 51 让普通异步 write 标脏后先返回，由通用 BDI flusher、内存压力或显式同步触发 `writepages` → 16 KiB bounce `WRITE_DATA`；没有新增异步 opcode/私有 worker。`O_SYNC`/`O_DSYNC`、fsync/fdatasync、MS_SYNC、truncate、close/VMA close 仍会等待 daemon；失败 redirty 并进入 mapping/superblock errseq。 | `kestrelfs/file.c`、`kestrelfs/inode.c` |
 | 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+显式时间/其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`；普通 truncate 随带的 VFS 隐式 mtime/ctime 由 TRUNCATE 处理。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
@@ -392,14 +395,14 @@ Cursor 对照代码、200 tests 与 `STEP50_DOUBLE_PACK_PASS` 确认 Step 50 已
 | 21 | **Redis 连接仍是原型级** | 当前只接受 `redis://`（未启用 `rediss://` TLS），持有一条 multiplexed connection 且未加自动重连 manager；连接故障时请求返回 EIO，需恢复 Redis 后重启 daemon。URL 可能含凭据，因此启动日志不会打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 41 用容量 32、每项最多 64 keys、delete 并发 4 的 worker 隔离慢 S3；背压/失败不丢 durable key，成功结果由串行 metadata 线程确认。多 daemon 仍可能重复处理同一 Redis `gc` SET，幂等 delete/revision-CAS ack 可容忍；尚无跨 Redis/S3 事务、dead-letter 或运维限额。 | `daemon/src/gc_worker.rs`、`daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
-| 24 | **NVMe cache hit 仍需同步等待调用结果** | Step 48 已实现 hit BIO 的异步提交/独立 completion，并让不同冷 folio 脱离 bounce 锁并发提交；但 VFS `read_folio` 仍同步等待自己的 completion，metadata/fill/journal 与 READ_DATA miss 仍同步。Step 49/50 写入保留 clean filemap 页并支持共享 mmap write-through；仍无跨 iovec scatter-gather BIO 或完整 splice，mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
+| 24 | **NVMe cache hit 仍需同步等待调用结果** | Step 48 已实现 hit BIO 的异步提交/独立 completion，并让不同冷 folio 脱离 bounce 锁并发提交；但 VFS `read_folio` 仍同步等待自己的 completion，metadata/fill/journal 与 READ_DATA miss 仍同步。Step 51 的写入先留 dirty filemap 页，再由 flusher 或同步点提交；仍无跨 iovec scatter-gather BIO 或完整 splice，mutation 会等待慢 reader。 | `kestrelfs/file.c`、`kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 25 | **cache v4 journal 正确但同步 flush 成本高** | 每个完整 4 KiB data block、32-byte index entry、superblock 和 journal 都有 CRC32。单页 intent journal 将 fill/invalidate/evict/坏块退休的半提交状态恢复为安全 miss；torn journal/superblock fail closed。metadata mutation 由 cache rwsem 写侧保证单事务，且每次 index mutation 新增 journal prepare/clear 两次同步写与 flush；仍无双 superblock/metadata 镜像，CRC32 也不是密码学保护。 | `kestrelfs/cache.c` |
 | 26 | **cache namespace identity 依赖部署规范化** | Step 21 起 superblock 绑定 32-byte SHA-256 digest，当前 v4 继续沿用；缺失/非法/mismatch 均拒绝加载。内核不解析 data-dir/Redis/S3 配置，调用方必须对稳定、无凭据、规范化的 MetaStore + ObjectStore descriptor 求 SHA-256。旧 v1/v2/v3 不自动迁移；Step 27 工具只提供显式 metadata wipe。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 27 | **远端 cache coherence 仍是最终一致原型** | Step 42 用最近 256 revision 的 durable dirty log 将正常变化收窄为最多 64 inode 的 ABI v20 批量失效；记录缺失/损坏、溢出、累计超限或 probe 失败仍全量 fail closed。提交到下一次 probe 前仍有短暂旧 hit 窗口，daemon 离线期间没有 lease，尚无 range/pubsub。 | `daemon/src/main.rs`、`daemon/src/meta_redis.rs`、`kestrelfs/cache.c` |
 | 28 | **batch block-LRU 热度仍只在内存** | Step 29 默认一次退休 16 个 LRU victim（至多总槽位 1/16），用一份 journal 并按 index page 合并清零；连续 fill 可消费预回收槽位，MRU 尾部受到小批量保护。为避免破坏 hit 性能，不在每次访问持久化 recency；rmmod/insmod 后仍按 generation 恢复 insertion-order 近似。没有分区配额/租户热点隔离；victim 分散时仍需每个 index page 一次同步写，fill/invalidate 仍逐次 journal。 | `kestrelfs/cache.c`、`docs/phase4-nvme-cache.md` |
 | 29 | **Step 27 wipe 不是安全擦除或自动修复** | 工具只清零并 fsync 前 2 MiB cache metadata，使旧 data slot 不再可寻址并允许重新 format；data 区字节仍可能由 raw 取证读到。wipe 要求模块卸载、目标为块设备、exclusive open、环境变量精确匹配设备路径及命令行旗标；不会修复单个 entry、自动迁移旧格式或修改权威 MetaStore/ObjectStore。 | `tools/kestrelfs-cache-admin.c` |
 | 31 | **读侧 page cache 的远端失效偏保守** | Redis revision ioctl 推进全局 page-cache epoch：普通读下次访问惰性清页，Step 46 已映射 inode 由异步 worker 撤销 PTE/folio；inode-list 细粒度 NVMe 失效对 VFS page cache 仍退化为挂载级保守失效，避免 ioctl 线程等待 locked folio 与 daemon READ_DATA 死锁。一致性窗口包含原 ~100 ms probe 与 worker 调度。 | `kestrelfs/file.c`、`kestrelfs/chardev.c` |
-| 32 | **可写 mmap 仍是同步 write-through** | Step 50 支持可写 `MAP_SHARED` 与 `mprotect` 合法升级；`page_mkwrite` 先校验 page-cache epoch，过期映射等待清理重试或 fail-closed SIGBUS。共享脏页经 writepages/WRITE_DATA 写回；VMA close 会等待范围写回，但 `munmap` 无 errno 返回通道，失败依赖 mapping errseq 与后续 fsync/flush 暴露。远端一致性窗口仍含约 100 ms probe 与 worker 调度，尚无 lease。 | `kestrelfs/file.c` |
+| 32 | **可写 mmap 延迟写回仍有无返回值窗口** | Step 50 支持可写 `MAP_SHARED` 与 `mprotect` 合法升级，Step 51 允许共享 folio 保持 dirty；`page_mkwrite` 仍先校验 page-cache epoch。MS_SYNC/fsync/VMA close 会等待 WRITE_DATA，但 `munmap` 无 errno 返回通道，失败依赖 mapping errseq 与后续 fsync/flush 暴露。远端一致性窗口仍含约 100 ms probe 与 worker 调度，尚无 lease。 | `kestrelfs/file.c` |
 | 33 | **文件锁仅本地 advisory** | Step 47 已把 flock、POSIX 字节锁与 OFD 锁交给 Linux 本地锁管理器；同一挂载节点上的进程可协调，flock 与 POSIX/OFD 锁类彼此独立。不同挂载或节点不共享锁状态；无跨 daemon 分布式锁、远端 lease 或强制锁。 | `kestrelfs/file.c` |
 | 30 | **fsync 的持久性受后端配置限制** | Step 44 fsync 与 fdatasync 同样同步对象和元数据；syncfs 检查所有引用且同步本地对象目录树。Mem 返回仅进程内成功；Redis 仅保证已 ACK 的 mutation 可见，崩溃耐久取决于 AOF/RDB 配置（RDB 不保证逐次 fsync 耐久；本步没有 WAIT/WAITAOF）；S3 以已完成 PUT ACK 为边界；没有分布式跨后端原子事务或目录 file op 的 fsync。 | `daemon/src/main.rs`、`daemon/src/object_store.rs`、`daemon/src/meta_persist.rs` |
 
@@ -537,9 +540,12 @@ mnt=/mnt/kestrelfs
 long_dir=directory-name-that-is-over-twenty-three-bytes
 long_file=file-name-that-is-definitely-over-twenty-three-bytes.txt
 long_new=renamed-file-that-is-still-over-twenty-three-bytes.txt
+data_dir=/tmp/kestrelfs-step13-$$
+mkdir -p "$data_dir"
 
 sudo insmod kestrelfs/kestrelfs.ko
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sudo mkdir -p "$mnt"
 sudo mount -t kestrelfs none "$mnt"
@@ -554,7 +560,8 @@ time sudo umount "$mnt"                     # 应 <1s
 
 kill "$daemon_pid"
 wait "$daemon_pid" || true
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sudo mount -t kestrelfs none "$mnt"
 sudo ls "$mnt/$long_dir" | grep -Fx "$long_new"
@@ -568,13 +575,16 @@ wait "$daemon_pid" || true
 
 ### 7.8 Step 14 symlink 与持久化重启验证（需 sudo）
 
-以下命令包含固定 data-dir、模块加载、目标跟随、`readlink`、`ls -l` 与 daemon 重启恢复：
+以下命令包含独立 data-dir、模块加载、目标跟随、`readlink`、`ls -l` 与 daemon 重启恢复：
 
 ```bash
 make -C kestrelfs
 (cd daemon && cargo build --release)
 sudo insmod kestrelfs/kestrelfs.ko
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+data_dir=/tmp/kestrelfs-step14-$$
+mkdir -p "$data_dir"
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 
@@ -595,7 +605,8 @@ time sudo umount "$mnt"
 
 kill "$daemon_pid"
 wait "$daemon_pid" || true
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mount -t kestrelfs none "$mnt"
@@ -671,7 +682,9 @@ sudo ln -s step16-file /mnt/kestrelfs/step16-link
 sudo umount /mnt/kestrelfs
 kill "$daemon_pid"; wait "$daemon_pid" || true
 
-./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step16 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" \
+  --redis-prefix kestrelfs-step31 --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mount -t kestrelfs none /mnt/kestrelfs
@@ -710,7 +723,12 @@ put/get/覆盖/幂等 delete，另一项覆盖 handle_write_bytes → unlink →
 export REDIS_URL="redis://:${KESTRELFS_REDIS_PASSWORD}@192.168.18.253:8379/15"
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
 sudo insmod kestrelfs/kestrelfs.ko
-./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 --s3-endpoint http://192.168.18.253:9000 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+data_dir=/tmp/kestrelfs-step17-$$
+mkdir -p "$data_dir"
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" \
+  --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 \
+  --s3-endpoint http://192.168.18.253:9000 --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mkdir -p /mnt/kestrelfs
@@ -720,7 +738,10 @@ printf 'redis plus s3 survives restart\n' | sudo tee /mnt/kestrelfs/step17-s3-fi
 sudo umount /mnt/kestrelfs
 kill "$daemon_pid"; wait "$daemon_pid" || true
 
-./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 --s3-endpoint http://192.168.18.253:9000 --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+./daemon/target/release/kestrelfs-daemon --meta "$REDIS_URL" \
+  --redis-prefix kestrelfs-step17 --objects s3://kestrelfs-test/step17 \
+  --s3-endpoint http://192.168.18.253:9000 --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mount -t kestrelfs none /mnt/kestrelfs
@@ -749,7 +770,10 @@ device，不能传普通文件：
 ```bash
 sudo insmod kestrelfs/kestrelfs.ko cache_size_mib=128
 test "$(cat /sys/module/kestrelfs/parameters/cache_size_mib)" = 128
-./daemon/target/release/kestrelfs-daemon --data-dir /tmp/kestrelfs-debug >/dev/null 2>&1 &
+data_dir=/tmp/kestrelfs-step18-$$
+mkdir -p "$data_dir"
+./daemon/target/release/kestrelfs-daemon --data-dir "$data_dir" \
+  >"$data_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 sudo mkdir -p /mnt/kestrelfs
@@ -1707,6 +1731,35 @@ Codex 自检：`cargo test` **200 passed**，clippy `-D warnings` 通过，
 Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复跑 vng
 `STEP50_DOUBLE_PACK_PASS`（umount_ms=11）。
 
+### 7.45 Phase 4/内核+文档 Step 51 WRITE-BEHIND + OPS/DOC
+
+普通 buffered write 不再在 `write_iter` 返回前主动等待整个 mapping 写回；folio
+标脏后可由内核 BDI flusher、内存压力或显式 durability 路径推进既有
+`writepages` → `WRITE_DATA`。`O_SYNC`/`O_DSYNC` 仍经 `generic_write_sync()`；
+fsync/fdatasync、MS_SYNC、truncate、close `.flush` 和 writable VMA close 仍等待
+相关 dirty folio。VFS 在 `sync_fs(wait=1)` 前已完成 superblock mapping 写回，随后
+再发 `OP_SYNC_FS` 后端屏障。失败保留 dirty folio，并通过 mapping/superblock
+errseq 在同步点报告；daemon 恢复后可重试。远端 page-cache epoch 清理先撤销 writable
+PTE 并写回 dirty folio，成功后才退页；失败时保留 dirty 页，并让 read 或 mmap fault
+fail closed。本步没有新增 opcode 或磁盘字段，IPC ABI **v22**、cache format **v4**
+均不变。
+
+新增 `docs/configuration.md` 作为模块参数、挂载选项、daemon CLI/环境变量与安全
+恢复边界的唯一权威配置表；README/HANDOFF/Phase 4 文档改为链接该表，并清理当前
+write-through 等明显过时表述。正常加载仍不自动 wipe 或迁移。
+
+Codex 自检：`STEP51_ASYNC_RETURN_PASS`（daemon 离线时普通 write 0 ms 返回）、
+`STEP51_FSYNC_ERROR_PASS`、`STEP51_FSYNC_RECOVERY_PASS`、
+`STEP51_SYNCFS_BARRIER_PASS`、`STEP51_DIRTY_COHERENCE_PASS`、
+`STEP51_RESTART_READBACK_PASS` 与 `STEP51_WRITE_BEHIND_PASS`（最终 umount 14 ms）。
+完整 cargo/clippy/make 与 Step 50/49/46/44
+vng 回归结果见 `docs/remaining-capabilities.md` §9。所有 insmod、loop 和 mount
+只在 vng guest 内执行；daemon 使用独立 data-dir 并保留 daemon.log。
+
+Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复跑 vng
+`STEP51_WRITE_BEHIND_PASS`（umount_ms=11；`STEP51_ASYNC_WRITE_LATENCY_MS=0`）。
+
+
 ## 8. 路线图（未做）
 
 按 Cursor 既定策略的推荐优先级：
@@ -1714,8 +1767,8 @@ Cursor 验收自检（2026-09-20）：200 tests；clippy / make 零警告；复�
 | 优先级 | 内容 | 说明 |
 |---|---|---|
 | 1 | **双包交付** | 自 Step 50 起每步约 2× 既往体量；见 remaining-capabilities §2 |
-| 2 | **Step 51 WRITE-BEHIND + OPS/DOC** | 提示词见 `docs/remaining-capabilities.md` §8 |
-| 3 | 其后 | DIST-IO、TEST-PERF 等（继续双包） |
+| 2 | **Step 52 DIST-IO + TEST-PERF** | 提示词见 `docs/remaining-capabilities.md` §8 |
+| 3 | 其后 | 视需要继续双包 |
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
 
@@ -1771,8 +1824,10 @@ mkdir -p "$data_dir"
 
 - [x] Step 50 双包已由 Cursor 验收并提交
 - [x] IPC ABI = 22；cache format = v4
-- [x] Step 8–49 + Step 50 已验收状态已写清
-- [x] 下一步明确：Step 51 双包（WRITE-BEHIND + OPS/DOC；`docs/remaining-capabilities.md` §8）
+- [x] Step 8–50 + Step 51 已验收状态已写清
+- [x] Step 51 双包已由 Cursor 验收并提交
+- [x] 权威配置表：`docs/configuration.md`
+- [x] 下一步明确：Step 52 双包（DIST-IO + TEST-PERF；`docs/remaining-capabilities.md` §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

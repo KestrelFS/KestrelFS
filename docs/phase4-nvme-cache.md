@@ -89,6 +89,22 @@ writable VMA 的 close 也同步等待映射范围，防止普通 `munmap` 静�
 inode 类型变为 v22；缓存磁盘布局不变，仍为 format v4。测试见
 `test-step50-vng.sh` 与 `test-step50-map-shared.c`。
 
+Step 51 将普通 buffered write 从 write-through 改为 write-behind：
+`write_iter` 在 folio 成功标脏后不再主动 `filemap_write_and_wait()`，由内核 BDI
+flusher、内存回收或显式同步路径调用既有 `writepages` → `WRITE_DATA`。因此普通
+异步 write 可以在 daemon 暂时离线时先从 page cache 返回；这不代表数据已持久化。
+`O_SYNC`/`O_DSYNC` 仍经 `generic_write_sync()` 等待；`fsync`/`fdatasync`、
+`msync(MS_SYNC)`、writable VMA close、truncate 与 close `.flush` 也会同步写回。
+`syncfs` 由 VFS 先写回该 superblock 的 dirty mapping，再由 `sync_fs(wait=1)` 发
+`OP_SYNC_FS`。WRITE_DATA 失败会 redirty folio 并记录 mapping/superblock errseq，
+由同步调用或后续同步点报告；NVMe read-cache 的写前/提交前失效及 page-cache epoch
+仍保持顺序：远端 epoch worker 先撤销 writable PTE、写回 dirty folio，成功后才
+退休旧 page-cache 页；写回失败保留 dirty 页并让 read/SIGBUS fail closed，避免
+静默丢弃本地延迟写。这里复用内核通用 flusher，并未增加异步 WRITE_DATA opcode
+或自有线程。
+IPC ABI 仍为 v22，cache format 仍为 v4；验证见
+`test-step51-write-behind-vng.sh`。
+
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
 open，避免模块持有期间读取不一致快照。它报告 namespace、geometry、
@@ -152,63 +168,9 @@ opcode 与 cache format v4 均未改变。
 `CONFIG_BLK_DEV_WRITE_MOUNTED` 的内核仍允许未参与 holder 协议的 raw writer；
 部署侧必须保证该专用设备不被其他进程写入。
 
-当前主要只读模块参数：
-
-```text
-cache_device=/dev/loop0
-cache_size_mib=4096
-cache_namespace=<64 hex digits>
-cache_direct_io=1
-cache_parallel_reads=1
-```
-
-`cache_size_mib=0` 表示以整个块设备容量为上限；非零值转换为 MiB 后必须不
-超过实际容量。可用容量向下对齐 logical sector，且必须容纳 2 MiB 元数据区和
-至少一个 4 KiB data block。logical/physical sector 必须为 2 的幂、logical
-至少 512 字节，且两者都必须整除 4 KiB superblock。
-
-只要指定 `cache_device`，就必须同时传入 `cache_namespace`。其值是 logical
-filesystem namespace 规范描述的 SHA-256 digest，必须恰好为 64 个十六进制
-字符；内核只做 hex 解码和精确比较，不在内核中解析路径、Redis URL 或凭据。
-建议部署层使用稳定、无凭据且无歧义的描述，例如：
-
-```text
-v1;meta=file:/absolute/data-dir/meta.json;objects=local:/absolute/data-dir
-v1;meta=redis:host:6379/db#prefix;objects=s3:endpoint/bucket/prefix
-```
-
-路径必须先规范化为绝对路径，endpoint/DB/prefix/bucket/object prefix 也必须采用
-部署统一的规范形式；Redis 密码和 S3 secret 不应进入描述。示例：
-
-```bash
-cache_namespace=$(printf '%s' \
-  'v1;meta=file:/tmp/kestrelfs-debug/meta.json;objects=local:/tmp/kestrelfs-debug' \
-  | sha256sum | awk '{print $1}')
-```
-
-digest 可出现在 `/sys/module/kestrelfs/parameters/`，但它不是凭据。相同 logical
-filesystem 在重启时必须使用同一 digest；修改 MetaStore namespace 或 ObjectStore
-dataset 时必须使用不同 digest。
-
-`cache_direct_io` 默认为 1。设为 0 只关闭 Step 22 用户页直达，保留 Step 20
-同步 BIO + copy 路径，主要用于正确性回退和同一 build 的 A/B 粗测。六个只读
-观测计数 `cache_direct_hit_blocks`、`cache_copy_hit_blocks`、
-`cache_direct_fallbacks`、`cache_evictions`、`cache_checksum_failures` 和
-`cache_journal_recoveries` 可从 sysfs 读取；Step 35/42 另有
-`cache_coherence_invalidations` 记录成功的 daemon 全失效次数，
-`cache_coherence_inode_batches` / `cache_coherence_inode_entries` 记录细粒度批次与
-实际退休 entry 数。它们都不是稳定用户 ABI。
-
-`cache_evict_batch` 默认为 16，合法范围 1–64；实际单批还限制为总槽位的 1/16
-（至少 1），避免小 cache 被一次扫空。`cache_eviction_batches`、
-`cache_eviction_batch_slots` 和 `cache_eviction_index_writes` 分别观测批次数、已退休
-victim 数和合并后的 index-page 写次数，同样不是稳定用户 ABI。设为 1 可退回
-Step 23 的单 victim 行为。
-
-`cache_parallel_reads` 默认为 1；设为 0 会让 hit 也取得写侧，用于同一 build 的
-串行/并行 A/B，不改变盘上格式。另有只读观测值 `cache_active_hit_readers` 与
-`cache_parallel_hit_peak`，分别表示当前和本次加载以来的峰值 hit reader 数；它们
-同样不是稳定用户 ABI。
+模块输入参数、只读观测计数、namespace descriptor 规则与安全默认值统一维护在
+[`configuration.md`](configuration.md)。本设计文档不再复制参数表，避免默认值和
+新增计数发生漂移。
 
 ## Step 19–27 磁盘格式
 

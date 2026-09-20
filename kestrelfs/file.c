@@ -60,12 +60,24 @@ static void kestrelfs_pagecache_coherence_work(struct work_struct *work)
 	struct kestrelfs_inode_state *state = container_of(work,
 			struct kestrelfs_inode_state, coherence_work);
 	u64 epoch;
+	int ret;
 
 	for (;;) {
 		epoch = atomic64_read(&kestrelfs_pagecache_coherence_epoch);
 		inode_lock(state->inode);
-		truncate_inode_pages(state->inode->i_mapping, 0);
-		WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+		/* Delayed local writes must reach the authoritative daemon before
+		 * stale clean pages are retired. The ioctl only queues this worker,
+		 * so waiting here cannot make the daemon wait on its own IPC reply.
+		 * Revoke writable PTEs first; refaults observe the stale epoch and
+		 * wait, so no new mmap dirties can race between writeback and retire.
+		 */
+		unmap_mapping_range(state->inode->i_mapping, 0, 0, 0);
+		ret = filemap_write_and_wait(state->inode->i_mapping);
+		if (!ret) {
+			truncate_inode_pages(state->inode->i_mapping, 0);
+			WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+		}
+		WRITE_ONCE(state->coherence_error, ret);
 		inode_unlock(state->inode);
 		wake_up_all(&state->coherence_wait);
 
@@ -87,6 +99,7 @@ void kestrelfs_pagecache_register_inode(struct inode *inode)
 	INIT_LIST_HEAD(&state->coherence_link);
 	INIT_WORK(&state->coherence_work, kestrelfs_pagecache_coherence_work);
 	init_waitqueue_head(&state->coherence_wait);
+	state->coherence_error = 0;
 	state->pagecache_coherence_epoch =
 		atomic64_read(&kestrelfs_pagecache_coherence_epoch);
 	mutex_lock(&kestrelfs_coherence_inodes_lock);
@@ -109,6 +122,7 @@ static void kestrelfs_pagecache_schedule_coherence(
 {
 	mutex_lock(&kestrelfs_coherence_inodes_lock);
 	if (!state->coherence_work_scheduled) {
+		WRITE_ONCE(state->coherence_error, 0);
 		state->coherence_work_scheduled = true;
 		queue_work(system_unbound_wq, &state->coherence_work);
 	}
@@ -151,14 +165,25 @@ static ssize_t kestrelfs_regular_read_iter(struct kiocb *iocb,
 	 */
 	epoch = atomic64_read(&kestrelfs_pagecache_coherence_epoch);
 	if (READ_ONCE(state->pagecache_coherence_epoch) != epoch) {
+		int ret;
+
 		inode_lock(inode);
 		epoch = atomic64_read(&kestrelfs_pagecache_coherence_epoch);
 		if (state->pagecache_coherence_epoch != epoch) {
-			truncate_inode_pages(inode->i_mapping, 0);
-			WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+			unmap_mapping_range(inode->i_mapping, 0, 0, 0);
+			ret = filemap_write_and_wait(inode->i_mapping);
+			if (!ret) {
+				truncate_inode_pages(inode->i_mapping, 0);
+				WRITE_ONCE(state->pagecache_coherence_epoch, epoch);
+			}
+			WRITE_ONCE(state->coherence_error, ret);
+			inode_unlock(inode);
 			wake_up_all(&state->coherence_wait);
+			if (ret)
+				return ret;
+		} else {
+			inode_unlock(inode);
 		}
-		inode_unlock(inode);
 	}
 	return generic_file_read_iter(iocb, to);
 }
@@ -183,7 +208,10 @@ static vm_fault_t kestrelfs_regular_mmap_fault(struct vm_fault *vmf)
 		release_fault_lock(vmf);
 		wait_event(state->coherence_wait,
 			READ_ONCE(state->pagecache_coherence_epoch) ==
-			atomic64_read(&kestrelfs_pagecache_coherence_epoch));
+			atomic64_read(&kestrelfs_pagecache_coherence_epoch) ||
+			READ_ONCE(state->coherence_error));
+		if (READ_ONCE(state->coherence_error))
+			return VM_FAULT_SIGBUS;
 		return VM_FAULT_RETRY;
 	}
 	return filemap_fault(vmf);
@@ -210,7 +238,10 @@ static vm_fault_t kestrelfs_regular_page_mkwrite(struct vm_fault *vmf)
 		release_fault_lock(vmf);
 		wait_event(state->coherence_wait,
 			READ_ONCE(state->pagecache_coherence_epoch) ==
-			atomic64_read(&kestrelfs_pagecache_coherence_epoch));
+			atomic64_read(&kestrelfs_pagecache_coherence_epoch) ||
+			READ_ONCE(state->coherence_error));
+		if (READ_ONCE(state->coherence_error))
+			return VM_FAULT_SIGBUS;
 		return VM_FAULT_RETRY;
 	}
 	return filemap_page_mkwrite(vmf);
@@ -229,7 +260,7 @@ static void kestrelfs_regular_mmap_close(struct vm_area_struct *vma)
 	if (!(vma->vm_flags & VM_SHARED) || !(vma->vm_flags & VM_MAYWRITE))
 		return;
 	end = length > LLONG_MAX - start ? LLONG_MAX : start + length - 1;
-	/* munmap has no errno channel.  Attempt write-through here and retain any
+	/* munmap has no errno channel. Attempt synchronous writeback here and retain any
 	 * failure in mapping errseq so a later fsync/close observes it.
 	 */
 	filemap_write_and_wait_range(file->f_mapping, start, end);
@@ -908,9 +939,11 @@ static int kestrelfs_regular_flock(struct file *file, int cmd,
 }
 
 /* Buffered writes dirty filemap folios. A writeback callback persists each
- * folio through WRITE_DATA; this minimal write-through policy waits before
- * returning from write_iter and keeps clean pages in filemap thereafter.
- * fsync and close also wait, so future dirty-folio sources stay covered.
+ * folio through WRITE_DATA. Normal asynchronous writes may return while the
+ * folio is still dirty; the BDI flusher, memory pressure, or an explicit
+ * durability operation advances writeback. O_SYNC/O_DSYNC still wait through
+ * generic_write_sync(), while fsync, close, truncate, and writable VMA close
+ * retain their explicit waits.
  * Invalidate the NVMe read cache before and after the dirtying operation, so
  * concurrent old READ_DATA fills cannot remain indexed after this write.
  */
@@ -948,11 +981,6 @@ static ssize_t kestrelfs_writable_write_iter(struct kiocb *iocb,
 		if (checked > 0)
 			mapping_set_error(inode->i_mapping, ret);
 		goto out;
-	}
-	if (checked > 0) {
-		ret = filemap_write_and_wait(inode->i_mapping);
-		if (ret)
-			goto out;
 	}
 out_checked:
 	inode_unlock(inode);

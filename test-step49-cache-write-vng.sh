@@ -81,6 +81,8 @@ error_file="$mnt/failure.dat"
 : >"$error_file"
 exec 8<>"$error_file"
 stop_daemon
+# Step 51 allows the write itself to complete from page cache; the helper then
+# requires fsync to report that WRITE_DATA could not reach the offline daemon.
 "$helper" fail-write-fd 8
 echo STEP49_WRITEBACK_ERROR_PASS
 start_daemon

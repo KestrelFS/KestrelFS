@@ -33,6 +33,7 @@ struct kestrelfs_inode_state {
 	struct list_head coherence_link;
 	struct work_struct coherence_work;
 	wait_queue_head_t coherence_wait;
+	int coherence_error;
 	bool coherence_work_scheduled;
 };
 

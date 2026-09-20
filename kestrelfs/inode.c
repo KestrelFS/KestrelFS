@@ -93,6 +93,10 @@ static int kestrelfs_sync_fs(struct super_block *sb, int wait)
 {
 	if (!wait)
 		return 0;
+	/* sync_filesystem() has synchronously flushed this superblock's dirty
+	 * mappings before the wait=1 callback. Order the daemon durability
+	 * barrier strictly after that VFS writeback phase.
+	 */
 	return kestrelfs_sync_daemon(KESTRELFS_OP_SYNC_FS, 0);
 }
 
@@ -175,7 +179,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 		mutex_init(&state->lifecycle_lock);
 		inode->i_private = state;
 		kestrelfs_pagecache_register_inode(inode);
-		/* Folio reads and write-through data writeback share this mapping. */
+		/* Folio reads and delayed data writeback share this mapping. */
 		inode->i_mapping->a_ops = &kestrelfs_reg_aops;
 		inode->i_op = &kestrelfs_reg_inode_ops;
 		inode->i_fop = &kestrelfs_reg_file_ops;

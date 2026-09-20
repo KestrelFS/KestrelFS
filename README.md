@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 50 可写 MAP_SHARED + WHITEOUT 已验收；下一步 Step 51 双包 WRITE-BEHIND + OPS/DOC；IPC ABI v22；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 51 write-behind 已验收；下一步 Step 52 双包 DIST-IO + TEST-PERF；IPC ABI v22；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -44,11 +44,13 @@
 > Step 43 已将普通 write/writev/pwritev 统一到同步 `.write_iter` / `iov_iter` 路径；
 > Step 44 的普通文件 fsync/fdatasync 与挂载 syncfs 已经同步等待 daemon 后端耐久屏障；
 > Step 45 已把普通读接到 `read_folio`/`readahead` 与 VFS page cache，
-> 冷页仍由内核块缓存或 `READ_DATA` 填充；Step 49 已落地 write-through aops（脏 folio → writepages/WRITE_DATA；fsync 先写回再屏障）；
-> 标脏和 `writepages` 同步写回 daemon，成功后保留干净 page-cache 页；
+> 冷页仍由内核块缓存或 `READ_DATA` 填充；Step 49 落地 folio writeback，Step 51
+> 允许普通 buffered write 标脏后先返回，再由通用 flusher 或显式同步操作经
+> writepages/WRITE_DATA 写回；fsync 仍先写回再执行后端屏障；
 > 热读不再走 Step 28 直达用户页路径。Step 46 已支持普通文件
-> `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`；Step 50 已在同一 write-through
-> 路径上启用可写 `MAP_SHARED`，覆盖 `msync`/`fsync`/`munmap`；
+> `MAP_PRIVATE`（含私有 COW）及只读 `MAP_SHARED`；Step 50 已启用可写
+> `MAP_SHARED`，Step 51 让其共享同一延迟写回路径，`msync(MS_SYNC)`/`fsync`
+> 仍同步等待；
 > 写后旧映射重新 fault，远端 revision 触发异步映射清理。Step 47 已在同一挂载节点支持普通文件 flock、POSIX `fcntl` 字节锁和 OFD 锁；锁由内核
 > 本地管理，进程退出自动释放，不跨节点或跨挂载协调。
 > Step 48 的 cache hit 已采用异步 BIO completion；VFS 读调用仍等待结果。
@@ -155,7 +157,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–50 已验收；下一步 Step 51 双包 WRITE-BEHIND+OPS/DOC（ABI v22 / format v4） |
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–51 已验收；下一步 Step 52 双包 DIST-IO+TEST-PERF（ABI v22 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -174,6 +176,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
+├── docs/configuration.md           # 模块/挂载/daemon 唯一权威配置表
 ├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
 ├── test-step19-cache-vng.sh … test-step29-cache-evict-vng.sh
 ├── test-step32-posix-core-vng.sh   # 硬链接、持久 nlink 与末引用 GC
@@ -203,6 +206,8 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step40-posix-utimes.c         # open-unlink futimens 测试助手
 ├── test-step50-vng.sh                 # 可写 MAP_SHARED + WHITEOUT 双包回归
 ├── test-step50-map-shared.c           # mmap 写、同步、COW 与重启测试助手
+├── test-step51-write-behind-vng.sh     # 延迟写回、显式同步、失败/重启回归
+├── test-step51-write-behind.c          # write-behind 时序与读回测试助手
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -286,6 +291,9 @@ sudo insmod kestrelfs/kestrelfs.ko \
   cache_namespace="$cache_namespace"
 ```
 
+模块参数、只读计数、namespace 生成规则和当前 mount/daemon 参数的权威说明见
+[`docs/configuration.md`](docs/configuration.md)。
+
 当前挂载已是**可写动态 VFS**（create/mkdir/rename/symlink/read/write/chmod 等），
 不是 Phase 1 的只读演示。
 
@@ -331,18 +339,9 @@ cargo build --release
 sudo ./target/release/kestrelfs-daemon --data-dir /var/lib/kestrelfs/objects
 ```
 
-常用选项：
-
-- `--data-dir <PATH>` — 持久化 `meta.json` 与本地对象目录（默认 `./.kestrelfs-data`）
-- `--memory` — 内存 MetaStore + ObjectStore（重启丢失；仅测试）
-- `--meta <REDIS_URL>` — 例如 `redis://127.0.0.1:6379/0`；对象仍可用 `--data-dir`
-- `--redis-prefix <PREFIX>` — Redis metadata 命名空间（默认 `kestrelfs`；v2 键位于
-  `<PREFIX>:meta:v2:*`）；需同时使用 `--meta`
-- `--objects <S3_URL>` — 例如 `s3://bucket/kestrelfs-data`；不可与 `--memory` 同用
-- `--s3-endpoint <URL>` — MinIO 等自定义 endpoint（path-style）；也可读 `S3_ENDPOINT`
-
-S3 凭据走标准 AWS SDK 链（`AWS_ACCESS_KEY_ID` 等），**从不**作为 CLI 参数或打印到日志。
-目标 bucket 须预先存在。
+完整 CLI 默认值、互斥关系、环境变量和凭据约束统一维护在
+[`docs/configuration.md`](docs/configuration.md)。S3 凭据走标准 AWS SDK 链，
+**从不**作为 CLI 参数或打印到日志；目标 bucket 须预先存在。
 
 Step 31 已验收的 Redis schema v2 将 control、inode、dirent、slice、symlink 与 GC
 queue 拆到独立 HASH/SET；点查只读取目标 field，复合 mutation 用 Lua
@@ -492,8 +491,8 @@ Step 34 支持 create/mkdir mode 与
 - Step 31 已验收的 Redis 元数据为 v2 分记录 HASH/SET，点查不再全量读取；但
   mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
   引用确认也仍需聚合扫描。当前仅支持 `redis://` 与一条 multiplexed connection，
-  尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。S3 delete 失败会保留队列并
-  重试，但重试仍在串行 daemon event loop 中执行，慢请求可能增加 IPC 尾延迟。
+  尚无 TLS、自动重连、超时/健康检查或 v1 自动迁移。Step 41 已把 S3 delete 移到
+  有界 worker；失败保留 durable queue 重试，但尚无 dead-letter 或管理限额。
 - Phase 4 v4 绑定 namespace；CRC32 非密码学；半提交可安全 miss，但无双
   superblock/metadata 镜像；Step 48 已实现多个 hit BIO 异步提交、分别
   completion 唤醒，但 VFS 调用仍等待自己的 BIO，mutation 会等待在途 reader。
@@ -504,16 +503,19 @@ Step 34 支持 create/mkdir mode 与
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
 - Step 45 已让普通文件读经 page cache/readahead；冷 folio 才访问 NVMe 或 daemon。
-  Step 49 已落地的 buffered write 使用 dirty folio/writepages，但写调用仍等待 daemon，
-  成功后保留干净 folio；Step 50 已启用可写 `MAP_SHARED`，共享脏页沿同一同步
-  write-through 路径经 `msync`/`fsync`/VMA close 写回。`munmap` 本身没有 errno
+  Step 51 让普通 buffered write 与可写 `MAP_SHARED` 使用 write-behind：普通异步
+  write 可仅标脏后返回，BDI flusher/内存压力或显式同步再经 WRITE_DATA 提交。
+  `O_SYNC`/`O_DSYNC`、`fsync`/`fdatasync`、`msync(MS_SYNC)`、truncate、close
+  `.flush` 和 writable VMA close 仍可能同步等待 daemon。`munmap` 本身没有 errno
   返回通道，失败依赖 mapping errseq 与后续 `fsync`/`flush` 报告；远端失效还受
-  probe 与异步清页调度窗口影响。splice 仍未覆盖。
+  probe 与异步清页调度窗口影响。epoch 清理会先撤销 writable PTE 并写回 dirty
+  folio，失败时保留数据并让后续 read/mmap fail closed。splice 仍未覆盖，也没有
+  独立异步 WRITE_DATA opcode 或跨 folio 批量提交。
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
-- Step 49 的普通 write/writev/pwritev 先写入 VFS folio，再由 aops 经
-  全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；这是同步 write-through，不是
-  延迟写缓存或 WRITE_DATA 异步 completion。失败会保留 dirty folio 并向调用者报错。
+- dirty folio 仍由 aops 经全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；后台
+  writeback 自身同步等待 daemon，失败会 redirty folio 并记录 mapping/superblock
+  errseq。延迟的是 write(2) 的完成点，并非 daemon IPC 或 WRITE_DATA completion。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有
   引用对象和本地对象目录树。FileMetaStore/LocalFs 同步文件与目录项；Mem 仅内存生效，
   Redis 已 ACK 的 mutation 崩溃耐久仍取决于 AOF/RDB 设置（RDB 不保证逐次 fsync），
