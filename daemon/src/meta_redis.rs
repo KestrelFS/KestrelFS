@@ -9,9 +9,14 @@
 //! allocation, rename replacement, truncate, and the durable GC queue atomic.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use futures_util::StreamExt;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
 use crate::fs_model::{Inode, Slice, S_IFDIR};
@@ -111,6 +116,7 @@ local expired = tonumber(ARGV[3]) - tonumber(ARGV[7])
 if expired >= 1 then
     redis.call('HDEL', KEYS[7], tostring(expired))
 end
+redis.call('PUBLISH', KEYS[8], ARGV[3])
 return 1
 "#;
 
@@ -164,18 +170,25 @@ return result
 /// Errors that prevent constructing a Redis metadata backend.
 #[derive(Debug, thiserror::Error)]
 pub enum RedisMetaStoreError {
-    #[error("Redis metadata URL must start with redis://")]
+    #[error("Redis metadata URL must start with redis:// or rediss://")]
     InvalidUrl,
     #[error("Redis prefix must be non-empty and contain no whitespace/control characters")]
     InvalidPrefix,
+    #[error("a custom Redis CA certificate requires a rediss:// URL")]
+    InvalidTlsConfig,
+    #[error("failed to create Redis notification wakeup: {0}")]
+    Notification(#[source] io::Error),
     #[error("legacy Redis metadata schema v1 exists; automatic migration is not supported")]
     LegacySchema,
     #[error("unsupported Redis metadata schema: {0}")]
     UnsupportedSchema(String),
     #[error("invalid Redis metadata layout: {0}")]
     InvalidLayout(String),
-    #[error("Redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    // Keep the source for diagnostics/backtraces, but do not interpolate it
+    // into the startup error: client-configuration errors are not guaranteed
+    // never to echo connection information containing credentials.
+    #[error("Redis backend connection/configuration error")]
+    Redis(#[from] #[source] redis::RedisError),
     #[error("Redis metadata record is invalid: {0}")]
     Snapshot(#[from] serde_json::Error),
 }
@@ -189,6 +202,7 @@ struct RedisKeys {
     symlinks: String,
     garbage: String,
     dirty: String,
+    notifications: String,
     legacy_snapshot: String,
 }
 
@@ -203,6 +217,7 @@ impl RedisKeys {
             symlinks: format!("{base}:symlinks"),
             garbage: format!("{base}:gc"),
             dirty: format!("{base}:dirty"),
+            notifications: format!("{base}:notify"),
             legacy_snapshot: format!("{prefix}:{LEGACY_SNAPSHOT_KEY_SUFFIX}"),
         }
     }
@@ -222,8 +237,103 @@ impl RedisKeys {
 
 /// A record-oriented Redis implementation of [`MetaStore`].
 pub struct RedisMetaStore {
-    connection: MultiplexedConnection,
+    connection: ConnectionManager,
     keys: RedisKeys,
+    notification: Option<RedisNotification>,
+}
+
+struct RedisNotification {
+    event_fd: Arc<OwnedFd>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl RedisNotification {
+    fn new(client: redis::Client, channel: String) -> io::Result<Self> {
+        // SAFETY: eventfd returns a new owned descriptor or a negative errno.
+        let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw_fd was just returned by eventfd and ownership transfers
+        // exactly once into OwnedFd.
+        let event_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        let task_fd = Arc::clone(&event_fd);
+        let task = tokio::spawn(async move {
+            let mut retry = Duration::from_millis(50);
+            loop {
+                let connected = async {
+                    let mut pubsub = client.get_async_pubsub().await?;
+                    pubsub.subscribe(&channel).await?;
+
+                    // Subscription establishment (including reconnect) may
+                    // follow missed messages. Force durable reconciliation.
+                    Self::signal(&task_fd);
+                    let mut messages = pubsub.on_message();
+                    while messages.next().await.is_some() {
+                        Self::signal(&task_fd);
+                    }
+                    Ok::<(), redis::RedisError>(())
+                }
+                .await;
+
+                if connected.is_ok() {
+                    retry = Duration::from_millis(50);
+                }
+                tokio::time::sleep(retry).await;
+                retry = retry.saturating_mul(2).min(Duration::from_secs(1));
+            }
+        });
+        Ok(Self {
+            event_fd,
+            _task: task,
+        })
+    }
+
+    fn signal(fd: &OwnedFd) {
+        let value = 1_u64.to_ne_bytes();
+        // SAFETY: fd is a live eventfd and value is an eight-byte eventfd
+        // counter increment. EAGAIN means a wakeup is already pending.
+        let _ = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+            )
+        };
+    }
+
+    fn drain(&self) -> io::Result<bool> {
+        let mut value = 0_u64;
+        // SAFETY: event_fd is live and value provides the required eight-byte
+        // eventfd read buffer.
+        let result = unsafe {
+            libc::read(
+                self.event_fd.as_raw_fd(),
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if result == std::mem::size_of::<u64>() as isize {
+            return Ok(value != 0);
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short Redis notification eventfd read",
+        ))
+    }
+}
+
+impl Drop for RedisNotification {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -545,8 +655,22 @@ impl RedisMetaStore {
     /// A legacy v1 snapshot or an unversioned partial v2 layout is rejected;
     /// this implementation never silently migrates or wipes metadata.
     pub async fn new(url: &str, prefix: &str) -> std::result::Result<Self, RedisMetaStoreError> {
-        if !url.starts_with("redis://") {
+        Self::new_with_tls_ca(url, prefix, None).await
+    }
+
+    /// Connects with an optional PEM CA certificate for a `rediss://`
+    /// endpoint. Credentials remain in the URL consumed by the Redis client
+    /// and are never emitted by this module.
+    pub async fn new_with_tls_ca(
+        url: &str,
+        prefix: &str,
+        root_cert: Option<Vec<u8>>,
+    ) -> std::result::Result<Self, RedisMetaStoreError> {
+        if !url.starts_with("redis://") && !url.starts_with("rediss://") {
             return Err(RedisMetaStoreError::InvalidUrl);
+        }
+        if root_cert.is_some() && !url.starts_with("rediss://") {
+            return Err(RedisMetaStoreError::InvalidTlsConfig);
         }
         if prefix.is_empty()
             || prefix
@@ -556,14 +680,30 @@ impl RedisMetaStore {
             return Err(RedisMetaStoreError::InvalidPrefix);
         }
 
-        let client = redis::Client::open(url)?;
-        let connection = client.get_multiplexed_async_connection().await?;
-        let store = Self {
+        let client = if let Some(root_cert) = root_cert {
+            redis::Client::build_with_tls(
+                url,
+                redis::TlsCertificates {
+                    client_tls: None,
+                    root_cert: Some(root_cert),
+                },
+            )?
+        } else {
+            redis::Client::open(url)?
+        };
+        let connection = client.get_connection_manager().await?;
+        let keys = RedisKeys::new(prefix);
+        let mut store = Self {
             connection,
-            keys: RedisKeys::new(prefix),
+            keys,
+            notification: None,
         };
         store.initialize().await?;
         store.load_snapshot_backend().await?;
+        store.notification = Some(
+            RedisNotification::new(client, store.keys.notifications.clone())
+                .map_err(RedisMetaStoreError::Notification)?,
+        );
         Ok(store)
     }
 
@@ -825,8 +965,9 @@ impl RedisMetaStore {
         let mut connection = self.connection.clone();
         let result: i32 = redis::cmd("EVAL")
             .arg(MUTATE_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(&keys)
+            .arg(&self.keys.notifications)
             .arg(SCHEMA_VERSION)
             .arg(expected_revision)
             .arg(new_revision)
@@ -1292,6 +1433,18 @@ impl MetaStore for RedisMetaStore {
             .map_err(|error| Self::report_backend_error("coherence probe failed", error))?;
         Self::decode_coherence_response(&response)
     }
+
+    fn coherence_notification_fd(&self) -> Option<RawFd> {
+        self.notification
+            .as_ref()
+            .map(|notification| notification.event_fd.as_raw_fd())
+    }
+
+    fn drain_coherence_notifications(&self) -> io::Result<bool> {
+        self.notification
+            .as_ref()
+            .map_or(Ok(false), RedisNotification::drain)
+    }
 }
 
 #[cfg(test)]
@@ -1299,6 +1452,20 @@ mod tests {
     use super::*;
     use crate::fs_model::{ROOT_INODE, S_IFCHR, S_IFDIR, S_IFREG};
     use uuid::Uuid;
+
+    fn wait_for_notification(store: &RedisMetaStore, timeout_ms: i32) -> bool {
+        let Some(fd) = store.coherence_notification_fd() else {
+            return false;
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is one initialized poll descriptor and nfds is one.
+        let result = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        result > 0 && pfd.revents & libc::POLLIN != 0
+    }
 
     #[test]
     fn record_field_encodings_round_trip_unicode_and_numeric_ids() {
@@ -1588,6 +1755,142 @@ mod tests {
             runtime.block_on(RedisMetaStore::new("redis://localhost", "")),
             Err(RedisMetaStoreError::InvalidPrefix)
         ));
+        assert!(matches!(
+            runtime.block_on(RedisMetaStore::new_with_tls_ca(
+                "redis://localhost",
+                "kestrelfs",
+                Some(b"not-a-certificate".to_vec()),
+            )),
+            Err(RedisMetaStoreError::InvalidTlsConfig)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_url_gated_notification_and_reconnect() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("REDIS_URL not set; skipping Redis notification/reconnect assertions");
+            return;
+        };
+        let prefix = format!("kestrelfs:test:notify:{}", Uuid::new_v4());
+        let store = RedisMetaStore::new(&url, &prefix).await.unwrap();
+        let peer = RedisMetaStore::new(&url, &prefix).await.unwrap();
+
+        assert!(wait_for_notification(&store, 2_000));
+        assert!(store.drain_coherence_notifications().unwrap());
+        assert!(wait_for_notification(&peer, 2_000));
+        assert!(peer.drain_coherence_notifications().unwrap());
+
+        let observer_client = redis::Client::open(url.as_str()).unwrap();
+        let mut observer = observer_client.get_async_pubsub().await.unwrap();
+        observer.subscribe(&store.keys.notifications).await.unwrap();
+
+        let observed = peer.coherence_probe(None).await.unwrap().revision().unwrap();
+        let started = std::time::Instant::now();
+        let inode = store.create(ROOT_INODE, "notified", 0o640).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_millis(500), observer.on_message().next())
+            .await
+            .unwrap()
+            .expect("notification observer disconnected");
+        let published_revision: u64 = message.get_payload().unwrap();
+        assert!(wait_for_notification(&peer, 500));
+        assert!(peer.drain_coherence_notifications().unwrap());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        match peer.coherence_probe(Some(observed)).await.unwrap() {
+            CoherenceProbe::Inodes {
+                revision,
+                inode_ids,
+            } => {
+                assert_eq!(published_revision, revision);
+                assert!(inode_ids.contains(&inode));
+            }
+            other => panic!("notification did not lead to a bounded durable probe: {other:?}"),
+        }
+
+        // Kill only the command connection. The ConnectionManager must replace
+        // it, after which metadata requests and notifications work without a
+        // daemon/store restart.
+        let mut managed = store.connection.clone();
+        let client_id: i64 = redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut managed)
+            .await
+            .unwrap();
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let mut killer = client.get_multiplexed_async_connection().await.unwrap();
+        let killed: usize = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(client_id)
+            .query_async(&mut killer)
+            .await
+            .unwrap();
+        assert_eq!(killed, 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.getattr(ROOT_INODE).await.is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "Redis reconnect timed out");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        store
+            .set_attrs(inode, Some(0o600), None, None, None, None)
+            .await
+            .unwrap();
+        assert!(wait_for_notification(&peer, 500));
+        assert!(peer.drain_coherence_notifications().unwrap());
+        assert_eq!(peer.getattr(inode).await.unwrap().mode, S_IFREG | 0o600);
+
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}:meta:*"))
+            .query_async(&mut killer)
+            .await
+            .unwrap();
+        if !keys.is_empty() {
+            let _: usize = redis::cmd("DEL")
+                .arg(keys)
+                .query_async(&mut killer)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_tls_url_gated_self_signed_ca() {
+        let (Ok(url), Ok(ca_path)) = (
+            std::env::var("REDIS_TLS_URL"),
+            std::env::var("REDIS_TLS_CA_CERT"),
+        ) else {
+            eprintln!("Redis TLS gate not configured; skipping self-signed CA assertions");
+            return;
+        };
+        let ca = std::fs::read(ca_path).unwrap();
+        let prefix = format!("kestrelfs:test:tls:{}", Uuid::new_v4());
+        let store = RedisMetaStore::new_with_tls_ca(&url, &prefix, Some(ca.clone()))
+            .await
+            .unwrap();
+        let inode = store.create(ROOT_INODE, "tls-file", 0o640).await.unwrap();
+        assert_eq!(store.getattr(inode).await.unwrap().mode, S_IFREG | 0o640);
+        drop(store);
+
+        let restarted = RedisMetaStore::new_with_tls_ca(&url, &prefix, Some(ca))
+            .await
+            .unwrap();
+        assert_eq!(restarted.lookup(ROOT_INODE, "tls-file").await.unwrap(), inode);
+        let mut connection = restarted.connection.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}:meta:*"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        if !keys.is_empty() {
+            let _: usize = redis::cmd("DEL")
+                .arg(keys)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+        }
     }
 
     /// Runs only when a developer/CI job supplies a real Redis endpoint.

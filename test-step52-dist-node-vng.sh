@@ -142,10 +142,26 @@ else
 	inode_entries=/sys/module/kestrelfs/parameters/cache_coherence_inode_entries
 	before_batches=$(cat "$inode_batches")
 	before_entries=$(cat "$inode_entries")
-	"$helper" watch "$shared_file" "$ready" "$committed"
+	if test "${STEP53_NOTIFY:-0}" = 1; then
+		before_notifications=$(grep -c 'Redis coherence notification received' \
+			"$data_dir/daemon.log" || true)
+	fi
+	watch_output=$("$helper" watch "$shared_file" "$ready" "$committed")
+	echo "$watch_output"
 	test "$(cat "$inode_batches")" -gt "$before_batches"
 	test "$(cat "$inode_entries")" -gt "$before_entries"
 	echo STEP52_DIST_REMOTE_VISIBLE_PASS
+	if test "${STEP53_NOTIFY:-0}" = 1; then
+		latency_ms=$(printf '%s\n' "$watch_output" |
+			sed -n 's/^STEP52_DIST_VISIBILITY_LATENCY_MS=//p')
+		test -n "$latency_ms"
+		test "$latency_ms" -lt 50
+		after_notifications=$(grep -c 'Redis coherence notification received' \
+			"$data_dir/daemon.log" || true)
+		test "$after_notifications" -gt "$before_notifications"
+		echo "STEP53_DIST_NOTIFY_LATENCY_MS=$latency_ms"
+		echo STEP53_DIST_NOTIFY_WAKE_PASS
+	fi
 	exec 8<"$shared_file"
 	sync
 	echo 3 >/proc/sys/vm/drop_caches
@@ -153,6 +169,7 @@ else
 	"$helper" verify-fd 8 2
 	exec 8>&-
 	echo STEP52_DIST_DAEMON_FREE_NEW_HIT_PASS
+	test "${STEP53_NOTIFY:-0}" != 1 || echo STEP53_DIST_NOTIFY_DAEMON_FREE_HIT_PASS
 	start_daemon
 fi
 

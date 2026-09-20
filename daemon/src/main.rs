@@ -153,6 +153,17 @@ struct Args {
     )]
     redis_prefix: String,
 
+    /// PEM CA certificate used to verify a rediss:// metadata endpoint.
+    ///
+    /// Credentials still belong in `--meta`; neither value is logged.
+    #[arg(
+        long,
+        value_name = "PEM_PATH",
+        requires = "meta",
+        conflicts_with = "memory"
+    )]
+    redis_ca_cert: Option<PathBuf>,
+
     /// S3 object location, for example s3://bucket/optional/prefix.
     ///
     /// When omitted, persistent object data remains in `data_dir`.
@@ -288,14 +299,24 @@ fn main() -> io::Result<()> {
                 "kestrelfs-daemon: using Redis metadata (prefix={})",
                 args.redis_prefix
             );
-            Arc::new(
-                runtime
-                    .block_on(meta_redis::RedisMetaStore::new(
-                        redis_url,
-                        &args.redis_prefix,
-                    ))
-                    .map_err(|e| io::Error::other(e.to_string()))?,
-            )
+            let redis_ca = args
+                .redis_ca_cert
+                .as_ref()
+                .map(std::fs::read)
+                .transpose()?;
+            let redis_store = if let Some(redis_ca) = redis_ca {
+                runtime.block_on(meta_redis::RedisMetaStore::new_with_tls_ca(
+                    redis_url,
+                    &args.redis_prefix,
+                    Some(redis_ca),
+                ))
+            } else {
+                runtime.block_on(meta_redis::RedisMetaStore::new(
+                    redis_url,
+                    &args.redis_prefix,
+                ))
+            };
+            Arc::new(redis_store.map_err(|e| io::Error::other(e.to_string()))?)
         } else {
             let meta_path = args.data_dir.join("meta.json");
             Arc::new(
@@ -374,11 +395,20 @@ fn event_loop(
     object_store: &Arc<dyn ObjectStore>,
     gc_worker: &mut GcWorker,
 ) -> io::Result<()> {
-    let mut pfd = libc::pollfd {
-        fd: dev.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let notification_fd = store.coherence_notification_fd();
+    let mut pfds = [
+        libc::pollfd {
+            fd: dev.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: notification_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let poll_count = if notification_fd.is_some() { 2 } else { 1 };
 
     let mut retry_delay = GC_RETRY_BASE;
     let mut retry_at = Instant::now() + retry_delay;
@@ -392,7 +422,9 @@ fn event_loop(
     });
 
     loop {
-        pfd.revents = 0;
+        for pfd in &mut pfds[..poll_count] {
+            pfd.revents = 0;
+        }
 
         let now = Instant::now();
         let wake_at = coherence_at.map_or(retry_at, |deadline| retry_at.min(deadline));
@@ -401,13 +433,13 @@ fn event_loop(
             .as_millis()
             .min(i32::MAX as u128) as i32;
 
-        // SAFETY: `&mut pfd` points at a single valid `libc::pollfd`
-        // on the stack, matching the `nfds = 1` argument. The bounded
+        // SAFETY: `pfds` contains `poll_count` initialized pollfd values.
+        // The bounded
         // timeout lets the same thread service durable GC retries while
         // idle. `poll()` itself performs no memory access beyond reading/writing
-        // through this one pointer, which is safe C-ABI FFI as long
+        // through this array pointer, which is safe C-ABI FFI as long
         // as the pointer and count agree, which they do here.
-        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), poll_count as libc::nfds_t, timeout) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -420,14 +452,20 @@ fn event_loop(
             return Err(err);
         }
 
-        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        if pfds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
             return Err(io::Error::other(format!(
                 "kestrelfs-daemon: /dev/kestrel_ctl fd reported POLLERR/POLLNVAL (revents=0x{:x})",
-                pfd.revents
+                pfds[0].revents
+            )));
+        }
+        if poll_count == 2 && pfds[1].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other(format!(
+                "kestrelfs-daemon: Redis notification fd reported POLLERR/POLLNVAL (revents=0x{:x})",
+                pfds[1].revents
             )));
         }
 
-        if pfd.revents & libc::POLLIN != 0 {
+        if pfds[0].revents & libc::POLLIN != 0 {
             drain_and_respond(dev, runtime, store, object_store);
             // New mutations attempt GC inline. If that attempt failed, retry
             // promptly rather than inheriting an older long backoff. Taking
@@ -435,6 +473,17 @@ fn event_loop(
             // starving retry under a continuous request stream.
             retry_delay = GC_RETRY_BASE;
             retry_at = retry_at.min(Instant::now() + retry_delay);
+        }
+
+        if poll_count == 2
+            && pfds[1].revents & libc::POLLIN != 0
+            && store.drain_coherence_notifications()?
+        {
+            println!(
+                "kestrelfs-daemon: Redis coherence notification received; reconciling durable revision"
+            );
+            reconcile_coherence(dev, runtime, store, &mut coherence_revision)?;
+            coherence_at = coherence_revision.map(|_| Instant::now() + COHERENCE_POLL_INTERVAL);
         }
 
         while let Some(completion) = gc_worker.try_recv() {
@@ -464,50 +513,54 @@ fn event_loop(
         }
 
         if coherence_at.is_some_and(|deadline| Instant::now() >= deadline) {
-            match runtime.block_on(store.coherence_probe(coherence_revision)) {
-                Ok(probe) => {
-                    let previous = coherence_revision;
-                    match coherence_invalidation(Some(&probe)) {
-                        CoherenceInvalidation::None => {}
-                        CoherenceInvalidation::Inodes(inode_ids) => {
-                            dev.invalidate_cache_inodes(&inode_ids)?;
-                            println!(
-                                "kestrelfs-daemon: coherence revision {} -> {}; invalidated {} dirty inode caches",
-                                previous.unwrap_or_default(),
-                                probe.revision().expect("inode probe has revision"),
-                                inode_ids.len()
-                            );
-                        }
-                        CoherenceInvalidation::All => {
-                            dev.invalidate_cache_all()?;
-                            println!(
-                                "kestrelfs-daemon: coherence revision {} -> {}; dirty history unavailable/overflowed, full local cache invalidated",
-                                previous.unwrap_or_default(),
-                                probe.revision().expect("full probe has revision")
-                            );
-                        }
-                    }
-                    coherence_revision = probe.revision();
-                }
-                Err(error) => {
-                    // Metadata state is unknown, so retaining hits would be
-                    // unsafe. A durable full invalidation is the fail-closed
-                    // response; keep the old revision and retry the probe.
-                    eprintln!(
-                        "kestrelfs-daemon: coherence probe failed ({error}); invalidating local cache"
-                    );
-                    dev.invalidate_cache_all()?;
-                }
-            }
+            reconcile_coherence(dev, runtime, store, &mut coherence_revision)?;
             coherence_at = coherence_revision.map(|_| Instant::now() + COHERENCE_POLL_INTERVAL);
         }
+    }
+}
 
-        if pfd.revents & libc::POLLIN == 0 && ret > 0 {
-            // Spurious wakeup (or POLLHUP with nothing readable);
-            // nothing to drain, go back to sleep.
-            continue;
+fn reconcile_coherence(
+    dev: &KestrelDevice,
+    runtime: &tokio::runtime::Runtime,
+    store: &Arc<dyn MetaStore>,
+    coherence_revision: &mut Option<u64>,
+) -> io::Result<()> {
+    match runtime.block_on(store.coherence_probe(*coherence_revision)) {
+        Ok(probe) => {
+            let previous = *coherence_revision;
+            match coherence_invalidation(Some(&probe)) {
+                CoherenceInvalidation::None => {}
+                CoherenceInvalidation::Inodes(inode_ids) => {
+                    dev.invalidate_cache_inodes(&inode_ids)?;
+                    println!(
+                        "kestrelfs-daemon: coherence revision {} -> {}; invalidated {} dirty inode caches",
+                        previous.unwrap_or_default(),
+                        probe.revision().expect("inode probe has revision"),
+                        inode_ids.len()
+                    );
+                }
+                CoherenceInvalidation::All => {
+                    dev.invalidate_cache_all()?;
+                    println!(
+                        "kestrelfs-daemon: coherence revision {} -> {}; dirty history unavailable/overflowed, full local cache invalidated",
+                        previous.unwrap_or_default(),
+                        probe.revision().expect("full probe has revision")
+                    );
+                }
+            }
+            *coherence_revision = probe.revision();
+        }
+        Err(error) => {
+            // Metadata state is unknown, so retaining hits would be unsafe. A
+            // full invalidation is fail-closed; keep the old revision and let
+            // notification reconnect or the bounded poll retry the probe.
+            eprintln!(
+                "kestrelfs-daemon: coherence probe failed ({error}); invalidating local cache"
+            );
+            dev.invalidate_cache_all()?;
         }
     }
+    Ok(())
 }
 
 /// Drains every currently-pending REQ event and pushes back one
@@ -2317,6 +2370,7 @@ mod tests {
             Some("redis://127.0.0.1:6379/0")
         );
         assert_eq!(distributed_args.redis_prefix, "test-fs");
+        assert!(distributed_args.redis_ca_cert.is_none());
         assert_eq!(
             distributed_args.objects.as_deref(),
             Some("s3://test-bucket/test-prefix")
@@ -2346,6 +2400,25 @@ mod tests {
             "http://127.0.0.1:9000",
         ])
         .is_err());
+        assert!(Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--redis-ca-cert",
+            "/tmp/test-ca.pem",
+        ])
+        .is_err());
+
+        let tls_args = Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--meta",
+            "rediss://redis.example.test:6379/0",
+            "--redis-ca-cert",
+            "/etc/kestrelfs/redis-ca.pem",
+        ])
+        .unwrap();
+        assert_eq!(
+            tls_args.redis_ca_cert.as_deref(),
+            Some(std::path::Path::new("/etc/kestrelfs/redis-ca.pem"))
+        );
     }
 
     /// Builds a raw `OP_LOOKUP` request event, encoding `(parent_inode,

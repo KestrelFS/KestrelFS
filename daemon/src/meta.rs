@@ -37,6 +37,7 @@
 //! by this module's own unit tests (`cargo test`).
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -415,6 +416,19 @@ pub trait MetaStore: Send + Sync {
     /// that its inode list covers every intervening mutation.
     async fn coherence_probe(&self, _observed_revision: Option<u64>) -> Result<CoherenceProbe> {
         Ok(CoherenceProbe::Disabled)
+    }
+
+    /// Optional edge-trigger-like wakeup for a shared backend. The wakeup is
+    /// only a latency hint: callers must still reconcile the durable revision
+    /// and retain periodic polling because notifications may be lost.
+    fn coherence_notification_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    /// Drains pending backend notification wakeups. Returns true when at least
+    /// one notification (or subscriber reconnect) requested reconciliation.
+    fn drain_coherence_notifications(&self) -> std::io::Result<bool> {
+        Ok(false)
     }
 }
 

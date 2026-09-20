@@ -61,9 +61,10 @@ mount -t kestrelfs none /mnt/kestrelfs
 | 参数 | 默认值 | 含义与约束 |
 |---|---:|---|
 | `--data-dir <PATH>` | `./.kestrelfs-data` | FileMetaStore 的 `meta.json` 与 LocalFsObjectStore 根目录；目录不存在时创建。|
-| `--memory` | 关闭 | MetaStore 与 ObjectStore 均置于内存，进程退出即丢失；与 `--meta`、`--redis-prefix`、`--objects`、`--s3-endpoint` 冲突。|
-| `--meta <REDIS_URL>` | 未设置 | 使用 RedisMetaStore；未设置则使用 `{data-dir}/meta.json`。URL 可含凭据，daemon 不打印它。|
+| `--memory` | 关闭 | MetaStore 与 ObjectStore 均置于内存，进程退出即丢失；与 `--meta`、`--redis-prefix`、`--redis-ca-cert`、`--objects`、`--s3-endpoint` 冲突。|
+| `--meta <REDIS_URL>` | 未设置 | 使用 RedisMetaStore；接受明文 `redis://` 或 TLS `rediss://`，未设置则使用 `{data-dir}/meta.json`。URL 可含凭据，daemon 不打印它。|
 | `--redis-prefix <PREFIX>` | `kestrelfs` | Redis v2 key namespace；要求同时给出 `--meta`。|
+| `--redis-ca-cert <PEM_PATH>` | 未设置 | 为 `rediss://` 增加私有/自签 CA trust anchor；要求同时给出 `--meta`，对 `redis://` 使用会 fail closed。未设置时 `rediss://` 使用系统 trust store。|
 | `--objects <S3_URL>` | 未设置 | 使用 `s3://bucket/optional/prefix` 的 S3ObjectStore；未设置则使用 `data-dir` 下的 LocalFsObjectStore。|
 | `--s3-endpoint <URL>` | 未设置 | MinIO 等 S3-compatible endpoint，要求同时给出 `--objects`；优先于环境变量 `S3_ENDPOINT`，自定义 endpoint 使用 path-style。|
 
@@ -80,10 +81,19 @@ File/Redis metadata 可分别与 LocalFs/S3 objects 组合；但多节点共享�
 | `AWS_SESSION_TOKEN` | 可选临时凭据 token |
 | `AWS_REGION` | AWS SDK region |
 | `S3_BUCKET` / `S3_PREFIX` / `S3_CREATE_BUCKET=1` | 仅用于门控 S3 集成测试；不是 daemon 运行配置 |
-| `REDIS_URL` | 仅用于门控 Redis 集成测试；daemon 运行时须用 `--meta` |
+| `REDIS_URL` | 仅用于门控 Redis 明文、通知与重连集成测试；daemon 运行时须用 `--meta` |
+| `REDIS_TLS_URL` / `REDIS_TLS_CA_CERT` | 仅用于自签 CA TLS 门控测试；daemon 对应参数为 `--meta` / `--redis-ca-cert` |
 
 不要把凭据写进日志、`cache_namespace` descriptor 或提交到仓库。生产环境还应避免
 把 secret 直接留在可被其他用户读取的 shell history/process listing 中。
+
+Redis 命令路径使用自动重连 connection manager。连接中断时，当次无法确认结果的
+请求可能返回 `EIO`；Redis 恢复后，后续请求会在无需重启 daemon 的情况下重建连接。
+这不把不确定 mutation 自动重放成“恰好一次”，调用方仍应按操作语义处理错误。
+Pub/Sub 订阅也会以 50 ms 起、最多 1 s 的退避重连；重订阅成功会立即请求一次 durable
+revision 对账。通知只缩短可见性延迟，约 100 ms revision poll 始终保留，所以丢失、
+重复、乱序通知不会绕过 dirty-inode/full fail-closed 规则。当前没有 lease、fencing、
+跨节点锁或线性一致性保证。
 
 ## 安全与恢复边界
 

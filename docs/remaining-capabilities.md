@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-20，Cursor（Step 52 DIST-IO + TEST-PERF 已验收；发布 Step 53 双包）
+> 最后更新：2026-09-21，Cursor（Step 53 已验收；发布 Step 54 **过夜大包 ≈ 4× 既往双包**）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -11,11 +11,12 @@
 > - 本文：未完成能力、优先级、决策记录、**§8 当前 Codex 提示词**、**§9 实现汇报日志**。
 > - 不另开指挥文档；人类只需让 Codex「读 `docs/remaining-capabilities.md` §8 并执行」。
 >
-> **体量约定（2026-09-20）**：自 Step 50 起，每个 §8 提示词按约 **2× 既往单步** 打包。
+> **体量约定**：自 Step 50 起常规双包 ≈ 2× 既往单步；**Step 54 为过夜大包 ≈ 4× 既往双包
+> （约 8× 单步）**，允许一次落地多条独立能力，仍要求完整自检与 §9 汇报。
 
 ## 1. 当前基线
 
-- Phase 4 至 Step 52（含 DIST-IO 两节点闭环与 vng 粗测基线）均已验收。
+- Phase 4 至 Step 53（含 Pub/Sub 失效提示、Redis 重连、`rediss://` 私有 CA）均已验收。
 - 已验收 IPC ABI **v22**，cache format **v4**。
 - cache/mount 测试只允许在 vng guest + loop；禁止触碰宿主机 zvol。
 - 配置权威表：`docs/configuration.md`；粗测方法：`docs/perf-baseline.md`。
@@ -26,166 +27,174 @@
 
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
-| 0–28 | … + DIST-IO/TEST-PERF | Step 24–52 | **ACCEPTED** | 多节点最小闭环 + 粗测基线已落地 |
-| 29 | DIST-NOTIFY + REDIS-HARDEN | Step 53（双包） | **DECIDED** | 收窄 probe 窗口 + Redis 连接原型硬化 |
-| — | 其它增强 | — | PROPOSED | 视需要并入双包（完整 lease、io_uring、splice、orphan sweep） |
+| 0–29 | … + DIST-NOTIFY/REDIS-HARDEN | Step 24–53 | **ACCEPTED** | 推送失效 + Redis 硬化已落地 |
+| 30 | OVERNIGHT MEGA | Step 54（大包） | **DECIDED** | 过夜一次推进 lease 雏形、orphan 清扫、splice、写路径流水线 |
+| — | 其它 | — | PROPOSED | 视 Step 54 验收后拆分 |
 
 Codex **只实现 §8 当前提示词**。
 
 ## 3. Phase 4 缓存能力
 
-读缓存、异步 hit、write-behind、可写 MAP_SHARED、DIST-IO 闭环已 ACCEPTED。
+读缓存、异步 hit、write-behind、可写 MAP_SHARED、DIST-IO、DIST-NOTIFY 已 ACCEPTED。
 
-## 4. 内核 / 分布式
-
-### Step 52 — DIST-IO + TEST-PERF（双包）
-
-- 状态：`ACCEPTED`（Cursor，2026-09-20）
-- 实现：两并行 vng guest + 共享 Redis/S3；`docs/perf-baseline.md`。
+## 4. 分布式 / 内核 / 运维
 
 ### Step 53 — DIST-NOTIFY + REDIS-HARDEN（双包）
 
-- 状态：DIST-NOTIFY `DECIDED`；REDIS-HARDEN `DECIDED`
-- 目标 A（DIST-NOTIFY）：在既有 dirty-inode / revision 模型上，为远端失效增加
-  **推送通知**（Redis Pub/Sub 或等价轻量通道），使可见性不再只依赖约 100 ms
-  poll；poll 仍作兜底；失败 fail closed；**不是**完整 lease/分布式锁。
-- 目标 B（REDIS-HARDEN）：Redis 连接自动重连（或 connection manager）；可选
-  `rediss://` TLS；同步 `docs/configuration.md`；不破坏现有 `redis://` 配方。
-- 范围：见 §8。
+- 状态：`ACCEPTED`（Cursor，2026-09-21）
+- 实现：Pub/Sub revision 提示 + poll 对账；ConnectionManager；`rediss://` + `--redis-ca-cert`。
+
+### Step 54 — OVERNIGHT MEGA（大包 ≈ 4× 双包）
+
+- 状态：四项均为 `DECIDED`（见 §8）
+- A DIST-LEASE-MIN：最小会话心跳 / fencing 雏形（**不是**完整分布式锁）
+- B ORPHAN-SWEEP：泄漏 orphan 的安全自动清扫
+- C VFS-SPLICE：普通文件 splice/sendfile 可行路径
+- D ASYNC-WRITE-PIPE：WRITE_DATA / bounce 路径去阻塞化或跨 folio 流水线最小落地
+- 范围与验收：严格见 §8；可按 A→B→C→D 顺序实现，但 **四项都要做完** 才标 REVIEW。
 
 ## 5. 运维、测试与文档
 
-配置权威表与 perf 基线已落地；本步硬化 Redis 运维面并写入配置表。
+配置表与 perf 基线已落地；本步新增项必须同步 `docs/configuration.md` 与 HANDOFF 已知限制。
 
 ## 6. Cursor ↔ Codex 决策记录
 
 | 日期 | 记录者 | ID | 决策/问题 | 结论或待办 |
 |---|---|---|---|---|
-| 2026-09-20 | Cursor | MAP-SHARED-WRITE + WHITEOUT | Step 50 验收 | **ACCEPTED** |
-| 2026-09-20 | Cursor | WRITE-BEHIND + OPS/DOC | 选定 Step 51 | **DECIDED** |
-| 2026-09-20 | Codex | WRITE-BEHIND + OPS/DOC | 实现与自检 | **REVIEW** |
-| 2026-09-20 | Cursor | WRITE-BEHIND + OPS/DOC | Step 51 验收 | **ACCEPTED**；200 tests + Cursor vng PASS |
-| 2026-09-20 | Cursor | DIST-IO + TEST-PERF | 选定 Step 52 | **DECIDED**；见 §8 |
-| 2026-09-20 | Codex | DIST-IO + TEST-PERF | Step 52 双包开工 | **IMPLEMENTING**；两并行 vng guest + 共享 Redis/S3，另建可重复 vng 粗测基线 |
-| 2026-09-20 | Codex | DIST-IO + TEST-PERF | 实现与自检完成 | **REVIEW**；双 guest Redis+S3 闭环、vng perf 基线及 Step 51 回归通过，见 §9 |
-| 2026-09-20 | Cursor | DIST-IO + TEST-PERF | Step 52 验收 | **ACCEPTED**；200 tests + Cursor `STEP52_DIST_TWO_NODE_PASS` / `STEP52_PERF_PASS` |
-| 2026-09-20 | Cursor | DIST-NOTIFY + REDIS-HARDEN | 选定 Step 53 | **DECIDED**；见 §8 |
+| 2026-09-20 | Cursor | DIST-IO + TEST-PERF | Step 52 验收 | **ACCEPTED** |
+| 2026-09-20 | Cursor | DIST-NOTIFY + REDIS-HARDEN | 选定 Step 53 | **DECIDED** |
+| 2026-09-20 | Codex | DIST-NOTIFY + REDIS-HARDEN | Step 53 开工 | **IMPLEMENTING** |
+| 2026-09-21 | Codex | DIST-NOTIFY + REDIS-HARDEN | 实现与自检完成 | **REVIEW**；见 §9 |
+| 2026-09-21 | Cursor | DIST-NOTIFY + REDIS-HARDEN | Step 53 验收 | **ACCEPTED**；202 tests + Cursor TLS/DIST-NOTIFY PASS |
+| 2026-09-21 | Cursor | OVERNIGHT MEGA | 选定 Step 54 过夜大包 | **DECIDED**；≈ 4× 双包；见 §8 |
 
 ## 7. 不应顺手扩大
 
 - 不自动 wipe；不触碰宿主机 zvol；不擅自 commit/push。
-- Step 53 不顺手做完整 inode/range lease 协议、跨机分布式锁、io_uring 用户态导出、
-  splice 全覆盖、orphan 自动全局 sweep，或宣称线性一致。
+- Step 54 **不要**宣称线性一致、完整 range lease、跨机强制锁、Redis Cluster/Sentinel、
+  生产级 io_uring 导出或安全擦除。宁可缩小某子项实现面，也不要编造语义。
 
-## 8. 当前 Codex 提示词（Step 53，双包 ≈ 2×）
+## 8. 当前 Codex 提示词（Step 54，过夜大包 ≈ 4× 既往双包）
 
 > **人类操作**：对 Codex 说「读 `HANDOFF.md` 与 `docs/remaining-capabilities.md`，只执行 §8」。
+> 本步 intentionally 很大：按 A→B→C→D 推进；全部完成后再标 REVIEW。若某子项阻塞，
+> 在 §9 写清阻塞原因与已完成子项，仍尽量交付可测增量，但默认目标是四项齐全。
 
 ```text
 你是 KestrelFS 实现 agent。路径：/home/roots/work/code/KestrelFS。
-先读 HANDOFF.md、docs/remaining-capabilities.md（§2/§6/§8）、docs/configuration.md、
-docs/phase4-nvme-cache.md、docs/perf-baseline.md。HEAD 应含 Step 52（DIST-IO + TEST-PERF）。
-注意：§8 为双包。
+先读 HANDOFF.md、docs/remaining-capabilities.md（§2/§6/§7/§8）、docs/configuration.md、
+docs/phase4-nvme-cache.md、docs/perf-baseline.md。HEAD 应含 Step 53（Pub/Sub + Redis harden）。
+注意：§8 为过夜大包（约 4× 既往双包）。不要 commit/push。README 保持中文。
 
-开工时：两项均 → IMPLEMENTING，§6 追加一行。
+开工：四项均 → IMPLEMENTING，§6 追加一行。
 
 ## 测试铁律
-- 涉及内核/mount 的验证只在 vng guest + loop；禁止触碰宿主机 zvol
+- 内核/mount 验证只在 vng guest + loop；禁止宿主机 zvol / 物理机 insmod
 - daemon：独立 data_dir + >"$data_dir/daemon.log"；禁止 >/dev/null
-- 一旦改 kestrelfs/*.c 或依赖 mount：必须 vng
-- Redis 门控测本步需要；默认 cargo test 仍可不依赖外部服务
-- Dist 场景继续用两并行 vng guest + 共享 Redis（S3 可沿用 Step 52 配方，若本步不改对象面可不强制）
+- 改 kestrelfs/*.c 或依赖 mount：必须 vng
+- Redis/S3 门控按需；默认 cargo test 可不依赖外部服务
+- Dist 场景继续两并行 vng + 共享 Redis（对象面沿用 Step 52/53 配方）
 
-## 目标：Step 53 — DIST-NOTIFY + REDIS-HARDEN（双包）
+## 目标：Step 54 — OVERNIGHT MEGA（四项）
 
-### A) DIST-NOTIFY（推送失效，收窄 probe 窗口）
-在既有 durable revision + dirty-inode 日志之上：
-1. mutation 提交成功后，向 Redis 发布轻量通知（Pub/Sub 或文档化的等价通道），
-   携带足够信息让对端推进失效（至少 revision，最好含 dirty inode 集合摘要）
-2. 订阅端收到通知后尽快执行与 poll 路径同等语义的失效（page-cache epoch /
-   NVMe inode 退休 / 全量 fail-closed 回退规则不变）
-3. 保留原有 ~100 ms poll 作兜底与对账；通知丢失/乱序不得比今天更不安全
-4. vng：相对 Step 52，在同等负载下证明通知路径可将可见延迟压到明显低于一个
-   完整 poll 周期（记录 STEP53_DIST_NOTIFY_*_PASS 与 latency 样本）；不宣称 lease
-5. 失败 fail closed；不要实现完整 lease、fencing token、或跨机分布式字节锁
+### A) DIST-LEASE-MIN（最小会话 / fencing 雏形）
+在 Step 42/53 的 revision + Pub/Sub 之上增加**最小**多 daemon 会话语义：
+1. 每个 Redis MetaStore daemon 注册带 TTL 的 session（心跳续约）；key/布局写入
+   docs/configuration.md 与 §9
+2. 写路径：mutation 提交时绑定/检查 session；过期或冲突时 fail closed（返回明确错误），
+   不静默写成功
+3. 读/失效：对端可观察 session 丢失并触发保守失效或拒绝过期 writer 的后续写
+4. vng：两节点场景证明 (i) 正常心跳下 Step 53 通知/可见性仍成立
+   (ii) 强杀/停心跳后对端或本地能在有界时间内进入安全状态（记录 STEP54_LEASE_*_PASS）
+5. **明确不是**：跨机字节锁、range lease、线性一致、fencing token 全协议。名称可用
+   lease/session，但文档必须写清边界
 
-### B) REDIS-HARDEN（连接原型硬化）
-1. 为 Redis MetaStore 增加断线自动重连（connection manager 或等价），短暂故障后
-   请求可恢复，而不是永久卡在坏连接上必须重启 daemon
-2. 支持可选 `rediss://` TLS（至少能在测试中用自签/测试证书跑通一条路径）；
-   现有 `redis://` 配方必须继续可用
-3. 更新 `docs/configuration.md`：URL 形态、TLS 相关参数/环境变量、重连语义与限制
-4. 门控测 + 单元/集成测覆盖：重连后 mutation/coherence 仍正确；TLS 路径至少一条
-5. 启动日志仍不得打印含凭据的完整 URL
+### B) ORPHAN-SWEEP（泄漏 orphan 安全清扫）
+针对 HANDOFF 已知限制（final-close IPC 失败可安全泄漏 nlink=0 orphan）：
+1. daemon 启动与/或周期任务扫描可证明「无 open 引用」的 orphan，幂等进入既有 GC
+2. 绝不可在「可能仍有活 fd」时删除；证据不足则跳过并打日志
+3. 覆盖 Mem/File/Redis 至少一条真实路径；Redis 路径优先
+4. vng 或集成测：制造泄漏 orphan → sweep → 对象/元数据回收；负例：仍 open 时不删
+   （STEP54_ORPHAN_SWEEP_*_PASS）
+5. 不引入自动 wipe cache；不改 v4 盘格式除非绝对必要（若必要须 bump 并论证）
+
+### C) VFS-SPLICE（splice/sendfile 可行路径）
+1. 为普通文件补齐可行的 splice/sendfile（或明确文档化仍不支持的子集 + 实现最大子集）
+2. 优先：从 KestrelFS 文件 splice 到 pipe / 从 pipe splice 进来；与 page-cache /
+   write-behind / cache hit 语义兼容，失败时正确回退或返回 errno
+3. vng：STEP54_SPLICE_*_PASS，含数据校验；不要求打满所有零拷贝边角
+4. 若内核版本/树外限制导致只能部分实现：实现可读路径 + 写清限制，但必须有自动化测
+
+### D) ASYNC-WRITE-PIPE（写回路径去阻塞 / 流水线）
+针对 bounce 锁下同步 WRITE_DATA 等已知限制，做**最小**改进（择优，可组合）：
+1. 缩短 bounce mutex 持有区间，或允许不同 folio/inode 的 WRITE_DATA 重叠提交
+2. 保持 fsync/MS_SYNC/syncfs/coherence-before-invalidate 的耐久与 fail-closed 语义
+3. 可观测：至少一项计数/日志证明并发或缩短临界区（类似 cache_async_hit_peak）
+4. vng：STEP54_WRITE_PIPE_*_PASS；回归 Step 51 write-behind 与 Step 50 MAP_SHARED
+5. 不要引入新的用户态异步 API；不要宣称生产级 io_uring
 
 ## 要求
-1. `make -C kestrelfs` 零警告；cargo test 不回归
-2. STEP53_*_PASS 覆盖 A+B；Step 52 DIST/PERF 与 Step 51 write-behind 回归不破
-3. ABI 无布局变化可保持 v22；有变化须 bump
-4. 更新 HANDOFF（待验收）、README（中文）、本文 → REVIEW + §9
+1. make -C kestrelfs 零警告；cargo test + clippy -D warnings 不回归
+2. STEP54_*_PASS 覆盖 A+B+C+D；并回归 Step 53 DIST-NOTIFY、Step 52 PERF、Step 51 write-behind
+3. ABI 有布局/opcode 变化必须 bump；无变化保持 v22；format 同理
+4. 更新 HANDOFF（待验收）、README（中文）、configuration.md、本文 → REVIEW + §9
 5. 不要擅自 commit/push
 
 ## 明确不做
-完整 lease/fencing、跨机强制锁、io_uring 用户态导出、splice 全覆盖、orphan 全局
-sweep、自动 wipe、宣称线性一致或多 AZ 生产可用性。
+完整分布式锁、range lease 生产协议、Redis Cluster/Sentinel、自动 wipe、安全擦除、
+宣称线性一致、完整用户态 io_uring 导出、任意 mknod 全集（除非 C 子项论证需要极小子集）。
 
 ## 验收自检
 - cargo test + clippy -D warnings
-- make -C kestrelfs 零警告 + Step 53 vng（含通知延迟样本）
-- Redis/TLS 门控测（环境允许时）
-- 汇报写入本文 §9
+- make -C kestrelfs 零警告
+- A/B/C/D 各自 STEP54_*_PASS + 关键回归
+- §9 分小节写清方案、测例、数字、风险与未做项
 ```
 
 ## 9. 实现汇报日志
 
-### 2026-09-20 — Step 52 DIST-IO + TEST-PERF（Cursor ACCEPTED）
+### 2026-09-21 — Step 53 DIST-NOTIFY + REDIS-HARDEN（Cursor ACCEPTED）
 
-- 两并行 vng guest + 共享 Redis/S3 数据面闭环；`docs/perf-baseline.md`。
-- 验证：200 tests；clippy / make 干净；Cursor 复跑
-  `STEP52_PERF_PASS`（write-behind ~1324 MiB/s；page-cache ~2153 MiB/s；
-  NVMe/loop hit ~178 MiB/s / async bios=256；umount_ms=23）与
-  `STEP52_DIST_TWO_NODE_PASS`（visibility latency 35 ms；Redis/MinIO via
-  `10.0.2.2`）。
+- Pub/Sub revision 提示唤醒 + 原 `coherence_probe()`；100 ms poll 保留；
+  ConnectionManager 重连；`rediss://` + `--redis-ca-cert`。
+- 验证：202 tests；clippy / make 干净；
+  `redis_url_gated_notification_and_reconnect` PASS；`STEP53_REDIS_TLS_PASS`；
+  `STEP53_DIST_NOTIFY_TWO_NODE_PASS`（latency 11 ms，wake 计数增长）。
 - Commit：随 Cursor 本轮验收推送。
 
-### 2026-09-20 — Step 52 DIST-IO + TEST-PERF（Codex REVIEW）
+### 2026-09-21 — Step 53 DIST-NOTIFY + REDIS-HARDEN（Codex REVIEW）
 
-- 方案选择：采用两个并行 vng guest，而不是同 guest 双 mount。每个节点有独立
-  daemon、挂载、data-dir、page cache 和 loop cache，共享随机 Redis prefix 与 S3
-  prefix，因而真实覆盖跨 daemon revision/coherence；宿主编排器不执行 insmod/mount。
-- DIST-IO：A 写版本 1，B 先缓存旧版本；A 覆写版本 2 并 fsync 后，B 的 durable
-  dirty-inode probe 推进 page-cache epoch 并退休 1 个 NVMe entry。B 观察版本 2 后
-  保留 fd、drop_caches、停止 daemon，仍从新 cache entry 读回版本 2。本轮可见延迟
-  10 ms（轮询相位样本）；契约仍是约 100 ms 最终一致窗口，不是 lease/线性一致。
-- TEST-PERF：新增 `test-step52-perf-vng.sh`/C helper 与 `docs/perf-baseline.md`。本轮
-  vng 6.12.38 + 64 MiB loop 的 1 MiB 样本：write-behind 1.53 ms / 653.58 MiB/s，
-  fsync 116.41 ms；page-cache 64 MiB 2104.47 MiB/s；daemon-free NVMe/loop hit
-  6.30 ms / 158.62 MiB/s、256 async BIO。均为含校验的粗测，不是 SLA。
-- ABI/format：无布局或 opcode 变化，IPC ABI **v22**、cache format **v4** 不变。
-- 验证：`cargo test` 200 passed；clippy `-D warnings` 通过；`make -C kestrelfs`
-  零警告；真实 Redis 与 MinIO 门控测试各 1 passed；vng 输出
-  `STEP52_DIST_TWO_NODE_PASS`、`STEP52_PERF_PASS`；Step 51 回归输出
-  `STEP51_WRITE_BEHIND_PASS`（umount 15 ms）。Step 42 fail-closed 回归在二次读前
-  drop page cache 以适配 Step 45 后的 VFS 热读路径，输出
-  `STEP42_FAILURE_FALLBACK_ALL_PASS` / `STEP42_COHERENCE_FINE_PASS`。
-  所有模块、loop、mount 均只在 guest。
-- 风险/未做：probe 前仍可能短暂旧读；Redis/S3 无跨后端事务，服务故障沿既有路径
-  fail closed；未实现 lease/pubsub、分布式锁、io_uring、自动 wipe 或生产 benchmark。
+- 方案与安全边界：保留 Step 42 durable revision + dirty-inode log 为唯一正确性来源，
+  Redis Lua mutation 在 durable 状态提交后同事务 `PUBLISH` revision。订阅任务只用
+  eventfd 唤醒同步 IPC poll 线程；线程收到提示仍执行原 `coherence_probe()`，沿用
+  inode-list / full fail-closed 失效。100 ms poll 不变，订阅首次建立或重连也主动
+  对账，因此丢失、重复、乱序只影响延迟，不会把不确定状态当 cache hit。
+- Redis 硬化：命令路径改为 `ConnectionManager` 自动重连；Pub/Sub 以 50 ms 起、
+  最高 1 s 退避重订阅。支持 `redis://` 与 `rediss://`，新增
+  `--redis-ca-cert <PEM_PATH>` 信任私有/自签 CA；完整 URL 从不写启动日志。故障当次
+  请求可能 EIO，服务恢复后的后续请求无需 daemon 重启；不自动重放不确定 mutation。
+- 测试：`cargo test` **202 passed**；真实 Redis gate 杀掉 command connection 后，
+  读请求自动恢复、后续 mutation/coherence/通知正确；自签 CA 经用户态 TLS 代理输出
+  `STEP53_REDIS_TLS_PASS`。双独立 vng guest + loop + 共享 Redis/S3 输出
+  `STEP53_DIST_NOTIFY_WAKE_PASS`、`STEP53_DIST_NOTIFY_DAEMON_FREE_HIT_PASS`、
+  `STEP53_DIST_NOTIFY_TWO_NODE_PASS`，本轮可见延迟 **11 ms**（低于 100 ms poll，且
+  mutation 后订阅唤醒计数增加）。
+  Step 52 perf 回归输出 `STEP52_PERF_PASS`（page-cache 2128.54 MiB/s、daemon-free
+  loop hit 169.52 MiB/s、256 async BIO、umount 19 ms）；Step 51 输出
+  `STEP51_WRITE_BEHIND_PASS`（async write 0 ms、umount 10 ms）。所有 insmod、loop、
+  mount 均只在 vng guest，未触碰宿主机模块/zvol/挂载；clippy `-D warnings` 与
+  `make -C kestrelfs` 零警告通过。
+- ABI/format：无共享内存、opcode、ioctl 或盘布局变化，IPC ABI **v22**、cache format
+  **v4** 不变。
+- 风险与未做：Pub/Sub 不提供 lease/线性一致；daemon 离线或订阅中断仍可能有最多
+  poll/重连窗口；没有 fencing、跨节点锁、range 消息、Redis Cluster/Sentinel、
+  不确定 mutation 幂等重放、io_uring/splice、orphan sweep 或自动 wipe。
+
+### 2026-09-20 — Step 52 DIST-IO + TEST-PERF（Cursor ACCEPTED）
+
+- 两并行 vng guest + 共享 Redis/S3；`docs/perf-baseline.md`。
+- 验证：200 tests；Cursor `STEP52_PERF_PASS` / `STEP52_DIST_TWO_NODE_PASS`。
 
 ### 2026-09-20 — Step 51 WRITE-BEHIND + OPS/DOC（Cursor ACCEPTED）
 
-- 普通 write 可先返回；BDI/显式同步推进 writepages；coherence worker 先写回再退休；
-  `docs/configuration.md` 权威配置表。
-- 验证：200 tests；clippy / make 干净；Cursor 复跑 vng
-  `STEP51_WRITE_BEHIND_PASS`（umount_ms=11；async write latency 0 ms）。
-- Commit：随 Cursor 本轮验收推送。
-
-### 2026-09-20 — Step 51 WRITE-BEHIND + OPS/DOC（Codex REVIEW）
-
-- 去掉 write_iter 强制写回；durability 点仍同步；配置文档落地。
-- 自检：200 tests；vng STEP51_*_PASS（Codex umount 14 ms）及多步回归。
-- 未做：lease、io_uring、DIST-IO、跨 folio 异步 WRITE_DATA。
-
-### 2026-09-20 — Step 50 MAP-SHARED-WRITE + WHITEOUT（Cursor ACCEPTED）
-
-- ABI v22；Cursor vng `STEP50_DOUBLE_PACK_PASS`（umount_ms=11）。
+- write-behind + `docs/configuration.md`；Cursor `STEP51_WRITE_BEHIND_PASS`。
