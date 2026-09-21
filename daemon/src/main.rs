@@ -80,6 +80,7 @@ use std::time::{Duration, Instant};
 const GC_RETRY_BASE: Duration = Duration::from_secs(1);
 const GC_RETRY_MAX: Duration = Duration::from_secs(60);
 const COHERENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 static GC_PASSES: AtomicU64 = AtomicU64::new(0);
 static GC_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static GC_DELETED: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +164,17 @@ struct Args {
         conflicts_with = "memory"
     )]
     redis_ca_cert: Option<PathBuf>,
+
+    /// Redis writer-session TTL in milliseconds. Mutations fail closed after
+    /// expiry; heartbeat runs at one third of this interval.
+    #[arg(
+        long,
+        default_value_t = 3000,
+        value_parser = clap::value_parser!(u64).range(300..),
+        requires = "meta",
+        conflicts_with = "memory"
+    )]
+    redis_session_ttl_ms: u64,
 
     /// S3 object location, for example s3://bucket/optional/prefix.
     ///
@@ -304,17 +316,27 @@ fn main() -> io::Result<()> {
                 .as_ref()
                 .map(std::fs::read)
                 .transpose()?;
-            let redis_store = if let Some(redis_ca) = redis_ca {
-                runtime.block_on(meta_redis::RedisMetaStore::new_with_tls_ca(
+            let session_ttl = Duration::from_millis(args.redis_session_ttl_ms);
+            let redis_store = match (redis_ca, session_ttl == meta_redis::DEFAULT_SESSION_TTL) {
+                (None, true) => runtime.block_on(meta_redis::RedisMetaStore::new(
                     redis_url,
                     &args.redis_prefix,
-                    Some(redis_ca),
-                ))
-            } else {
-                runtime.block_on(meta_redis::RedisMetaStore::new(
-                    redis_url,
-                    &args.redis_prefix,
-                ))
+                )),
+                (Some(redis_ca), true) => {
+                    runtime.block_on(meta_redis::RedisMetaStore::new_with_tls_ca(
+                        redis_url,
+                        &args.redis_prefix,
+                        Some(redis_ca),
+                    ))
+                }
+                (redis_ca, false) => {
+                    runtime.block_on(meta_redis::RedisMetaStore::new_with_options(
+                        redis_url,
+                        &args.redis_prefix,
+                        redis_ca,
+                        session_ttl,
+                    ))
+                }
             };
             Arc::new(redis_store.map_err(|e| io::Error::other(e.to_string()))?)
         } else {
@@ -363,6 +385,12 @@ fn main() -> io::Result<()> {
     GC_SCHEDULER
         .set(gc_scheduler.clone())
         .map_err(|_| io::Error::other("GC scheduler initialized more than once"))?;
+    runtime.block_on(run_orphan_sweep(
+        "startup",
+        &dev,
+        &store,
+        &gc_scheduler,
+    ));
     runtime.block_on(schedule_pending_garbage(
         "startup",
         &store,
@@ -412,6 +440,7 @@ fn event_loop(
 
     let mut retry_delay = GC_RETRY_BASE;
     let mut retry_at = Instant::now() + retry_delay;
+    let mut orphan_sweep_at = Instant::now() + ORPHAN_SWEEP_INTERVAL;
     let initial_coherence = runtime
         .block_on(store.coherence_probe(None))
         .map_err(|error| io::Error::other(format!("initial coherence probe failed: {error}")))?;
@@ -427,7 +456,9 @@ fn event_loop(
         }
 
         let now = Instant::now();
-        let wake_at = coherence_at.map_or(retry_at, |deadline| retry_at.min(deadline));
+        let wake_at = coherence_at
+            .map_or(retry_at, |deadline| retry_at.min(deadline))
+            .min(orphan_sweep_at);
         let timeout = wake_at
             .saturating_duration_since(now)
             .as_millis()
@@ -515,6 +546,16 @@ fn event_loop(
         if coherence_at.is_some_and(|deadline| Instant::now() >= deadline) {
             reconcile_coherence(dev, runtime, store, &mut coherence_revision)?;
             coherence_at = coherence_revision.map(|_| Instant::now() + COHERENCE_POLL_INTERVAL);
+        }
+
+        if Instant::now() >= orphan_sweep_at {
+            runtime.block_on(run_orphan_sweep(
+                "periodic",
+                dev,
+                store,
+                &gc_worker.scheduler(),
+            ));
+            orphan_sweep_at = Instant::now() + ORPHAN_SWEEP_INTERVAL;
         }
     }
 }
@@ -1530,6 +1571,58 @@ async fn schedule_pending_garbage(
     false
 }
 
+/// Replays only final-close failures recorded by the kernel after its local
+/// open-handle count reached zero. Peek/ack makes the queue crash-safe across
+/// daemon restarts while the module stays loaded; no session-expiry guess is
+/// accepted as open-reference evidence.
+async fn run_orphan_sweep(
+    source: &str,
+    dev: &KestrelDevice,
+    store: &Arc<dyn MetaStore>,
+    scheduler: &GcScheduler,
+) {
+    let mut reclaimed = 0_usize;
+    for _ in 0..64 {
+        let inode = match dev.peek_orphan_retry() {
+            Ok(Some(inode)) => inode,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("kestrelfs-daemon: ORPHAN-SWEEP source={source} peek failed: {error}");
+                break;
+            }
+        };
+        let garbage = match store.finalize_orphan(inode).await {
+            Ok(garbage) => garbage,
+            Err(MetaError::NotFound) => Vec::new(),
+            Err(error) => {
+                eprintln!(
+                    "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} retained for retry: {error}"
+                );
+                break;
+            }
+        };
+        if let Err(error) = dev.acknowledge_orphan_retry(inode) {
+            eprintln!(
+                "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} ack failed: {error}"
+            );
+            break;
+        }
+        reclaimed += 1;
+        let scheduled = scheduler.schedule("orphan-sweep", garbage);
+        if scheduled.backpressured != 0 {
+            eprintln!(
+                "kestrelfs-daemon: ORPHAN-SWEEP worker queue full; {} key(s) remain durable",
+                scheduled.backpressured
+            );
+        }
+    }
+    if reclaimed != 0 {
+        println!(
+            "kestrelfs-daemon: ORPHAN-SWEEP source={source} reclaimed={reclaimed} proof=kernel-final-close"
+        );
+    }
+}
+
 /// Applies one worker result on the serial IPC/metadata thread. Successful
 /// deletes are acknowledged only here; failures (including ack failure) stay
 /// in the durable queue and become schedulable again.
@@ -1682,6 +1775,7 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::TooManyLinks => -libc::EMLINK,
         MetaError::UnsupportedRenameFlags(_) => -libc::EINVAL,
         MetaError::Io => -libc::EIO,
+        MetaError::StaleSession => -libc::ESTALE,
     }
 }
 
@@ -2348,6 +2442,7 @@ mod tests {
         assert!(!default_args.memory);
         assert!(default_args.meta.is_none());
         assert!(default_args.objects.is_none());
+        assert_eq!(default_args.redis_session_ttl_ms, 3000);
 
         let memory_args = Args::try_parse_from(["kestrelfs-daemon", "--memory"]).unwrap();
         assert!(memory_args.memory);
@@ -2370,6 +2465,7 @@ mod tests {
             Some("redis://127.0.0.1:6379/0")
         );
         assert_eq!(distributed_args.redis_prefix, "test-fs");
+        assert_eq!(distributed_args.redis_session_ttl_ms, 3000);
         assert!(distributed_args.redis_ca_cert.is_none());
         assert_eq!(
             distributed_args.objects.as_deref(),
@@ -2404,6 +2500,14 @@ mod tests {
             "kestrelfs-daemon",
             "--redis-ca-cert",
             "/tmp/test-ca.pem",
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "kestrelfs-daemon",
+            "--meta",
+            "redis://127.0.0.1:6379/0",
+            "--redis-session-ttl-ms",
+            "299",
         ])
         .is_err());
 

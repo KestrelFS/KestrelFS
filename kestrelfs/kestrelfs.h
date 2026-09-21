@@ -127,6 +127,10 @@ int kestrelfs_is_daemon_alive(void);
 
 /* Serializes every request that owns the single shared data bounce buffer. */
 extern struct mutex kestrelfs_data_ipc_lock;
+void kestrelfs_orphan_retry_add(u64 inode_id);
+int kestrelfs_orphan_retry_peek(u64 *inode_id);
+int kestrelfs_orphan_retry_ack(u64 inode_id);
+void kestrelfs_orphan_retry_cleanup(void);
 
 /*
  * ipc_ring.c: lock-free-consumer ring buffer push/pop primitives.

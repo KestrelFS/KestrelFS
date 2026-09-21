@@ -74,6 +74,7 @@ static void __exit kestrelfs_exit(void)
 	kestrelfs_ipc_ring_exit();
 	kestrelfs_chardev_exit();
 	unregister_filesystem(&kestrelfs_fs_type);
+	kestrelfs_orphan_retry_cleanup();
 	kestrelfs_cache_exit();
 	pr_info("kestrelfs: module unloaded\n");
 }

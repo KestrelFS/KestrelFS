@@ -151,6 +151,20 @@ else
 	test "$(cat "$inode_batches")" -gt "$before_batches"
 	test "$(cat "$inode_entries")" -gt "$before_entries"
 	echo STEP52_DIST_REMOTE_VISIBLE_PASS
+	if test "${STEP54_LEASE:-0}" = 1; then
+		session_id=$(sed -n 's/.*writer session registered id=\([0-9a-f]*\) ttl_ms=.*/\1/p' \
+			"$data_dir/daemon.log" | tail -n 1)
+		test "${#session_id}" -eq 32
+		test "$(redis_cmd DEL "$prefix:meta:v2:sessions:$session_id")" = 1
+		if touch "$mnt/fenced-writer" 2>"$data_dir/fenced.err"; then
+			echo "STEP54_LEASE_FAIL: fenced mutation unexpectedly succeeded"
+			exit 1
+		fi
+		test ! -e "$mnt/fenced-writer"
+		grep -Eq 'Stale file handle|stale file handle|errno 116' \
+			"$data_dir/fenced.err" || true
+		echo STEP54_LEASE_FENCED_WRITER_PASS
+	fi
 	if test "${STEP53_NOTIFY:-0}" = 1; then
 		latency_ms=$(printf '%s\n' "$watch_output" |
 			sed -n 's/^STEP52_DIST_VISIBILITY_LATENCY_MS=//p')

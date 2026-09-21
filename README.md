@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 53 DIST-NOTIFY + REDIS-HARDEN 已验收；IPC ABI v22；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 54 OVERNIGHT MEGA 已验收；IPC ABI v23；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -59,8 +59,10 @@
 > dirty-inode/page-cache/NVMe 失效与 daemon-free 新 cache hit，并加入可重复的
 > write-behind、page-cache 和 loop cache 粗测基线（见 `docs/perf-baseline.md`）。
 > Step 53 已验收实现以 Redis Pub/Sub 提示 durable revision 对账（100 ms poll 保底）、
-> 自动重连命令连接和 `rediss://` 自签 CA 路径；它不是 lease 或线性一致性协议。
-> 跨 BIO 流水线与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
+> 自动重连命令连接和 `rediss://` 自签 CA 路径。Step 54 已验收实现加入 TTL writer
+> session/fail-closed mutation、内核证明型 orphan retry、普通文件 splice/sendfile，
+> 并把 folio 数据准备移出全局 bounce mutex；它仍不是读 lease 或线性一致性协议。
+> 真正并发 WRITE_DATA 与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -162,7 +164,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–53 已验收（含 DIST-NOTIFY/REDIS-HARDEN；ABI v22 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–54 已验收（ABI v23 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -177,7 +179,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v22）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v23）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -221,6 +223,9 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── test-step52-perf.c                   # 定时与数据校验助手
 ├── test-step53-dist-notify-vng.sh       # 双 vng Redis Pub/Sub 低延迟失效门控
 ├── test-step53-redis-tls.sh              # rediss:// 自签 CA 与 TLS 代理门控
+├── test-step54-lease-vng.sh              # 双 vng Redis session fencing 门控
+├── test-step54-vfs-pipe-vng.sh           # orphan retry、splice 与写回预暂存
+├── test-step54-vfs.c                     # splice/sendfile 数据校验助手
 ├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
@@ -365,7 +370,9 @@ dirty-inode 记录，保留最近 256 个 revision；daemon 每 100 ms 合并游
 时仍请求全 cache 失效。启动时也先全量退休恢复索引。Step 53 已验收路径在同一 Lua
 mutation 提交后发布 revision，订阅端立即走同一 durable probe；100 ms poll 继续对账。
 Redis 命令连接可自动重连，`rediss://` 可用 `--redis-ca-cert` 信任私有 CA。该原型不是
-生产级 lease，通知丢失只会退化为轮询延迟。
+生产级读 lease，通知丢失只会退化为轮询延迟。Step 54 已验收路径为每个 daemon
+增加 TTL writer session，Lua mutation 校验精确 token，session 丢失后返回 ESTALE；
+这只 fence 过期 writer，不提供跨节点锁、range lease 或线性一致性。
 可选集成测试：
 
 ```bash
@@ -495,8 +502,10 @@ truncate/`O_TRUNC`、批量 readdir、255 字节文件名；Step 32 支持硬链
 Step 34 支持 create/mkdir mode 与
 `2 + 直接子目录数` 的持久化目录 nlink。仍缺：
 
-- Step 36 已支持 open-unlink 与 last-close GC；若最终 close 时 daemon
-  不在线，会安全保留 orphan 而可能泄漏，尚无自动 sweep。Step 37/39 已实现文件/目录
+- Step 36 已支持 open-unlink 与 last-close GC；Step 54 已验收路径在本地 open count
+  已降为零且 final-close IPC 失败时写入内核 retry 队列，由 daemon 启动/周期任务
+  peek/finalize/ack。活 fd 不会入队；rmmod 后未处理队列仍会丢失，跨 mount open
+  引用也未聚合。Step 37/39 已实现文件/目录
   持久 chmod 与 chown/fchown。Step 40 已实现显式 atime/mtime，当前
   仅有秒级精度，自动读 atime 与 ctime 不持久化；mode/owner/time 与 size 的单事务仍未实现。
   whiteout 是 rename 内部生成的 0:0 字符设备 marker，不开放通用 `mknod`；
@@ -515,8 +524,9 @@ Step 34 支持 create/mkdir mode 与
   completion 唤醒，但 VFS 调用仍等待自己的 BIO，mutation 会等待在途 reader。
   Step 42（ABI v20）已把正常 Redis revision 变化
   收窄为最多 64 inode 的批量失效，并保留全量 fail-closed 回退；Step 53 Pub/Sub
-  只加速 durable probe，100 ms poll 保底。daemon 离线期间无 lease，也没有 range
-  消息、fencing 或线性一致性保证。
+  只加速 durable probe，100 ms poll 保底。Step 54 的 TTL writer session 可让过期
+  mutation 以 ESTALE fail closed，但它不是读 lease/fencing generation；仍没有 range
+  消息、跨机锁或线性一致性保证。
   Step 29 可用一次
   journal 批量退休 LRU victim 并合并同页 index 清零，但 fill/invalidate 仍有逐次
   prepare/clear flush，分散 victim 也仍需每个 index page 一次同步写。
@@ -527,11 +537,13 @@ Step 34 支持 create/mkdir mode 与
   `.flush` 和 writable VMA close 仍可能同步等待 daemon。`munmap` 本身没有 errno
   返回通道，失败依赖 mapping errseq 与后续 `fsync`/`flush` 报告；远端失效还受
   probe 与异步清页调度窗口影响。epoch 清理会先撤销 writable PTE 并写回 dirty
-  folio，失败时保留数据并让后续 read/mmap fail closed。splice 仍未覆盖，也没有
-  独立异步 WRITE_DATA opcode 或跨 folio 批量提交。
+  folio，失败时保留数据并让后续 read/mmap fail closed。Step 54 通过 filemap helper
+  覆盖普通文件 file→pipe、pipe→file 与 sendfile，并把 folio→staging 复制移出全局
+  bounce mutex；仍没有独立异步 WRITE_DATA opcode 或跨 folio 并发提交。
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
-- dirty folio 仍由 aops 经全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；后台
+- dirty folio 仍由 aops 经全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；Step 54 只让
+  folio 数据预暂存可在锁外准备，cache ordering、bounce copy 与 IPC 仍串行。后台
   writeback 自身同步等待 daemon，失败会 redirty folio 并记录 mapping/superblock
   errseq。延迟的是 write(2) 的完成点，并非 daemon IPC 或 WRITE_DATA completion。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有

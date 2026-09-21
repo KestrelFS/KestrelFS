@@ -110,6 +110,12 @@ impl Default for CacheInvalidateInodes {
 pub const INVALIDATE_CACHE_INODES: libc::c_ulong =
     iow(MAGIC, 5, std::mem::size_of::<CacheInvalidateInodes>() as u32);
 
+/// Peek/ack a kernel-proven failed final-close orphan retry. Peek is `_IOR`
+/// and deliberately leaves the record queued until the daemon has finalized
+/// metadata and issues the `_IOW` acknowledgement.
+pub const PEEK_ORPHAN_RETRY: libc::c_ulong = ior(MAGIC, 6, 8);
+pub const ACK_ORPHAN_RETRY: libc::c_ulong = iow(MAGIC, 7, 8);
+
 const _: () = assert!(std::mem::size_of::<CacheInvalidateInodes>() == 520);
 const _: () = assert!(std::mem::offset_of!(CacheInvalidateInodes, inode_ids) == 8);
 
@@ -130,6 +136,8 @@ mod tests {
         assert_eq!(GET_REGION_SIZE, 0x8008e003);
         assert_eq!(INVALIDATE_CACHE_ALL, 0xe004);
         assert_eq!(INVALIDATE_CACHE_INODES, 0x4208e005);
+        assert_eq!(PEEK_ORPHAN_RETRY, 0x8008e006);
+        assert_eq!(ACK_ORPHAN_RETRY, 0x4008e007);
         assert_eq!(std::mem::size_of::<CacheInvalidateInodes>(), 520);
         assert_eq!(std::mem::offset_of!(CacheInvalidateInodes, inode_ids), 8);
     }

@@ -429,6 +429,27 @@ static long kestrelfs_ioctl(struct file *file, unsigned int cmd,
 		return ret;
 	}
 
+	case KESTRELFS_IOC_PEEK_ORPHAN_RETRY: {
+		__u64 inode_id;
+
+		ret = kestrelfs_orphan_retry_peek(&inode_id);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &inode_id,
+				 sizeof(inode_id)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case KESTRELFS_IOC_ACK_ORPHAN_RETRY: {
+		__u64 inode_id;
+
+		if (copy_from_user(&inode_id, (void __user *)arg,
+				   sizeof(inode_id)))
+			return -EFAULT;
+		return kestrelfs_orphan_retry_ack(inode_id);
+	}
+
 	default:
 		return -ENOTTY;
 	}

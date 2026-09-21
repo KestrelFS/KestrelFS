@@ -42,6 +42,8 @@ cache_namespace=$(printf '%s' "$descriptor" | sha256sum | awk '{print $1}')
 | `cache_async_hit_submissions` / `cache_async_hit_peak` | 异步 completion BIO 提交数 / 峰值在途数 |
 | `cache_coherence_invalidations` | daemon 请求并成功完成的全 cache 失效数 |
 | `cache_coherence_inode_batches` / `cache_coherence_inode_entries` | 有界 inode 失效批次 / 退休 entry 数 |
+| `write_pipe_staged_bytes` / `write_pipe_submissions` | 在 bounce mutex 外预暂存的 folio 字节 / 随后提交的 WRITE_DATA chunk 数 |
+| `write_pipe_lock_wait_ns` / `write_pipe_lock_hold_ns` | 写回等待 / 持有全局 bounce mutex 的累计纳秒数 |
 
 计数路径为 `/sys/module/kestrelfs/parameters/<name>`。
 
@@ -65,6 +67,7 @@ mount -t kestrelfs none /mnt/kestrelfs
 | `--meta <REDIS_URL>` | 未设置 | 使用 RedisMetaStore；接受明文 `redis://` 或 TLS `rediss://`，未设置则使用 `{data-dir}/meta.json`。URL 可含凭据，daemon 不打印它。|
 | `--redis-prefix <PREFIX>` | `kestrelfs` | Redis v2 key namespace；要求同时给出 `--meta`。|
 | `--redis-ca-cert <PEM_PATH>` | 未设置 | 为 `rediss://` 增加私有/自签 CA trust anchor；要求同时给出 `--meta`，对 `redis://` 使用会 fail closed。未设置时 `rediss://` 使用系统 trust store。|
+| `--redis-session-ttl-ms <N>` | `3000` | Redis writer session TTL（最小 300 ms）；每 TTL/3 心跳续约。session 过期或被 fence 后 mutation 返回 `ESTALE`，不会静默提交。要求同时给出 `--meta`。|
 | `--objects <S3_URL>` | 未设置 | 使用 `s3://bucket/optional/prefix` 的 S3ObjectStore；未设置则使用 `data-dir` 下的 LocalFsObjectStore。|
 | `--s3-endpoint <URL>` | 未设置 | MinIO 等 S3-compatible endpoint，要求同时给出 `--objects`；优先于环境变量 `S3_ENDPOINT`，自定义 endpoint 使用 path-style。|
 
@@ -92,8 +95,14 @@ Redis 命令路径使用自动重连 connection manager。连接中断时，当�
 这不把不确定 mutation 自动重放成“恰好一次”，调用方仍应按操作语义处理错误。
 Pub/Sub 订阅也会以 50 ms 起、最多 1 s 的退避重连；重订阅成功会立即请求一次 durable
 revision 对账。通知只缩短可见性延迟，约 100 ms revision poll 始终保留，所以丢失、
-重复、乱序通知不会绕过 dirty-inode/full fail-closed 规则。当前没有 lease、fencing、
-跨节点锁或线性一致性保证。
+重复、乱序通知不会绕过 dirty-inode/full fail-closed 规则。
+
+每个 Redis daemon 还注册
+`<PREFIX>:meta:v2:sessions:<32-hex-session-id>` 字符串 key，值为同一 session id，
+并按 `--redis-session-ttl-ms` 设置 TTL。mutation Lua 除 revision-CAS 外还校验该
+精确 key/value；过期、删除或冲突返回 `ESTALE`，心跳只允许续约现存的同 token key，
+不会把已失效 writer 复活。这是最小 writer-session fencing，不提供读 lease、单调
+fencing generation、跨节点锁、range lease 或线性一致性。
 
 ## 安全与恢复边界
 

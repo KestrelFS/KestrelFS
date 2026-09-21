@@ -41,14 +41,122 @@
 #include <linux/filelock.h>
 #include <linux/writeback.h>
 #include <linux/highmem.h>
+#include <linux/ktime.h>
+#include <linux/module.h>
+#include <linux/slab.h>
 
 #include "kestrelfs.h"
 
 /* One shared bounce buffer means at most one bulk data IPC may be in flight. */
 DEFINE_MUTEX(kestrelfs_data_ipc_lock);
+static unsigned long kestrelfs_write_pipe_staged_bytes;
+module_param_named(write_pipe_staged_bytes,
+		   kestrelfs_write_pipe_staged_bytes, ulong, 0444);
+MODULE_PARM_DESC(write_pipe_staged_bytes,
+		 "Folio bytes copied into private staging before taking the bounce mutex");
+static unsigned long kestrelfs_write_pipe_lock_wait_ns;
+module_param_named(write_pipe_lock_wait_ns,
+		   kestrelfs_write_pipe_lock_wait_ns, ulong, 0444);
+MODULE_PARM_DESC(write_pipe_lock_wait_ns,
+		 "Cumulative writeback nanoseconds waiting for the bounce mutex");
+static unsigned long kestrelfs_write_pipe_lock_hold_ns;
+module_param_named(write_pipe_lock_hold_ns,
+		   kestrelfs_write_pipe_lock_hold_ns, ulong, 0444);
+MODULE_PARM_DESC(write_pipe_lock_hold_ns,
+		 "Cumulative writeback nanoseconds holding the bounce mutex");
+static unsigned long kestrelfs_write_pipe_submissions;
+module_param_named(write_pipe_submissions,
+		   kestrelfs_write_pipe_submissions, ulong, 0444);
+MODULE_PARM_DESC(write_pipe_submissions,
+		 "WRITE_DATA chunks submitted from pre-staged folios");
 static atomic64_t kestrelfs_pagecache_coherence_epoch = ATOMIC64_INIT(0);
 static DEFINE_MUTEX(kestrelfs_coherence_inodes_lock);
 static LIST_HEAD(kestrelfs_coherence_inodes);
+
+struct kestrelfs_orphan_retry {
+	struct list_head link;
+	u64 inode_id;
+};
+
+static DEFINE_MUTEX(kestrelfs_orphan_retry_lock);
+static LIST_HEAD(kestrelfs_orphan_retries);
+
+/* A retry record is created only after the last local open handle reached
+ * zero and FINALIZE_ORPHAN failed. It therefore carries stronger evidence
+ * than daemon-session expiry, which cannot prove that a kernel fd vanished.
+ */
+void kestrelfs_orphan_retry_add(u64 inode_id)
+{
+	struct kestrelfs_orphan_retry *entry;
+	struct kestrelfs_orphan_retry *candidate;
+
+	candidate = kmalloc(sizeof(*candidate), GFP_KERNEL);
+	if (!candidate) {
+		pr_err("kestrelfs: cannot queue orphan retry inode=%llu\n", inode_id);
+		return;
+	}
+	candidate->inode_id = inode_id;
+	INIT_LIST_HEAD(&candidate->link);
+
+	mutex_lock(&kestrelfs_orphan_retry_lock);
+	list_for_each_entry(entry, &kestrelfs_orphan_retries, link) {
+		if (entry->inode_id == inode_id) {
+			mutex_unlock(&kestrelfs_orphan_retry_lock);
+			kfree(candidate);
+			return;
+		}
+	}
+	list_add_tail(&candidate->link, &kestrelfs_orphan_retries);
+	mutex_unlock(&kestrelfs_orphan_retry_lock);
+	pr_warn("kestrelfs: queued failed final-close orphan inode=%llu\n", inode_id);
+}
+
+int kestrelfs_orphan_retry_peek(u64 *inode_id)
+{
+	struct kestrelfs_orphan_retry *entry;
+
+	mutex_lock(&kestrelfs_orphan_retry_lock);
+	if (list_empty(&kestrelfs_orphan_retries)) {
+		mutex_unlock(&kestrelfs_orphan_retry_lock);
+		return -ENOENT;
+	}
+	entry = list_first_entry(&kestrelfs_orphan_retries,
+				 struct kestrelfs_orphan_retry, link);
+	*inode_id = entry->inode_id;
+	mutex_unlock(&kestrelfs_orphan_retry_lock);
+	return 0;
+}
+
+int kestrelfs_orphan_retry_ack(u64 inode_id)
+{
+	struct kestrelfs_orphan_retry *entry;
+	struct kestrelfs_orphan_retry *tmp;
+
+	mutex_lock(&kestrelfs_orphan_retry_lock);
+	list_for_each_entry_safe(entry, tmp, &kestrelfs_orphan_retries, link) {
+		if (entry->inode_id == inode_id) {
+			list_del(&entry->link);
+			mutex_unlock(&kestrelfs_orphan_retry_lock);
+			kfree(entry);
+			return 0;
+		}
+	}
+	mutex_unlock(&kestrelfs_orphan_retry_lock);
+	return -ENOENT;
+}
+
+void kestrelfs_orphan_retry_cleanup(void)
+{
+	struct kestrelfs_orphan_retry *entry;
+	struct kestrelfs_orphan_retry *tmp;
+
+	mutex_lock(&kestrelfs_orphan_retry_lock);
+	list_for_each_entry_safe(entry, tmp, &kestrelfs_orphan_retries, link) {
+		list_del(&entry->link);
+		kfree(entry);
+	}
+	mutex_unlock(&kestrelfs_orphan_retry_lock);
+}
 
 /* The daemon's ioctl must not wait for a folio whose READ_DATA request is
  * waiting on that same daemon. Retire mapped folios on a worker instead.
@@ -771,17 +879,36 @@ static int kestrelfs_write_folio(struct folio *folio,
 {
 	struct inode *inode = folio->mapping->host;
 	struct kestrelfs_shared_region *region;
+	u8 *staging = NULL;
 	loff_t offset = folio_pos(folio);
 	loff_t size = i_size_read(inode);
 	size_t length = offset < size ? min_t(u64, folio_size(folio),
 							 size - offset) : 0;
 	size_t done = 0;
+	u64 wait_started;
+	u64 lock_started;
 	int ret = 0;
 
 	if (!length)
 		goto out_unlock;
 	folio_start_writeback(folio);
+	/* The folio is locked and under writeback, so its bytes are stable. Copy
+	 * them before contending on the one shared bounce buffer. This leaves only
+	 * cache ordering, bounce memcpy, and synchronous IPC in the mutex-held
+	 * interval and permits other writeback workers to prepare their next folio
+	 * concurrently.
+	 */
+	staging = kvmalloc(length, GFP_KERNEL);
+	if (!staging) {
+		ret = -ENOMEM;
+		goto out_writeback;
+	}
+	memcpy_from_folio(staging, folio, 0, length);
+	wait_started = ktime_get_ns();
 	mutex_lock(&kestrelfs_data_ipc_lock);
+	lock_started = ktime_get_ns();
+	kestrelfs_write_pipe_lock_wait_ns += lock_started - wait_started;
+	kestrelfs_write_pipe_staged_bytes += length;
 	region = kestrelfs_shm_region();
 	if (!region) {
 		ret = -ENOTCONN;
@@ -800,7 +927,7 @@ static int kestrelfs_write_folio(struct folio *folio,
 			((u64)(offset + done) % KESTRELFS_MODEL_CHUNK_SIZE);
 
 		chunk = min_t(u64, chunk, chunk_boundary);
-		memcpy_from_folio(region->data_buffer, folio, done, chunk);
+		memcpy(region->data_buffer, staging + done, chunk);
 		req.opcode = KESTRELFS_OP_WRITE_DATA;
 		put_unaligned_le64(inode->i_ino, &req.payload[0]);
 		put_unaligned_le64(offset + done, &req.payload[8]);
@@ -816,10 +943,14 @@ static int kestrelfs_write_folio(struct folio *folio,
 			ret = -EPROTO;
 			break;
 		}
+		kestrelfs_write_pipe_submissions++;
 		done += chunk;
 	}
 out_mutex:
+	kestrelfs_write_pipe_lock_hold_ns += ktime_get_ns() - lock_started;
 	mutex_unlock(&kestrelfs_data_ipc_lock);
+	kvfree(staging);
+out_writeback:
 	if (ret) {
 		folio_redirty_for_writepage(wbc, folio);
 		mapping_set_error(folio->mapping, ret);
@@ -882,6 +1013,7 @@ static int kestrelfs_regular_release(struct inode *inode, struct file *file)
 	struct kestrelfs_inode_state *state = inode->i_private;
 	struct kestrelfs_event req = { 0 };
 	struct kestrelfs_event resp = { 0 };
+	bool orphan_final_close = false;
 	int ret = 0;
 
 	if (!state)
@@ -895,6 +1027,7 @@ static int kestrelfs_regular_release(struct inode *inode, struct file *file)
 	state->open_handles--;
 	if (state->open_handles != 0 || inode->i_nlink != 0)
 		goto out_unlock;
+	orphan_final_close = true;
 
 	ret = kestrelfs_cache_invalidate_inode(inode->i_ino);
 	if (ret)
@@ -909,6 +1042,8 @@ static int kestrelfs_regular_release(struct inode *inode, struct file *file)
 		ret = -EPROTO;
 
 out_unlock:
+	if (ret && orphan_final_close)
+		kestrelfs_orphan_retry_add(inode->i_ino);
 	mutex_unlock(&state->lifecycle_lock);
 	return ret;
 }
@@ -998,8 +1133,10 @@ const struct file_operations kestrelfs_writable_file_ops = {
 	.lock	= kestrelfs_regular_lock,
 	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,
+	.splice_read	= filemap_splice_read,
 	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
+	.splice_write	= iter_file_splice_write,
 	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,
 };
@@ -1284,8 +1421,10 @@ const struct file_operations kestrelfs_reg_file_ops = {
 	.lock	= kestrelfs_regular_lock,
 	.flock	= kestrelfs_regular_flock,
 	.read_iter	= kestrelfs_regular_read_iter,
+	.splice_read	= filemap_splice_read,
 	.mmap	= kestrelfs_regular_mmap,
 	.write_iter	= kestrelfs_writable_write_iter,
+	.splice_write	= iter_file_splice_write,
 	.fsync	= kestrelfs_regular_fsync,
 	.llseek	= kestrelfs_writable_llseek,
 };

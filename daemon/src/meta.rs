@@ -101,6 +101,10 @@ pub enum MetaError {
     /// I/O error during persistence operations (FileMetaStore).
     #[error("I/O error")]
     Io,
+    /// The Redis writer session expired or was fenced. The caller must not
+    /// assume that a metadata mutation was committed.
+    #[error("metadata writer session expired or was fenced")]
+    StaleSession,
 }
 
 /// Convenience alias, matching the `Result<T>` naming used throughout

@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–52）
+## 当前边界（Step 18–54）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -114,6 +114,14 @@ B 停止 daemon 后仍能从新 entry 命中，证明旧 entry 没有越过失�
 轮询窗口包装成线性一致：提交到下一次 probe 前仍可能读到旧页；probe 失败或历史
 不完整时继续全量 fail closed。IPC ABI v22、cache format v4 均未改变。粗测方法与
 环境见 `perf-baseline.md`。
+
+Step 54 不改 cache format。普通文件新增 filemap splice-read 与 iter splice-write，
+所以 file→pipe、pipe→file 和 sendfile 继续经过同一 page cache、write-behind、
+fsync 与 coherence epoch 规则。writepages 在取得全局 bounce mutex 前把锁定 folio
+复制到私有 staging；不同 inode/folio 的准备阶段可重叠，mutex 内只保留 cache
+ordering、bounce memcpy 与同步 WRITE_DATA。它缩短临界区但没有让单一 bounce 上的
+WRITE_DATA 并发，亦未增加异步 opcode。新增 orphan retry peek/ack ioctl 使 IPC ABI
+bump 到 v23；共享内存/event/opcode 和 cache format v4 均未变化。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
@@ -351,8 +359,9 @@ mutation 会等待慢 reader，也没有 per-entry refcount/RCU。
 - Step 22/26 是 read hit 的受限少拷贝并行路径：完整、对齐、连续块可以直达用户
   页，Step 48 改为多个调用者异步提交 BIO、分别等待 completion；Step 28 通过 `read_iter` 覆盖
   read/pread/readv/preadv，但跨 iovec、partial block 和不能 pin/对齐的 buffer 仍有
-  一次 `copy_to_iter()`。Step 45 的普通读已改经 page-cache/readahead；仍无 splice 全覆盖、
-  也没有跨 iovec scatter-gather BIO 或单次请求内的多 BIO pipeline。
+  一次 `copy_to_iter()`。Step 45 的普通读已改经 page-cache/readahead；Step 54
+  覆盖普通文件的 file→pipe、pipe→file 与 sendfile，但没有跨 iovec scatter-gather
+  BIO、用户态异步接口或单次请求内的多 BIO pipeline。
 - v4 superblock 沿用持久化 namespace digest；缺失、非 64 位 hex 或 digest 不匹配
   均拒绝 cache_device 加载。内核无法验证部署层生成 descriptor 时是否规范化正确，
   因而 descriptor 规则仍是配置契约。
@@ -550,3 +559,18 @@ STEP52_DIST_TWO_NODE_PASS
 `test-step52-perf-vng.sh` 在单 guest 中分别测 write-behind 返回、page-cache 热读与
 drop_caches 后 daemon-free cache hit，并输出 `STEP52_PERF_*_PASS`。完整 workload、
 复现命令、一次通过样本和非 SLA 边界见 [`perf-baseline.md`](perf-baseline.md)。
+
+## Step 54 splice、orphan retry 与写回预暂存验证
+
+`test-step54-vfs-pipe-vng.sh` 在单个 vng guest + loop 中显式 insmod，使用共享 Redis
+metadata 与本地对象目录。它逐字节校验 file→pipe、pipe→file 和 sendfile；再写入
+2 MiB 并要求 `write_pipe_staged_bytes` 增长至少 2 MiB、WRITE_DATA submission 增长。
+orphan 负例保持 fd 打开两秒，确认对象不被清扫且 fd 仍可读；正例暂停 daemon，令
+final-close IPC 超时并由内核排队，恢复 daemon 后要求 periodic replay 与对象删除。
+2026-09-21 自检输出 `STEP54_VFS_PIPE_PASS`，本轮 512 submissions、umount 163 ms。
+
+`test-step54-lease-vng.sh` 复用两个独立 vng guest + Redis/S3 配方。正常 session
+心跳下 Step 53 Pub/Sub/dirty revision 可见性仍通过；随后删除 B 的精确 session key，
+B 的下一次 create 必须失败且路径不存在。自检输出
+`STEP54_LEASE_HEARTBEAT_NOTIFY_PASS`、`STEP54_LEASE_EXPIRED_FAIL_CLOSED_PASS` 和
+`STEP54_LEASE_PASS`，本轮远端可见延迟 11 ms。

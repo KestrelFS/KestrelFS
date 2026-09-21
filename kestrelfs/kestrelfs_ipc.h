@@ -862,8 +862,11 @@ struct kestrelfs_ring_ctrl {
  *  22 - Phase 4 step 50: RENAME_DATA accepts RENAME_WHITEOUT and metadata
  *       may return persistent S_IFCHR(0,0) whiteout inodes. Payload and
  *       shared-memory layouts are unchanged.
+ *  23 - Phase 4 step 54: Added PEEK_ORPHAN_RETRY and ACK_ORPHAN_RETRY
+ *       daemon ioctls. They expose only final-close failures proven by the
+ *       kernel open-handle count; shared-memory/event layouts are unchanged.
  */
-#define KESTRELFS_ABI_VERSION		22
+#define KESTRELFS_ABI_VERSION		23
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -960,6 +963,16 @@ struct kestrelfs_cache_invalidate_inodes {
 
 #define KESTRELFS_IOC_INVALIDATE_CACHE_INODES \
 	_IOW(KESTRELFS_IOC_MAGIC, 5, struct kestrelfs_cache_invalidate_inodes)
+
+/* Peek leaves the record queued until ACK succeeds, so daemon failure between
+ * metadata finalize and acknowledgement is safely retried (NotFound is
+ * idempotent completion). Records exist only after the local final close saw
+ * open_handles==0 and FINALIZE_ORPHAN failed.
+ */
+#define KESTRELFS_IOC_PEEK_ORPHAN_RETRY \
+	_IOR(KESTRELFS_IOC_MAGIC, 6, __u64)
+#define KESTRELFS_IOC_ACK_ORPHAN_RETRY \
+	_IOW(KESTRELFS_IOC_MAGIC, 7, __u64)
 
 /* ------------------------------------------------------------------
  * Compile-time layout guarantees (checked under BOTH kernel-C and

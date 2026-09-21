@@ -262,6 +262,45 @@ impl KestrelDevice {
         Ok(())
     }
 
+    /// Peeks one failed final-close record without removing it. ENOENT means
+    /// the kernel queue is empty; every returned inode was observed with zero
+    /// local open handles before FINALIZE_ORPHAN failed.
+    pub fn peek_orphan_retry(&self) -> io::Result<Option<u64>> {
+        let mut inode_id = 0_u64;
+        // SAFETY: PEEK_ORPHAN_RETRY writes exactly one u64 to this live value.
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd,
+                ioctl::PEEK_ORPHAN_RETRY as _,
+                &mut inode_id as *mut u64,
+            )
+        };
+        if ret == 0 {
+            return Ok(Some(inode_id));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        Err(error)
+    }
+
+    /// Removes the exact retry record after metadata finalization committed.
+    pub fn acknowledge_orphan_retry(&self, inode_id: u64) -> io::Result<()> {
+        // SAFETY: ACK_ORPHAN_RETRY reads exactly one u64 from this live value.
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd,
+                ioctl::ACK_ORPHAN_RETRY as _,
+                &inode_id as *const u64,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Returns the raw file descriptor, for use in a `libc::pollfd`
     /// (see `main.rs`'s event loop).
     pub fn as_raw_fd(&self) -> RawFd {

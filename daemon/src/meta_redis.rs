@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::fs_model::{Inode, Slice, S_IFDIR};
 use crate::meta::{CoherenceProbe, MemStore, MetaError, MetaStore, Result};
@@ -28,6 +29,8 @@ const SCHEMA_VERSION: &str = "2";
 const MAX_CAS_RETRIES: usize = 64;
 const COHERENCE_DIRTY_INODE_MAX: usize = 64;
 const COHERENCE_REVISION_WINDOW: u64 = 256;
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(3);
+const MIN_SESSION_TTL: Duration = Duration::from_millis(300);
 
 const INIT_SCRIPT: &str = r#"
 local function apply_hash(key, sets, dels)
@@ -93,6 +96,9 @@ local revision = redis.call('HGET', KEYS[1], 'revision')
 if not revision then
     return -2
 end
+if redis.call('GET', KEYS[9]) ~= ARGV[8] then
+    return -3
+end
 if revision ~= ARGV[2] then
     return 0
 end
@@ -129,10 +135,21 @@ local revision = redis.call('HGET', KEYS[1], 'revision')
 if not revision then
     return -2
 end
+if redis.call('GET', KEYS[2]) ~= ARGV[3] then
+    return -3
+end
 if revision == ARGV[2] then
     return 1
 end
 return 0
+"#;
+
+const RENEW_SESSION_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
 "#;
 
 const COHERENCE_PROBE_SCRIPT: &str = r#"
@@ -176,6 +193,10 @@ pub enum RedisMetaStoreError {
     InvalidPrefix,
     #[error("a custom Redis CA certificate requires a rediss:// URL")]
     InvalidTlsConfig,
+    #[error("Redis writer session TTL must be at least 300 ms")]
+    InvalidSessionTtl,
+    #[error("Redis writer session id unexpectedly conflicts")]
+    SessionConflict,
     #[error("failed to create Redis notification wakeup: {0}")]
     Notification(#[source] io::Error),
     #[error("legacy Redis metadata schema v1 exists; automatic migration is not supported")]
@@ -203,6 +224,7 @@ struct RedisKeys {
     garbage: String,
     dirty: String,
     notifications: String,
+    sessions: String,
     legacy_snapshot: String,
 }
 
@@ -218,6 +240,7 @@ impl RedisKeys {
             garbage: format!("{base}:gc"),
             dirty: format!("{base}:dirty"),
             notifications: format!("{base}:notify"),
+            sessions: format!("{base}:sessions"),
             legacy_snapshot: format!("{prefix}:{LEGACY_SNAPSHOT_KEY_SUFFIX}"),
         }
     }
@@ -233,6 +256,10 @@ impl RedisKeys {
             &self.dirty,
         ]
     }
+
+    fn session_key(&self, session_id: &str) -> String {
+        format!("{}:{session_id}", self.sessions)
+    }
 }
 
 /// A record-oriented Redis implementation of [`MetaStore`].
@@ -240,6 +267,85 @@ pub struct RedisMetaStore {
     connection: ConnectionManager,
     keys: RedisKeys,
     notification: Option<RedisNotification>,
+    session: RedisSession,
+}
+
+struct RedisSession {
+    id: String,
+    key: String,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl RedisSession {
+    async fn register(
+        mut connection: ConnectionManager,
+        keys: &RedisKeys,
+        ttl: Duration,
+    ) -> std::result::Result<Self, RedisMetaStoreError> {
+        if ttl < MIN_SESSION_TTL {
+            return Err(RedisMetaStoreError::InvalidSessionTtl);
+        }
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let id = Uuid::new_v4().simple().to_string();
+        let key = keys.session_key(&id);
+        let registered: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&id)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl_ms)
+            .query_async(&mut connection)
+            .await?;
+        if registered.as_deref() != Some("OK") {
+            return Err(RedisMetaStoreError::SessionConflict);
+        }
+        println!("[meta_redis] writer session registered id={id} ttl_ms={ttl_ms}");
+
+        let heartbeat_key = key.clone();
+        let heartbeat_id = id.clone();
+        let interval = ttl / 3;
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let renewed: redis::RedisResult<i32> = redis::cmd("EVAL")
+                    .arg(RENEW_SESSION_SCRIPT)
+                    .arg(1)
+                    .arg(&heartbeat_key)
+                    .arg(&heartbeat_id)
+                    .arg(ttl_ms)
+                    .query_async(&mut connection)
+                    .await;
+                match renewed {
+                    Ok(1) => {}
+                    Ok(_) => {
+                        eprintln!(
+                            "[meta_redis] writer session was fenced or expired; subsequent mutations fail closed"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("[meta_redis] writer session heartbeat failed; retrying");
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            id,
+            key,
+            _task: task,
+        })
+    }
+
+    #[cfg(test)]
+    fn stop_heartbeat(&self) {
+        self._task.abort();
+    }
+}
+
+impl Drop for RedisSession {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
 }
 
 struct RedisNotification {
@@ -655,7 +761,7 @@ impl RedisMetaStore {
     /// A legacy v1 snapshot or an unversioned partial v2 layout is rejected;
     /// this implementation never silently migrates or wipes metadata.
     pub async fn new(url: &str, prefix: &str) -> std::result::Result<Self, RedisMetaStoreError> {
-        Self::new_with_tls_ca(url, prefix, None).await
+        Self::new_with_options(url, prefix, None, DEFAULT_SESSION_TTL).await
     }
 
     /// Connects with an optional PEM CA certificate for a `rediss://`
@@ -665,6 +771,17 @@ impl RedisMetaStore {
         url: &str,
         prefix: &str,
         root_cert: Option<Vec<u8>>,
+    ) -> std::result::Result<Self, RedisMetaStoreError> {
+        Self::new_with_options(url, prefix, root_cert, DEFAULT_SESSION_TTL).await
+    }
+
+    /// Connects with explicit session TTL. The short-TTL form is useful for
+    /// bounded fencing tests; production callers normally use the default.
+    pub async fn new_with_options(
+        url: &str,
+        prefix: &str,
+        root_cert: Option<Vec<u8>>,
+        session_ttl: Duration,
     ) -> std::result::Result<Self, RedisMetaStoreError> {
         if !url.starts_with("redis://") && !url.starts_with("rediss://") {
             return Err(RedisMetaStoreError::InvalidUrl);
@@ -693,10 +810,12 @@ impl RedisMetaStore {
         };
         let connection = client.get_connection_manager().await?;
         let keys = RedisKeys::new(prefix);
+        let session = RedisSession::register(connection.clone(), &keys, session_ttl).await?;
         let mut store = Self {
             connection,
             keys,
             notification: None,
+            session,
         };
         store.initialize().await?;
         store.load_snapshot_backend().await?;
@@ -931,16 +1050,19 @@ impl RedisMetaStore {
         let mut connection = self.connection.clone();
         let result: i32 = redis::cmd("EVAL")
             .arg(CHECK_REVISION_SCRIPT)
-            .arg(1)
+            .arg(2)
             .arg(&self.keys.control)
+            .arg(&self.session.key)
             .arg(SCHEMA_VERSION)
             .arg(expected)
+            .arg(&self.session.id)
             .query_async(&mut connection)
             .await
             .map_err(|error| Self::report_backend_error("revision check failed", error))?;
         match result {
             1 => Ok(true),
             0 => Ok(false),
+            -3 => Err(MetaError::StaleSession),
             value => Err(Self::report_backend_error(
                 "revision check failed",
                 format_args!("invalid schema/status {value}"),
@@ -965,9 +1087,10 @@ impl RedisMetaStore {
         let mut connection = self.connection.clone();
         let result: i32 = redis::cmd("EVAL")
             .arg(MUTATE_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(&keys)
             .arg(&self.keys.notifications)
+            .arg(&self.session.key)
             .arg(SCHEMA_VERSION)
             .arg(expected_revision)
             .arg(new_revision)
@@ -975,12 +1098,14 @@ impl RedisMetaStore {
             .arg(encoded)
             .arg(dirty)
             .arg(COHERENCE_REVISION_WINDOW)
+            .arg(&self.session.id)
             .query_async(&mut connection)
             .await
             .map_err(|error| Self::report_backend_error("mutation transaction failed", error))?;
         match result {
             1 => Ok(true),
             0 => Ok(false),
+            -3 => Err(MetaError::StaleSession),
             value => Err(Self::report_backend_error(
                 "mutation transaction failed",
                 format_args!("invalid schema/status {value}"),
@@ -1851,6 +1976,74 @@ mod tests {
             let _: usize = redis::cmd("DEL")
                 .arg(keys)
                 .query_async(&mut killer)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_url_gated_session_fencing_and_orphan_finalize() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("REDIS_URL not set; skipping Redis session/orphan assertions");
+            return;
+        };
+        let prefix = format!("kestrelfs:test:lease-orphan:{}", Uuid::new_v4());
+        let owner = RedisMetaStore::new_with_options(
+            &url,
+            &prefix,
+            None,
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+        let sweeper = RedisMetaStore::new(&url, &prefix).await.unwrap();
+
+        let inode = owner.create(ROOT_INODE, "retained", 0o600).await.unwrap();
+        let slice = Slice {
+            chunk_index: 0,
+            slice_id: Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 32,
+            written_at: 1,
+        };
+        let object_key = slice.block_key(0);
+        owner.append_slice(inode, slice).await.unwrap();
+        assert!(owner
+            .unlink_with_lifecycle(ROOT_INODE, "retained", true)
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(sweeper.getattr(inode).await.unwrap().nlink, 0);
+
+        owner.session.stop_heartbeat();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(matches!(
+            owner.create(ROOT_INODE, "must-be-fenced", 0o600).await,
+            Err(MetaError::StaleSession)
+        ));
+
+        assert_eq!(
+            sweeper.finalize_orphan(inode).await.unwrap(),
+            vec![object_key.clone()]
+        );
+        assert!(matches!(sweeper.getattr(inode).await, Err(MetaError::NotFound)));
+        assert!(sweeper
+            .pending_garbage()
+            .await
+            .unwrap()
+            .contains(&object_key));
+
+        let mut connection = sweeper.connection.clone();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}:meta:*"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        if !keys.is_empty() {
+            let _: usize = redis::cmd("DEL")
+                .arg(keys)
+                .query_async(&mut connection)
                 .await
                 .unwrap();
         }
