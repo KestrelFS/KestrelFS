@@ -14,6 +14,10 @@
 `daemon/` 内 `cargo test` 仍留在 Rust 树内，不迁到这里。
 `tools/`、`vm-test/` 保持原位（构建产物/工具，不是 step 回归脚本）。
 
+Step 56 的持久 orphan/指标用例为 `tests/test-step56-orphan-metrics-vng.sh`；它在
+guest 内创建 loop、显式 insmod，并验证 open-skip、rmmod guard、模块重载 GC 与
+`orphan_retry_*` 计数增长。
+
 ## 运行方式
 
 始终在**仓库根**调用（脚本会自行 `cd` 到根）：

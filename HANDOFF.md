@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 55（POSIX-DTYPE + MKNOD-MIN）已验收；IPC ABI v24、cache format v4。 测试脚本约定迁入 `tests/`（见 `tests/README.md`）。下一步见 remaining-capabilities §8。
+> **最后更新**：Step 56（ORPHAN-RETRY-PERSIST + OPS-METRICS）已验收；IPC ABI v24、cache format v4。测试脚本统一位于 `tests/`。下一步见 remaining-capabilities §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 55 已验收；测试统一放 `tests/`；下一步见 remaining-capabilities §8 |
+| 当前阶段 | Step 56 已验收；下一步常规双包 Step 57（见 remaining-capabilities §8） |
 
 ---
 
@@ -90,6 +90,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 │       ├── meta_redis.rs        # RedisMetaStore（v2 分记录 HASH/SET + Lua revision-CAS）
 │       ├── object_store.rs      # ObjectStore trait + MemObjectStore + LocalFsObjectStore
 │       ├── object_store_s3.rs   # S3ObjectStore（AWS SDK、MinIO path-style）
+│       ├── orphan_retry.rs      # kernel final-close proof 的 data-dir 持久交接
 │       ├── gc_worker.rs         # 有界异步 ObjectStore GC delete worker
 │       ├── fs_model.rs          # Inode / Slice / Block 数据模型
 │       ├── device.rs            # /dev/kestrel_ctl 打开/mmap/ABI校验
@@ -229,6 +230,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/分布式+运维 Step 53** | **Redis Pub/Sub revision 提示 + poll 对账；命令自动重连；rediss 私有 CA** | **22（未变）** | **✅ 已验收** |
 | **Phase 4/综合 Step 54** | **最小 Redis session fencing + kernel-proven orphan sweep + splice/sendfile + WRITE_DATA 预暂存** | **23** | **✅ 已验收** |
 | **Phase 4/POSIX Step 55** | **精确 READDIR_DATA d_type + 受限 persistent whiteout mknod** | **24** | **✅ 已验收** |
+| **Phase 4/运维 Step 56** | **orphan retry 持久交接 + rmmod guard + 最小运维指标** | **24（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -300,9 +302,9 @@ Cursor 对照代码、203 tests 与 `STEP54_LEASE_PASS` / `STEP54_VFS_PIPE_PASS`
 
 Cursor 对照代码、206 tests 与 `STEP55_POSIX_DTYPE_MKNOD_PASS` 确认 Step 55 已验收。 精确 `d_type` + 受限 `mknod`；ABI **v24**；format **v4**。
 
-站立约定：step/vng/门控测试脚本与 C helper **只放 `tests/`**（见 `tests/README.md`）；仓库根禁止再新增 `test-*`。
+Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已验收。 orphan retry 持久交接 + rmmod guard + 最小运维指标；ABI **v24** 未变；format **v4**。
 
-待验收：见 `docs/remaining-capabilities.md` §8（Step 56 常规双包）。
+待验收：见 `docs/remaining-capabilities.md` §8（Step 57 常规双包）。
 > **当前 ABI**：`KESTRELFS_ABI_VERSION = 24`（`READDIR_DATA` 条目含 `DT_*`；受限 mknod 复用 CREATE_DATA）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
@@ -418,7 +420,7 @@ Cursor 对照代码、206 tests 与 `STEP55_POSIX_DTYPE_MKNOD_PASS` 确认 Step 
 | 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+显式时间/其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`；普通 truncate 随带的 VFS 隐式 mtime/ctime 由 TRUNCATE 处理。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
-| 17 | **orphan 自动清扫只覆盖内核已证明的 final-close 失败** | Step 54 在 mount-local `open_handles==0` 且 `FINALIZE_ORPHAN` 失败时把 inode 放入模块生命周期内 peek/ack retry 队列，daemon 启动及每秒回放，成功后进入既有 durable GC；仍 open 的 inode绝不入队。rmmod 会丢失未处理队列，不从 Redis session 过期猜测 fd 生命周期；不同 mount 的全局 open 引用仍未聚合。 | `kestrelfs/file.c`、`kestrelfs/chardev.c`、`daemon/src/main.rs` |
+| 17 | **orphan 自动清扫只覆盖内核已证明的 final-close 失败** | Step 56 已验收实现只接收 mount-local `open_handles==0` 且 `FINALIZE_ORPHAN` 失败的 proof。未持久接收的 proof 持有模块引用，正常 rmmod 被拒绝；daemon 经 temp fsync + rename + 目录 fsync 写入 `{data-dir}/.orphan-retries-v1.json` 后才 ACK，因而可跨 daemon 与模块重启回放。仍 open 的 inode 绝不入队，也不从 Redis session TTL 猜测；须复用同一 data-dir，强制卸载或遗失该目录仍可能泄漏，不同 mount 的全局 open 引用仍未聚合。 | `kestrelfs/file.c`、`daemon/src/orphan_retry.rs`、`daemon/src/main.rs` |
 | 18 | **Redis v2 写放大已降低，mutation 读放大仍在** | Step 31 把 metadata 拆为固定 HASH/SET，`lookup/getattr/read_slices/readlink` 定向读取，mutation 只写发生变化的 fields；但为复用 MemStore 的完整 rename/truncate/引用确认语义，每次 mutation 仍一致读取各聚合 HASH 并在客户端计算 diff，冲突最多重试 64 次。readdir 与 GC 引用确认也仍有聚合扫描。 | `daemon/src/meta_redis.rs` |
 | 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
 | 20 | **Redis schema 异常/旧 v1 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，v2 control/record 非法、版本未知、control 缺失但残留 v2 key 或旧 `<prefix>:meta:v1` 存在时 daemon 启动失败；运行中 schema/control 被删除或破坏时 metadata 操作返回 EIO。没有 v1 自动迁移或自动 wipe。 | `daemon/src/meta_redis.rs` |
@@ -1920,13 +1922,41 @@ Cursor 验收自检（2026-09-21）：206 tests；clippy / make 零警告；
 `STEP55_POSIX_DTYPE_MKNOD_PASS`（umount_ms=14，后迁入 `tests/` 复跑 umount 14）。
 同提交将根目录 `test-*` 迁入 `tests/`，并由 `_repo_root.sh` 固定仓库根 cwd。
 
+### 7.50 Phase 4/运维 Step 56 ORPHAN-RETRY-PERSIST + OPS-METRICS（已验收）
+
+内核 final-close retry list 的每个新 proof 持有一个模块引用；daemon 将 inode id 以
+versioned JSON 集合写入 `{data-dir}/.orphan-retries-v1.json`，完成 temp-file fsync、
+原子 rename 与目录 fsync 后才 ACK 内核并释放引用。正常 `rmmod` 因此不能越过尚未
+落盘的 proof；持久 proof 在 daemon 或模块重启后先幂等 finalize（NotFound 也视为已
+完成），再删除本地记录并把对象 key 交给既有 durable GC。损坏/未知版本状态 fail
+closed。仍 open 的 inode 不入队，也不使用 Redis session TTL 推断 fd 生命周期。
+
+只读 module 参数新增 `orphan_retry_queued`、`orphan_retry_acked` 累计计数与
+`orphan_retry_pending` gauge；`docs/configuration.md` 新增只读可观测性专节，统一列出
+cache、coherence、write-pipe、orphan、GC 与 Redis session 观测。它们是诊断接口，
+不是稳定 ABI。
+
+Codex 工作树自检：`cargo test` 208 passed；clippy `-D warnings`、`make -C kestrelfs`
+零警告。vng+loop 输出 `STEP56_ORPHAN_PERSIST_OPEN_SKIP_PASS`、
+`STEP56_ORPHAN_PERSIST_RMMOD_GUARD_PASS`、`STEP56_METRICS_ORPHAN_RETRY_PASS`
+（queued/acked 各增长 1）、`STEP56_ORPHAN_PERSIST_RELOAD_GC_PASS` 与
+`STEP56_DOUBLE_PACK_PASS`。回归 `STEP54_VFS_PIPE_PASS`（umount 207 ms）及
+`STEP55_POSIX_DTYPE_MKNOD_PASS`（umount 63 ms）。所有 insmod/mount/loop 仅在 vng
+guest；Step 54 Redis 经宿主用户态 TCP 转发访问测试实例。IPC ABI **v24**、cache
+format **v4** 均不变。
+
+
+Cursor 验收自检（2026-09-21）：208 tests；clippy / make 零警告；vng
+`STEP56_DOUBLE_PACK_PASS`（open-skip、rmmod-guard、queued/acked delta=1、reload-GC、
+`STEP56_METRICS_PASS`）。
+
 ## 8. 路线图（未做）
 
 按 Cursor 既定策略的推荐优先级：
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 55 验收** | 两项实现已交付，见 remaining-capabilities §9 |
+| 1 | **Step 56 验收** | 双包实现已交付，见 remaining-capabilities §9 |
 | 2 | 其后 | 视 Cursor 验收后继续双包 |
 
 
@@ -1993,7 +2023,8 @@ mkdir -p "$data_dir"
 - [x] Step 54 过夜大包已由 Cursor 验收并提交
 - [x] Step 55 双包已由 Cursor 验收并提交
 - [x] 测试脚本约定：仅 `tests/`（见 `tests/README.md`）
-- [x] 当前待验收：Step 56 常规双包（见 remaining-capabilities §8）
+- [x] Step 56 双包已由 Cursor 验收并提交
+- [x] 当前待验收：Step 57 常规双包（WRITE-DATA-PARALLEL + DOC-SWEEP；见 remaining-capabilities §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

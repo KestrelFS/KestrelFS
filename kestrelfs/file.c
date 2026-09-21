@@ -80,6 +80,21 @@ struct kestrelfs_orphan_retry {
 
 static DEFINE_MUTEX(kestrelfs_orphan_retry_lock);
 static LIST_HEAD(kestrelfs_orphan_retries);
+static unsigned long kestrelfs_orphan_retry_queued;
+module_param_named(orphan_retry_queued,
+		   kestrelfs_orphan_retry_queued, ulong, 0444);
+MODULE_PARM_DESC(orphan_retry_queued,
+		 "Kernel-proven final-close retries queued since module load");
+static unsigned long kestrelfs_orphan_retry_acked;
+module_param_named(orphan_retry_acked,
+		   kestrelfs_orphan_retry_acked, ulong, 0444);
+MODULE_PARM_DESC(orphan_retry_acked,
+		 "Orphan retry proofs durably accepted by the daemon");
+static unsigned long kestrelfs_orphan_retry_pending;
+module_param_named(orphan_retry_pending,
+		   kestrelfs_orphan_retry_pending, ulong, 0444);
+MODULE_PARM_DESC(orphan_retry_pending,
+		 "Kernel orphan retry proofs not yet durably accepted");
 
 /* A retry record is created only after the last local open handle reached
  * zero and FINALIZE_ORPHAN failed. It therefore carries stronger evidence
@@ -106,7 +121,19 @@ void kestrelfs_orphan_retry_add(u64 inode_id)
 			return;
 		}
 	}
+	/* An unacknowledged proof exists only in this module. Pin it until the
+	 * daemon confirms an fsync+rename handoff into its data-dir queue.
+	 */
+	if (!try_module_get(THIS_MODULE)) {
+		mutex_unlock(&kestrelfs_orphan_retry_lock);
+		kfree(candidate);
+		pr_err("kestrelfs: cannot pin module for orphan retry inode=%llu\n",
+		       inode_id);
+		return;
+	}
 	list_add_tail(&candidate->link, &kestrelfs_orphan_retries);
+	kestrelfs_orphan_retry_queued++;
+	kestrelfs_orphan_retry_pending++;
 	mutex_unlock(&kestrelfs_orphan_retry_lock);
 	pr_warn("kestrelfs: queued failed final-close orphan inode=%llu\n", inode_id);
 }
@@ -136,8 +163,11 @@ int kestrelfs_orphan_retry_ack(u64 inode_id)
 	list_for_each_entry_safe(entry, tmp, &kestrelfs_orphan_retries, link) {
 		if (entry->inode_id == inode_id) {
 			list_del(&entry->link);
+			kestrelfs_orphan_retry_acked++;
+			kestrelfs_orphan_retry_pending--;
 			mutex_unlock(&kestrelfs_orphan_retry_lock);
 			kfree(entry);
+			module_put(THIS_MODULE);
 			return 0;
 		}
 	}
@@ -151,6 +181,9 @@ void kestrelfs_orphan_retry_cleanup(void)
 	struct kestrelfs_orphan_retry *tmp;
 
 	mutex_lock(&kestrelfs_orphan_retry_lock);
+	if (!list_empty(&kestrelfs_orphan_retries))
+		pr_warn("kestrelfs: forced unload discarding %lu unacknowledged orphan proofs\n",
+			kestrelfs_orphan_retry_pending);
 	list_for_each_entry_safe(entry, tmp, &kestrelfs_orphan_retries, link) {
 		list_del(&entry->link);
 		kfree(entry);

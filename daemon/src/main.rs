@@ -58,6 +58,7 @@ mod meta_persist;
 mod meta_redis;
 mod object_store;
 mod object_store_s3;
+mod orphan_retry;
 mod ring;
 
 // Keep the storage model's validation limit pinned to the wire contract.
@@ -70,6 +71,7 @@ use fs_model::{Inode, Slice};
 use gc_worker::{DeleteCompletion, GcScheduler, GcWorker};
 use meta::{CoherenceProbe, MetaError, MetaStore};
 use object_store::ObjectStore;
+use orphan_retry::DurableOrphanRetries;
 use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
@@ -349,6 +351,7 @@ fn main() -> io::Result<()> {
         };
         (obj_store, meta_store)
     };
+    let mut orphan_retries = DurableOrphanRetries::open(&args.data_dir)?;
 
     // Seed the block data for remote.txt's single Slice (see
     // meta::REMOTE_TXT_SEED_SLICE_ID). MemStore already created the
@@ -390,6 +393,7 @@ fn main() -> io::Result<()> {
         &dev,
         &store,
         &gc_scheduler,
+        &mut orphan_retries,
     ));
     runtime.block_on(schedule_pending_garbage(
         "startup",
@@ -405,6 +409,7 @@ fn main() -> io::Result<()> {
         &store,
         &object_store,
         &mut gc_worker,
+        &mut orphan_retries,
     )
 }
 
@@ -422,6 +427,7 @@ fn event_loop(
     store: &Arc<dyn MetaStore>,
     object_store: &Arc<dyn ObjectStore>,
     gc_worker: &mut GcWorker,
+    orphan_retries: &mut DurableOrphanRetries,
 ) -> io::Result<()> {
     let notification_fd = store.coherence_notification_fd();
     let mut pfds = [
@@ -554,6 +560,7 @@ fn event_loop(
                 dev,
                 store,
                 &gc_worker.scheduler(),
+                orphan_retries,
             ));
             orphan_sweep_at = Instant::now() + ORPHAN_SWEEP_INTERVAL;
         }
@@ -1582,40 +1589,42 @@ async fn schedule_pending_garbage(
 }
 
 /// Replays only final-close failures recorded by the kernel after its local
-/// open-handle count reached zero. Peek/ack makes the queue crash-safe across
-/// daemon restarts while the module stays loaded; no session-expiry guess is
-/// accepted as open-reference evidence.
+/// open-handle count reached zero. Existing durable proofs are finalized first;
+/// new kernel proofs are then persisted and only afterwards acknowledged. The
+/// kernel pins its module until that acknowledgement, closing the rmmod window.
+/// No session-expiry guess is accepted as open-reference evidence.
 async fn run_orphan_sweep(
     source: &str,
     dev: &KestrelDevice,
     store: &Arc<dyn MetaStore>,
     scheduler: &GcScheduler,
+    durable: &mut DurableOrphanRetries,
 ) {
     let mut reclaimed = 0_usize;
-    for _ in 0..64 {
-        let inode = match dev.peek_orphan_retry() {
-            Ok(Some(inode)) => inode,
-            Ok(None) => break,
-            Err(error) => {
-                eprintln!("kestrelfs-daemon: ORPHAN-SWEEP source={source} peek failed: {error}");
-                break;
-            }
-        };
+    for inode in durable.snapshot().into_iter().take(64) {
         let garbage = match store.finalize_orphan(inode).await {
             Ok(garbage) => garbage,
             Err(MetaError::NotFound) => Vec::new(),
             Err(error) => {
                 eprintln!(
-                    "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} retained for retry: {error}"
+                    "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} durable proof retained: {error}"
                 );
-                break;
+                continue;
             }
         };
         if let Err(error) = dev.acknowledge_orphan_retry(inode) {
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                eprintln!(
+                    "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} kernel ack failed: {error}"
+                );
+                continue;
+            }
+        }
+        if let Err(error) = durable.remove(inode) {
             eprintln!(
-                "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} ack failed: {error}"
+                "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} durable remove failed: {error}"
             );
-            break;
+            continue;
         }
         reclaimed += 1;
         let scheduled = scheduler.schedule("orphan-sweep", garbage);
@@ -1626,9 +1635,39 @@ async fn run_orphan_sweep(
             );
         }
     }
+
+    let mut persisted = 0_usize;
+    for _ in 0..64 {
+        let inode = match dev.peek_orphan_retry() {
+            Ok(Some(inode)) => inode,
+            Ok(None) => break,
+            Err(error) => {
+                eprintln!("kestrelfs-daemon: ORPHAN-SWEEP source={source} peek failed: {error}");
+                break;
+            }
+        };
+        if let Err(error) = durable.record(inode) {
+            eprintln!(
+                "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} persist failed; kernel proof retained: {error}"
+            );
+            break;
+        }
+        if let Err(error) = dev.acknowledge_orphan_retry(inode) {
+            eprintln!(
+                "kestrelfs-daemon: ORPHAN-SWEEP source={source} inode={inode} ack after persist failed: {error}"
+            );
+            break;
+        }
+        persisted += 1;
+    }
     if reclaimed != 0 {
         println!(
-            "kestrelfs-daemon: ORPHAN-SWEEP source={source} reclaimed={reclaimed} proof=kernel-final-close"
+            "kestrelfs-daemon: ORPHAN-SWEEP source={source} reclaimed={reclaimed} proof=durable-kernel-final-close"
+        );
+    }
+    if persisted != 0 {
+        println!(
+            "kestrelfs-daemon: ORPHAN-SWEEP source={source} persisted={persisted} proof=kernel-final-close"
         );
     }
 }

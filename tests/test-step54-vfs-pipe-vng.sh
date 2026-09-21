@@ -25,7 +25,8 @@ redis_cmd() {
 }
 
 object_count() {
-	find "$data_dir" -type f ! -name daemon.log | wc -l
+	find "$data_dir" -type f ! -name daemon.log \
+		! -name .orphan-retries-v1.json | wc -l
 }
 
 wait_for_count() {
@@ -153,7 +154,7 @@ kill -STOP "$daemon_pid"
 exec 9>&- || true
 kill -CONT "$daemon_pid"
 wait_for_count $((retry_count - 1))
-wait_for_log 'ORPHAN-SWEEP source=periodic reclaimed=1 proof=kernel-final-close'
+wait_for_log 'ORPHAN-SWEEP source=periodic reclaimed=1 proof=durable-kernel-final-close'
 echo STEP54_ORPHAN_SWEEP_RETRY_PASS
 
 dmesg >"$data_dir/dmesg.log"

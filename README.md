@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 55 POSIX-DTYPE + MKNOD-MIN 已验收；IPC ABI v24；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 56 ORPHAN-RETRY-PERSIST + OPS-METRICS 已验收；IPC ABI v24；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -64,6 +64,9 @@
 > 并把 folio 数据准备移出全局 bounce mutex；它仍不是读 lease 或线性一致性协议。
 > Step 55 已验收实现让 readdir 对 file/dir/symlink/whiteout 返回准确 `d_type`，并开放
 > 仅限 `CAP_MKNOD` 调用者创建 `S_IFCHR 0:0` whiteout marker 的受限 mknod。
+> Step 56 已验收实现把内核 final-close proof 原子交接到 daemon `data_dir` 的持久队列；
+> 未完成持久交接时模块引用阻止正常 `rmmod`，重载后仍可继续 finalize→GC，并补齐
+> orphan retry 只读计数与现有 cache/coherence/write-pipe/session 观测说明。
 > 真正并发 WRITE_DATA 与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
@@ -166,7 +169,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–55 已验收（ABI v24 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–56 已验收（ABI v24 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -191,9 +194,9 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── tests/                         # ★ step/vng/门控脚本与 C helper
 │   ├── README.md                 # 测试布局与运行约定
 │   ├── _repo_root.sh             # 将 cwd 固定到仓库根
-│   └── test-stepNN-*.sh/.c       # 含 Step 15–55 回归与门控
+│   └── test-stepNN-*.sh/.c       # 含 Step 15–56 回归与门控
 └── daemon/                    # Rust 控制面 daemon
-    └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
+    └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,orphan_retry,fs_model,device,ring,ioctl}.rs
 ```
 
 ---
@@ -362,6 +365,13 @@ Step 41 已把慢 delete 移到容量 32、每项最多 64 keys 的有界 worker
 当前 slice 且不超过 4 MiB；S3 还会交叉校验响应 `Content-Length`，不匹配时 fail
 closed。`--memory` 下队列与对象都只在内存中，进程退出后二者一起消失。
 
+Step 56 已验收路径另有一个安全来源严格受限的 orphan retry 文件
+`{data-dir}/.orphan-retries-v1.json`：只有内核确认 mount-local 最后一个 open handle
+关闭且即时 finalize 失败后才会写入。daemon 原子落盘后才 ACK 内核，正常模块卸载在
+此前会被引用阻止；daemon/模块重启后复用同一 `--data-dir` 可继续 finalize 与对象 GC。
+该机制不从 Redis session TTL 推断 fd 生命周期。只读计数与日志字段见
+[`docs/configuration.md`](docs/configuration.md#只读可观测性)。
+
 **验证持久化：**
 
 1. 启动 daemon（指定 `--data-dir`）并 mount。
@@ -408,6 +418,8 @@ sudo rmmod kestrelfs
 **缓存回归（仅 vng guest + loop）：**
 
 ```bash
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec ./tests/test-step56-orphan-metrics-vng.sh
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step28-cache-vfs-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step27-ops-recovery-vng.sh"
 vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"

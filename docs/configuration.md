@@ -28,6 +28,8 @@ descriptor="v1;meta=file:$data_dir/meta.json;objects=local:$data_dir"
 cache_namespace=$(printf '%s' "$descriptor" | sha256sum | awk '{print $1}')
 ```
 
+## 只读可观测性
+
 下列同名 `0444` 参数是只读运行期计数，模块加载时从 0 开始，仅供诊断，**不是稳定
 用户 ABI**：
 
@@ -44,8 +46,26 @@ cache_namespace=$(printf '%s' "$descriptor" | sha256sum | awk '{print $1}')
 | `cache_coherence_inode_batches` / `cache_coherence_inode_entries` | 有界 inode 失效批次 / 退休 entry 数 |
 | `write_pipe_staged_bytes` / `write_pipe_submissions` | 在 bounce mutex 外预暂存的 folio 字节 / 随后提交的 WRITE_DATA chunk 数 |
 | `write_pipe_lock_wait_ns` / `write_pipe_lock_hold_ns` | 写回等待 / 持有全局 bounce mutex 的累计纳秒数 |
+| `orphan_retry_queued` / `orphan_retry_acked` | 本次模块加载后产生的内核 final-close proof / 已由 daemon 持久接收的累计数 |
+| `orphan_retry_pending` | 尚未由 daemon 持久接收的 proof 数；非零时模块持有引用，正常 `rmmod` 会被拒绝 |
 
 计数路径为 `/sys/module/kestrelfs/parameters/<name>`。
+
+daemon 目前以结构化文本日志提供其余最小观测，不提供 Prometheus/APM endpoint：
+
+| 日志前缀/字段 | 含义 |
+|---|---|
+| `ORPHAN-SWEEP ... persisted=N` / `reclaimed=N` | kernel proof 已原子写入 data-dir 队列 / 持久 proof 已完成 finalize |
+| `DIST-OBJECT ... totals attempted=... deleted=... failures=...` | 本进程 ObjectStore GC 累计尝试、成功与失败 |
+| `coherence revision A -> B; invalidated N dirty inode caches` | Redis durable revision 的细粒度 inode 失效 |
+| `writer session registered ... ttl_ms=...` | Redis writer session 已注册；日志只含随机 session id，不含 URL/凭据 |
+| `writer session was fenced or expired` / `heartbeat failed` | writer 已 fail closed / 心跳暂时失败并重试 |
+
+`orphan_retry_pending` 是安全相关 gauge：它不为零时不要强制卸载模块。daemon 把 proof
+写入 `{data-dir}/.orphan-retries-v1.json`，执行 temp-file `fsync`、原子 rename 与目录
+`fsync` 后才 ACK 内核；部署必须在 daemon 重启时复用同一 `--data-dir`。状态文件损坏
+或版本未知会使 daemon 启动失败（fail closed），不会清空后继续运行。仍打开的 inode
+不会进入该文件；Redis session TTL 也不会被当作 fd 已关闭的证据。
 
 ## 挂载参数
 
@@ -62,7 +82,7 @@ mount -t kestrelfs none /mnt/kestrelfs
 
 | 参数 | 默认值 | 含义与约束 |
 |---|---:|---|
-| `--data-dir <PATH>` | `./.kestrelfs-data` | FileMetaStore 的 `meta.json` 与 LocalFsObjectStore 根目录；目录不存在时创建。|
+| `--data-dir <PATH>` | `./.kestrelfs-data` | FileMetaStore 的 `meta.json`、LocalFsObjectStore 根目录及 `.orphan-retries-v1.json` 运维状态；目录不存在时创建。Redis/S3 组合也必须保留同一 data-dir 以恢复 orphan proof。|
 | `--memory` | 关闭 | MetaStore 与 ObjectStore 均置于内存，进程退出即丢失；与 `--meta`、`--redis-prefix`、`--redis-ca-cert`、`--objects`、`--s3-endpoint` 冲突。|
 | `--meta <REDIS_URL>` | 未设置 | 使用 RedisMetaStore；接受明文 `redis://` 或 TLS `rediss://`，未设置则使用 `{data-dir}/meta.json`。URL 可含凭据，daemon 不打印它。|
 | `--redis-prefix <PREFIX>` | `kestrelfs` | Redis v2 key namespace；要求同时给出 `--meta`。|

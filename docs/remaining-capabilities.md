@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-21，Cursor（Step 55 已验收；测试迁入 `tests/`；发布 Step 56 常规双包）
+> 最后更新：2026-09-21，Codex（Step 56 双包实现完成，待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -31,14 +31,14 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–31 | … + POSIX-DTYPE/MKNOD | Step 24–55 | **ACCEPTED** | d_type + 受限 mknod 已落地 |
-| 32 | ORPHAN-RETRY-PERSIST + OPS-METRICS | Step 56（双包） | **DECIDED** | 补齐 rmmod 丢队列缺口 + 可观测性整理 |
+| 32 | ORPHAN-RETRY-PERSIST + OPS-METRICS | Step 56（双包） | **REVIEW** | daemon data-dir 持久 proof + rmmod guard；观测项与最小计数已交付 |
 | — | 其它 | — | PROPOSED | 视需要并入后续双包 |
 
 Codex **只实现 §8 当前提示词**。
 
 ## 3–4. 摘要
 
-Step 55 `ACCEPTED`。下一步见 §8。
+Step 55 `ACCEPTED`；Step 56 `REVIEW`，实现与自检见 §9，等待 Cursor 验收。
 
 ## 5. 运维、测试与文档
 
@@ -54,6 +54,8 @@ Step 55 `ACCEPTED`。下一步见 §8。
 | 2026-09-21 | Cursor | POSIX-DTYPE + MKNOD-MIN | Step 55 验收 | **ACCEPTED**；206 tests + vng PASS |
 | 2026-09-21 | Cursor | TEST-LAYOUT | 测试脚本迁入 `tests/` | **ACCEPTED**（Cursor 随验收提交）；站立规则写入 HANDOFF/`tests/README.md` |
 | 2026-09-21 | Cursor | ORPHAN-RETRY-PERSIST + OPS-METRICS | 选定 Step 56 | **DECIDED**；见 §8 |
+| 2026-09-21 | Codex | ORPHAN-RETRY-PERSIST + OPS-METRICS | Step 56 开工 | **IMPLEMENTING**；daemon 持久 retry 集合 + 内核模块引用保护，补齐最小关键计数与观测文档 |
+| 2026-09-21 | Codex | ORPHAN-RETRY-PERSIST + OPS-METRICS | 实现与自检完成 | **REVIEW**；208 tests，Step 56/54/55 vng PASS；ABI v24 / format v4 不变 |
 
 ## 7. 不应顺手扩大
 
@@ -115,6 +117,28 @@ tests/README.md。HEAD 应含 Step 55（ABI v24）且测试已在 tests/。
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-21 — Step 56 ORPHAN-RETRY-PERSIST + OPS-METRICS（Codex REVIEW）
+
+- A / 持久 retry：选择 daemon `data_dir` versioned 集合，而不占用或升级 cache 盘格式。
+  内核只在 mount-local `open_handles==0` 且即时 `FINALIZE_ORPHAN` 失败时产生 proof；每个
+  未 ACK proof 持有模块引用，使正常 `rmmod` 在安全交接前失败。daemon 先用 temp-file
+  fsync → rename → 目录 fsync 写入 `.orphan-retries-v1.json`，再 ACK 内核；启动和每秒
+  先回放已有持久 proof，finalize 成功或 NotFound 后移除记录，并复用既有 durable GC。
+  状态损坏/版本未知 fail closed；没有用 Redis session TTL 推断 fd 生命周期。
+- B / 运维观测：新增只读 `orphan_retry_queued`、`orphan_retry_acked` 与
+  `orphan_retry_pending`；`docs/configuration.md` 独立整理 cache hit/async、LRU/CRC、
+  coherence inode batch/entry、write_pipe、orphan、ObjectStore GC 与 Redis writer-session
+  日志。没有引入 Prometheus/APM。
+- 测试：`cargo test` **208 passed**；clippy `-D warnings`、`make -C kestrelfs` 零警告。
+  `tests/test-step56-orphan-metrics-vng.sh` 输出 open-skip、rmmod-guard、queued/acked 各
+  增长 1、reload-GC 与 `STEP56_DOUBLE_PACK_PASS`。回归
+  `STEP54_VFS_PIPE_PASS`（umount 207 ms）及 `STEP55_POSIX_DTYPE_MKNOD_PASS`
+  （umount 63 ms）。所有模块、loop 与 mount 操作仅在 vng guest。
+- ABI/format：没有新增或改变 opcode/ioctl/layout；IPC ABI **v24**、cache format **v4**。
+- 风险/边界：重启必须复用同一 `--data-dir`；目录不可写时 daemon 不 ACK，模块保持
+  pinned。强制卸载可绕过保护并造成泄漏；跨 mount 全局 open-ref 仍未聚合。未做自动
+  wipe、完整监控栈、通用 mknod 或其它扩包。
 
 ### 2026-09-21 — Step 55 POSIX-DTYPE + MKNOD-MIN（Cursor ACCEPTED）
 
