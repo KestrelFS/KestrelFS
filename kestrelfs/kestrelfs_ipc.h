@@ -604,8 +604,8 @@
 #define KESTRELFS_NAME_DATA_MAX		255
 
 /*
- * ABI v10 READDIR_DATA layout
- * ---------------------------
+ * ABI v10/v24 READDIR_DATA layout
+ * -------------------------------
  * REQUEST payload:
  *   offset 0, 8 bytes, little-endian u64: directory inode id.
  *   offset 8, 4 bytes, little-endian u32: first entry index.
@@ -616,11 +616,15 @@
  *   offset 4, 4 bytes, little-endian u32: encoded byte count in data_buffer.
  *
  * data_buffer contains entry_count adjacent variable-length records:
- *   little-endian u64 inode_id, little-endian u16 name_len, then name_len
- *   bytes of non-NUL-terminated name. Each name is at most 255 bytes. The
- * daemon packs as many complete records as fit; entry_count == 0 marks EOF.
+ *   offset 0, 8 bytes: little-endian u64 inode_id.
+ *   offset 8, 2 bytes: little-endian u16 name_len.
+ *   offset 10, 1 byte: Linux DT_* directory-entry type.
+ *   offset 11, 1 byte: reserved, must be zero.
+ *   offset 12, name_len bytes: non-NUL-terminated name.
+ * Each name is at most 255 bytes. The daemon packs as many complete records
+ * as fit; entry_count == 0 marks EOF.
  */
-#define KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE	10
+#define KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE	12
 
 /*
  * ABI v11 symbolic-link layouts
@@ -865,8 +869,11 @@ struct kestrelfs_ring_ctrl {
  *  23 - Phase 4 step 54: Added PEEK_ORPHAN_RETRY and ACK_ORPHAN_RETRY
  *       daemon ioctls. They expose only final-close failures proven by the
  *       kernel open-handle count; shared-memory/event layouts are unchanged.
+ *  24 - Step 55: READDIR_DATA records add d_type plus one reserved byte;
+ *       CREATE_DATA mode S_IFCHR is the metadata representation of the only
+ *       supported mknod target, Linux whiteout device 0:0.
  */
-#define KESTRELFS_ABI_VERSION		23
+#define KESTRELFS_ABI_VERSION		24
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -1043,6 +1050,8 @@ _Static_assert(KESTRELFS_NAME_DATA_MAX == KESTRELFS_RENAME_DATA_NAME_MAX,
 _Static_assert(KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE +
 		KESTRELFS_NAME_DATA_MAX <= KESTRELFS_DATA_BUFFER_SIZE,
 		"one maximum-length READDIR_DATA entry must fit in data_buffer");
+_Static_assert(KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE == 12,
+		"ABI v24 READDIR_DATA header must include dtype and reserved");
 
 _Static_assert(8 + 2 + 2 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"SYMLINK_DATA request fields overflow the event payload");

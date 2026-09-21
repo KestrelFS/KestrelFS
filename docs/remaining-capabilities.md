@@ -1,6 +1,6 @@
 # KestrelFS 剩余能力与决策同步
 
-> 最后更新：2026-09-21，Cursor（Step 54 已验收；发布 Step 55 **常规双包 ≈ 2×**）
+> 最后更新：2026-09-21，Codex（Step 55 常规双包实现完成，等待 Cursor 验收）
 >
 > 用途：供 Cursor 与 Codex 维护尚未完成的产品能力、优先级、方案决策、**当前可执行提示词**和验收结果。
 > 本文是规划与协作入口，不替代 `HANDOFF.md` 的已验收事实。发生冲突时，按
@@ -29,7 +29,7 @@
 | 顺序 | ID | 能力 | 当前状态 | 理由 |
 |---:|---|---|---|---|
 | 0–30 | … + OVERNIGHT MEGA | Step 24–54 | **ACCEPTED** | 过夜四项已落地 |
-| 31 | POSIX-DTYPE + MKNOD-MIN | Step 55（双包） | **DECIDED** | 补齐 readdir 类型与受限 whiteout mknod |
+| 31 | POSIX-DTYPE + MKNOD-MIN | Step 55（双包） | **REVIEW** | 两项实现与自检完成，见 §9 |
 | — | 其它 | — | PROPOSED | 视需要并入后续双包 |
 
 Codex **只实现 §8 当前提示词**。
@@ -47,7 +47,7 @@ Codex **只实现 §8 当前提示词**。
 
 ### Step 55 — POSIX-DTYPE + MKNOD-MIN（双包 ≈ 2×）
 
-- 状态：POSIX-DTYPE `DECIDED`；MKNOD-MIN `DECIDED`
+- 状态：POSIX-DTYPE `REVIEW`；MKNOD-MIN `REVIEW`
 - 目标 A：readdir 报告正确 `d_type`（不再一律 `DT_UNKNOWN`）
 - 目标 B：开放**受限** `mknod`：仅允许创建与 Step 50 whiteout 相同的 `S_IFCHR 0:0`
   marker（需 `CAP_MKNOD`）；拒绝其它设备节点
@@ -67,6 +67,8 @@ Codex **只实现 §8 当前提示词**。
 | 2026-09-21 | Codex | OVERNIGHT MEGA | Step 54 实现与自检完成 | **REVIEW**；见 §9 |
 | 2026-09-21 | Cursor | OVERNIGHT MEGA | Step 54 验收 | **ACCEPTED**；203 tests + Cursor LEASE/VFS_PIPE PASS |
 | 2026-09-21 | Cursor | POSIX-DTYPE + MKNOD-MIN | 选定 Step 55；体量回归常规双包 | **DECIDED**；见 §8 |
+| 2026-09-21 | Codex | POSIX-DTYPE + MKNOD-MIN | Step 55 两项开工 | **IMPLEMENTING**；严格按 §8 双包范围 |
+| 2026-09-21 | Codex | POSIX-DTYPE + MKNOD-MIN | Step 55 实现与自检完成 | **REVIEW**；见 §9 |
 
 ## 7. 不应顺手扩大
 
@@ -124,6 +126,33 @@ HEAD 应含 Step 54（ABI v23）。注意：§8 为常规双包（≈ 2×），�
 ```
 
 ## 9. 实现汇报日志
+
+### 2026-09-21 — Step 55 POSIX-DTYPE + MKNOD-MIN（Codex REVIEW）
+
+- A / POSIX-DTYPE：`READDIR_DATA` 条目从 10-byte header 扩为 12 bytes：
+  `inode_id@0`、`name_len@8`、Linux `DT_*@10`、zero reserved@11，名字从 offset 12
+  开始。MetaStore readdir 在同一 metadata snapshot 中返回 inode/name/mode，避免
+  Redis 每项额外 lookup 及类型竞态；daemon 将 regular/directory/symlink/whiteout
+  编为 `DT_REG/DT_DIR/DT_LNK/DT_CHR`，内核拒绝未知类型或非零 reserved。
+- B / MKNOD-MIN：目录 inode ops 新增 `.mknod`，显式要求 `CAP_MKNOD`，且只接受
+  `S_IFCHR` 与 `rdev=0:0`；block、FIFO 和其它字符设备均返回 `EOPNOTSUPP`。
+  合法请求复用 `CREATE_DATA` 的既有 mode 字段，不新增 opcode；daemon/MetaStore 只将
+  精确 `S_IFCHR` 建成 mode-000、size-0、nlink-1 whiteout marker。Mem/File/Redis 均
+  复用原子 create 持久化路径，与 `RENAME_WHITEOUT` 的 inode 表示完全一致。
+- ABI/format：因 `READDIR_DATA` record layout 改变，IPC ABI **v23 → v24**；共享内存
+  总大小、opcode、ioctl 与 event payload 不变，cache format 保持 **v4**。
+- 测试：默认 `cargo test` **206 passed**；真实 Redis
+  `redis_url_gated_full_semantics_and_restart` **1 passed**；clippy
+  `--all-targets -- -D warnings` 通过；`make -C kestrelfs` 零警告。
+  vng+loop 输出 `STEP55_DTYPE_INITIAL_PASS`、`STEP55_DTYPE_RESTART_PASS`、
+  `STEP55_MKNOD_RESTRICT_PASS`、`STEP55_MKNOD_CAP_PASS`、
+  `STEP55_MKNOD_RESTART_PASS`、`STEP55_POSIX_DTYPE_MKNOD_PASS`（umount 56 ms）。
+  回归输出 `STEP50_DOUBLE_PACK_PASS`（含 WHITEOUT，umount 51 ms）与
+  `STEP54_VFS_PIPE_PASS`（umount 156 ms）。所有 insmod/mount/loop/cache 操作仅在
+  vng guest，未触碰宿主机模块、zvol 或挂载。
+- 风险与未做：`d_type` 只覆盖当前可持久化的四种 inode 类型，遇到损坏/未来未知
+  mode 会 `EPROTO/EIO` fail closed。mknod 权限位被规范化为与 rename whiteout 相同的
+  mode-000 marker；没有实现普通字符/块设备、FIFO、socket、udev 或设备 I/O。
 
 ### 2026-09-21 — Step 54 OVERNIGHT MEGA（Cursor ACCEPTED）
 

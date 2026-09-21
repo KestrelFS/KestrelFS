@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 54 OVERNIGHT MEGA 已验收；IPC ABI v23；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 55 POSIX-DTYPE + MKNOD-MIN 已验收；IPC ABI v24；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -62,6 +62,8 @@
 > 自动重连命令连接和 `rediss://` 自签 CA 路径。Step 54 已验收实现加入 TTL writer
 > session/fail-closed mutation、内核证明型 orphan retry、普通文件 splice/sendfile，
 > 并把 folio 数据准备移出全局 bounce mutex；它仍不是读 lease 或线性一致性协议。
+> Step 55 已验收实现让 readdir 对 file/dir/symlink/whiteout 返回准确 `d_type`，并开放
+> 仅限 `CAP_MKNOD` 调用者创建 `S_IFCHR 0:0` whiteout marker 的受限 mknod。
 > 真正并发 WRITE_DATA 与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
@@ -164,7 +166,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–54 已验收（ABI v23 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–55 已验收（ABI v24 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -179,54 +181,17 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v23）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v24）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
 ├── docs/configuration.md           # 模块/挂载/daemon 唯一权威配置表
 ├── docs/perf-baseline.md           # vng/loop 路径粗测方法与回归样本（非 SLA）
 ├── tools/kestrelfs-cache-admin.c    # v4 cache 离线诊断与双确认 metadata wipe
-├── test-step19-cache-vng.sh … test-step29-cache-evict-vng.sh
-├── test-step32-posix-core-vng.sh   # 硬链接、持久 nlink 与末引用 GC
-├── test-step33-posix-rename-vng.sh # NOREPLACE、持久化与 VFS 错误语义
-├── test-step33-renameat2.c         # renameat2 flags 测试辅助程序
-├── test-step34-posix-attr-vng.sh   # create/mkdir mode、目录 nlink 与重启恢复
-├── test-step34-posix-attr.c        # 原始 open/mkdir mode 测试辅助程序
-├── test-step35-cache-coherence-vng.sh # Redis revision→本地 cache 全失效
-├── test-step42-coherence-fine-vng.sh  # dirty inode 精细失效 + 全量回退
-├── test-step43-write-iter-vng.sh      # write/writev/pwritev/append/cache 失效
-├── test-step43-write-iter.c           # 向量写与部分布局测试辅助程序
-├── test-step44-fsync-vng.sh           # fsync/syncfs 与强杀 daemon 后重启验证
-├── test-step44-fsync.c                # 文件同步、离线拒绝和读回辅助程序
-├── test-step45-kernel-aops-vng.sh     # 读侧 folio/page cache 与写后清页 vng 回归
-├── test-step46-kernel-mmap-vng.sh     # 文件 mmap/COW/失效/共享写能力 vng 回归
-├── test-step46-kernel-mmap.c          # mmap 行为测试助手
-├── test-step47-kernel-locks-vng.sh    # 本地文件锁争用/等待/退出清理 vng 回归
-├── test-step47-kernel-locks.c         # flock/POSIX/OFD 锁测试助手
-├── test-step36-posix-lifecycle-vng.sh # open-unlink/cache/last-close GC
-├── test-step36-posix-lifecycle.c      # fd 生命周期阶段同步助手
-├── test-step37-posix-chmod-vng.sh     # 文件/目录 chmod、重启与 orphan 回归
-├── test-step37-posix-chmod.c          # open-unlink fchmod 测试助手
-├── test-step38-posix-exchange-vng.sh  # EXCHANGE、失败原子性、缓存与重启回归
-├── test-step39-posix-chown-vng.sh     # 文件/目录 chown、重启与 orphan 回归
-├── test-step39-posix-chown.c          # open-unlink fchown 测试助手
-├── test-step40-posix-utimes-vng.sh    # 文件/目录时间、重启与 orphan 回归
-├── test-step40-posix-utimes.c         # open-unlink futimens 测试助手
-├── test-step50-vng.sh                 # 可写 MAP_SHARED + WHITEOUT 双包回归
-├── test-step50-map-shared.c           # mmap 写、同步、COW 与重启测试助手
-├── test-step51-write-behind-vng.sh     # 延迟写回、显式同步、失败/重启回归
-├── test-step51-write-behind.c          # write-behind 时序与读回测试助手
-├── test-step52-dist-vng.sh              # 两个 vng guest 的 Redis+S3 数据面编排
-├── test-step52-dist-node-vng.sh         # 单个 DIST-IO guest 节点脚本（显式 insmod）
-├── test-step52-dist-io.c                # 跨节点 generation/fsync/可见性助手
-├── test-step52-perf-vng.sh              # write/page-cache/NVMe loop 粗测
-├── test-step52-perf.c                   # 定时与数据校验助手
-├── test-step53-dist-notify-vng.sh       # 双 vng Redis Pub/Sub 低延迟失效门控
-├── test-step53-redis-tls.sh              # rediss:// 自签 CA 与 TLS 代理门控
-├── test-step54-lease-vng.sh              # 双 vng Redis session fencing 门控
-├── test-step54-vfs-pipe-vng.sh           # orphan retry、splice 与写回预暂存
-├── test-step54-vfs.c                     # splice/sendfile 数据校验助手
-├── test-step28-cache-vfs.c           # preadv / iovec 边界验证辅助程序
+├── tests/                         # ★ step/vng/门控脚本与 C helper
+│   ├── README.md                 # 测试布局与运行约定
+│   ├── _repo_root.sh             # 将 cwd 固定到仓库根
+│   └── test-stepNN-*.sh/.c       # 含 Step 15–55 回归与门控
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,fs_model,device,ring,ioctl}.rs
 ```
@@ -508,7 +473,8 @@ Step 34 支持 create/mkdir mode 与
   引用也未聚合。Step 37/39 已实现文件/目录
   持久 chmod 与 chown/fchown。Step 40 已实现显式 atime/mtime，当前
   仅有秒级精度，自动读 atime 与 ctime 不持久化；mode/owner/time 与 size 的单事务仍未实现。
-  whiteout 是 rename 内部生成的 0:0 字符设备 marker，不开放通用 `mknod`；
+  Step 55 已验收路径允许具备 `CAP_MKNOD` 的调用者显式创建同一 `S_IFCHR 0:0`
+  marker，readdir 对它报告 `DT_CHR`；仍不开放其它字符/块设备、FIFO/socket 或 udev；
   symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。

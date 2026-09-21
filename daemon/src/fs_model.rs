@@ -119,6 +119,8 @@ pub type FileMode = u32;
 pub const S_IFDIR: FileMode = 0o040000;
 /// `S_IFREG` from `<linux/stat.h>` - regular file type bits.
 pub const S_IFREG: FileMode = 0o100000;
+/// File-type mask from `<linux/stat.h>`.
+pub const S_IFMT: FileMode = 0o170000;
 /// `S_IFLNK` from `<linux/stat.h>` - symbolic-link file type bits.
 pub const S_IFLNK: FileMode = 0o120000;
 /// `S_IFCHR` from `<linux/stat.h>` - character-device file type bits.  The

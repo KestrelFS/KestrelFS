@@ -222,7 +222,7 @@ impl MetaStore for FileMetaStore {
         Ok(garbage)
     }
 
-    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
+    async fn readdir(&self, inode: u64) -> Result<Vec<crate::meta::DirectoryEntry>> {
         self.mem.readdir(inode).await
     }
 
@@ -394,6 +394,32 @@ mod tests {
         let inode = store2.getattr(found).await.unwrap();
         assert_eq!(inode.mode & 0o170000, S_IFREG);  // Check only file type bits
         assert_eq!(inode.size, 0);
+    }
+
+    #[tokio::test]
+    async fn mknod_whiteout_and_readdir_type_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let marker;
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            marker = store
+                .create(ROOT_INODE, "mknod-whiteout", S_IFCHR)
+                .await
+                .unwrap();
+        }
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        assert_eq!(
+            restored.lookup(ROOT_INODE, "mknod-whiteout").await.unwrap(),
+            marker
+        );
+        assert_eq!(restored.getattr(marker).await.unwrap().mode, S_IFCHR);
+        assert!(restored.readdir(ROOT_INODE).await.unwrap().iter().any(|entry| {
+            entry.inode_id == marker
+                && entry.name == "mknod-whiteout"
+                && entry.mode == S_IFCHR
+        }));
     }
 
     #[tokio::test]
@@ -638,7 +664,11 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .any(|(ino, name)| *ino == marker && name == "whiteout-old"));
+            .any(|entry| {
+                entry.inode_id == marker
+                    && entry.name == "whiteout-old"
+                    && entry.mode == S_IFCHR
+            }));
     }
 
     #[tokio::test]

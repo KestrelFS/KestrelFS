@@ -33,7 +33,7 @@ page-cache 热读 ~2153 MiB/s、daemon-free NVMe/loop hit ~178 MiB/s（256 async
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec "$PWD/test-step52-perf-vng.sh"
+  --exec "$PWD/tests/test-step52-perf-vng.sh"
 ```
 
 脚本只在 guest 内创建 loop、执行 `insmod` 和 mount；daemon 使用 PID 隔离的
@@ -42,7 +42,7 @@ fd，避免 daemon 停止后路径 LOOKUP 把元数据 IPC 错误混进 data-cac
 
 ## Step 52 两节点数据面配方
 
-`test-step52-dist-vng.sh` 在宿主只负责启动和协调两个并行 vng guest。每个 guest
+`tests/test-step52-dist-vng.sh` 在宿主只负责启动和协调两个并行 vng guest。每个 guest
 各有独立 daemon、挂载、data-dir 和 loop cache，但共享随机 Redis prefix 与 S3
 prefix。Redis、S3 凭据只经环境变量传入，不写入仓库或 namespace digest。
 
@@ -53,7 +53,7 @@ export S3_BUCKET='EXISTING_TEST_BUCKET'
 export AWS_ACCESS_KEY_ID='...'
 export AWS_SECRET_ACCESS_KEY='...'
 export AWS_REGION='us-east-1'
-./test-step52-dist-vng.sh
+./tests/test-step52-dist-vng.sh
 ```
 
 测试顺序是：A 写入版本 1 并 fsync；B 打开同一 inode、读入 page cache/NVMe cache；

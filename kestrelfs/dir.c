@@ -314,6 +314,57 @@ static int kestrelfs_inode_create(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/* KestrelFS intentionally exposes only Linux's whiteout representation via
+ * mknod: a metadata-only S_IFCHR inode with device number 0:0. Arbitrary
+ * character/block devices, FIFOs, and sockets are outside this filesystem's
+ * object model and fail before any metadata mutation is sent.
+ */
+static int kestrelfs_inode_mknod(struct mnt_idmap *idmap,
+				 struct inode *dir, struct dentry *dentry,
+				 umode_t mode, dev_t rdev)
+{
+	struct kestrelfs_event resp = { 0 };
+	struct inode *inode;
+	size_t name_len = dentry->d_name.len;
+	u64 new_ino;
+	u64 size;
+	u32 resp_mode;
+	u32 uid;
+	u32 gid;
+	u32 nlink;
+	int ret;
+
+	if (!capable(CAP_MKNOD))
+		return -EPERM;
+	if (!S_ISCHR(mode) || rdev != WHITEOUT_DEV)
+		return -EOPNOTSUPP;
+	if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX)
+		return -ENAMETOOLONG;
+
+	ret = kestrelfs_name_data_call(KESTRELFS_OP_CREATE_DATA,
+				      dir->i_ino, S_IFCHR,
+				      dentry->d_name.name, name_len, &resp);
+	if (ret)
+		return ret;
+
+	new_ino = get_unaligned_le64(&resp.payload[0]);
+	size = get_unaligned_le64(&resp.payload[8]);
+	resp_mode = get_unaligned_le32(&resp.payload[16]);
+	uid = get_unaligned_le32(&resp.payload[20]);
+	gid = get_unaligned_le32(&resp.payload[24]);
+	nlink = get_unaligned_le32(&resp.payload[28]);
+	if (resp_mode != S_IFCHR || size != 0)
+		return -EPROTO;
+
+	inode = kestrelfs_get_inode(dir->i_sb, new_ino, resp_mode, size, uid, gid,
+				    nlink);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	return 0;
+}
+
 /* Create a metadata-only symbolic link via the serialized bounce buffer. */
 static int kestrelfs_inode_symlink(struct mnt_idmap *idmap,
 				   struct inode *dir, struct dentry *dentry,
@@ -805,6 +856,7 @@ const struct inode_operations kestrelfs_dir_inode_operations = {
 	.setattr	= kestrelfs_inode_setattr,
 	.lookup		= kestrelfs_inode_lookup,
 	.create		= kestrelfs_inode_create,
+	.mknod		= kestrelfs_inode_mknod,
 	.link		= kestrelfs_inode_link,
 	.symlink	= kestrelfs_inode_symlink,
 	.mkdir		= kestrelfs_inode_mkdir,
@@ -883,6 +935,7 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 		for (i = 0; i < entry_count; i++) {
 			u64 ino;
 			u16 name_len;
+			u8 dtype;
 
 			if (cursor + KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE > data_len) {
 				ret = -EPROTO;
@@ -892,6 +945,13 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 			ino = get_unaligned_le64(&region->data_buffer[cursor]);
 			name_len = get_unaligned_le16(
 				&region->data_buffer[cursor + sizeof(u64)]);
+			dtype = region->data_buffer[cursor + 10];
+			if (region->data_buffer[cursor + 11] != 0 ||
+			    (dtype != DT_REG && dtype != DT_DIR &&
+			     dtype != DT_LNK && dtype != DT_CHR)) {
+				ret = -EPROTO;
+				goto out_unlock_batch;
+			}
 			cursor += KESTRELFS_READDIR_DATA_ENTRY_HEADER_SIZE;
 			if (name_len == 0 || name_len > KESTRELFS_NAME_DATA_MAX ||
 			    cursor + name_len > data_len) {
@@ -900,7 +960,7 @@ static int kestrelfs_readdir(struct file *file, struct dir_context *ctx)
 			}
 
 			if (!dir_emit(ctx, &region->data_buffer[cursor], name_len,
-				      ino, DT_UNKNOWN)) {
+				      ino, dtype)) {
 				mutex_unlock(&kestrelfs_data_ipc_lock);
 				return 0;
 			}

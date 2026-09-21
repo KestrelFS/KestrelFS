@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 54（OVERNIGHT MEGA）已验收；IPC ABI v23、cache format v4。下一步回归常规双包 Step 55，见 remaining-capabilities §8。
+> **最后更新**：Step 55（POSIX-DTYPE + MKNOD-MIN）已验收；IPC ABI v24、cache format v4。 测试脚本约定迁入 `tests/`（见 `tests/README.md`）。下一步见 remaining-capabilities §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 54 已验收；下一步常规双包 Step 55（见 remaining-capabilities §8） |
+| 当前阶段 | Step 55 已验收；测试统一放 `tests/`；下一步见 remaining-capabilities §8 |
 
 ---
 
@@ -158,6 +158,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── test-step54-lease-vng.sh # Step 54 双 vng Redis session fencing
 ├── test-step54-vfs-pipe-vng.sh # Step 54 orphan/splice/write prestage vng
 ├── test-step54-vfs.c # Step 54 splice/sendfile 数据校验助手
+├── tests/ # ★ step/vng/门控脚本与 C helper（见 tests/README.md）
 ├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
 ├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
 ├── QEMU-TEST.md                 # QEMU 测试说明
@@ -227,6 +228,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/分布式+测试 Step 52** | **双 daemon Redis+S3 数据面闭环 + vng 粗测基线** | **22（未变）** | **✅ 已验收** |
 | **Phase 4/分布式+运维 Step 53** | **Redis Pub/Sub revision 提示 + poll 对账；命令自动重连；rediss 私有 CA** | **22（未变）** | **✅ 已验收** |
 | **Phase 4/综合 Step 54** | **最小 Redis session fencing + kernel-proven orphan sweep + splice/sendfile + WRITE_DATA 预暂存** | **23** | **✅ 已验收** |
+| **Phase 4/POSIX Step 55** | **精确 READDIR_DATA d_type + 受限 persistent whiteout mknod** | **24** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -296,10 +298,12 @@ Cursor 对照代码、202 tests 与 `STEP53_DIST_NOTIFY_TWO_NODE_PASS` / `STEP53
 
 Cursor 对照代码、203 tests 与 `STEP54_LEASE_PASS` / `STEP54_VFS_PIPE_PASS` 确认 Step 54 已验收。 session fencing + orphan peek/ack + splice/sendfile + WRITE_DATA prestage；ABI **v23**；format **v4**。
 
-待验收：见 `docs/remaining-capabilities.md` §8（Step 55 常规双包）。
+Cursor 对照代码、206 tests 与 `STEP55_POSIX_DTYPE_MKNOD_PASS` 确认 Step 55 已验收。 精确 `d_type` + 受限 `mknod`；ABI **v24**；format **v4**。
 
+站立约定：step/vng/门控测试脚本与 C helper **只放 `tests/`**（见 `tests/README.md`）；仓库根禁止再新增 `test-*`。
 
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 23`（新增 kernel-proven orphan retry peek/ack ioctl）
+待验收：见 `docs/remaining-capabilities.md` §8（Step 56 常规双包）。
+> **当前 ABI**：`KESTRELFS_ABI_VERSION = 24`（`READDIR_DATA` 条目含 `DT_*`；受限 mknod 复用 CREATE_DATA）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -315,7 +319,7 @@ Cursor 对照代码、203 tests 与 `STEP54_LEASE_PASS` / `STEP54_VFS_PIPE_PASS`
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 23`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 24`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -343,6 +347,9 @@ Cursor 对照代码、203 tests 与 `STEP54_LEASE_PASS` / `STEP54_VFS_PIPE_PASS`
     payload/opcode 不变，metadata 可返回持久 `S_IFCHR` 0:0 whiteout inode
 23. Phase 4/综合 Step 54：新增 `PEEK_ORPHAN_RETRY` / `ACK_ORPHAN_RETRY`
     daemon ioctl；共享内存与 event/opcode 布局不变
+24. Phase 4/POSIX Step 55：`READDIR_DATA` entry header 从 10 扩为 12 bytes，新增
+    Linux `DT_*` 与 zero reserved；`CREATE_DATA` 的既有 mode 字段允许精确
+    `S_IFCHR` whiteout marker
 
 ### 5.4 已实现 Opcode 列表
 
@@ -404,7 +411,7 @@ Cursor 对照代码、203 tests 与 `STEP54_LEASE_PASS` / `STEP54_VFS_PIPE_PASS`
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
 | 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
 | 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
-| 10 | **whiteout 仅支持 rename 生成** | Step 50 让 `RENAME_DATA` 支持 `RENAME_WHITEOUT`：目标接收原源 inode，旧路径原子创建持久 `S_IFCHR` 0:0 marker；`WHITEOUT|NOREPLACE` 合法，`EXCHANGE` 与二者互斥，未知位返回 `-EINVAL`。内核要求 `CAP_MKNOD`，但尚未开放通用 `mknod`；readdir d_type 仍为 `DT_UNKNOWN`，lookup/stat 可识别 marker。 | `kestrelfs/dir.c`、`kestrelfs/inode.c`、`daemon/src/meta.rs` |
+| 10 | **mknod 仅开放 whiteout marker** | Step 50 的 `RENAME_WHITEOUT` 与 Step 55 受限 `.mknod` 都持久化 `S_IFCHR` 0:0 marker；mknod 要求 `CAP_MKNOD`，其它字符/块设备、FIFO/socket 均不支持。Step 55 readdir 对 file/dir/symlink/whiteout 分别返回 `DT_REG/DT_DIR/DT_LNK/DT_CHR`。 | `kestrelfs/dir.c`、`kestrelfs/inode.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
 | 13 | **write-behind 仍以同步 WRITE_DATA 为底层提交** | Step 51 让普通异步 write 标脏后先返回；Step 54 将 folio→私有 staging 的复制移到全局 bounce mutex 之外，不同 inode/folio 可并行准备，但 cache ordering、bounce memcpy 与同步 `WRITE_DATA` 仍串行。`O_SYNC`/`O_DSYNC`、fsync/fdatasync、MS_SYNC、truncate、close/VMA close 仍会等待 daemon；失败 redirty 并进入 mapping/superblock errseq。 | `kestrelfs/file.c`、`kestrelfs/inode.c` |
@@ -1888,6 +1895,30 @@ Cursor 验收自检（2026-09-21）：203 tests；clippy / make 零警告；Redi
 submissions=512、umount_ms=130）；`STEP54_LEASE_PASS`（heartbeat+notify latency 10 ms；
 fenced writer ESTALE）。
 
+### 7.49 Phase 4/POSIX Step 55 POSIX-DTYPE + MKNOD-MIN（已验收）
+
+ABI v24 将 `READDIR_DATA` 变长条目的 header 从 10 扩为 12 bytes：inode u64、
+name_len u16、Linux `DT_*` u8、zero reserved u8。MetaStore 在同一 snapshot 返回
+inode/name/mode，daemon 对普通文件、目录、符号链接、whiteout 分别编码
+`DT_REG/DT_DIR/DT_LNK/DT_CHR`；内核对未知 dtype 或非零 reserved fail closed。
+
+目录 inode ops 新增受限 `.mknod`：要求 `CAP_MKNOD`，只允许 `S_IFCHR` 且设备号
+0:0。合法请求复用 `CREATE_DATA`，持久化为与 `RENAME_WHITEOUT` 相同的 mode-000、
+size-0 marker；其它字符/块设备、FIFO/socket 均不支持。Mem/File/Redis 使用既有
+create mutation 与持久化路径。本步不改共享内存总大小、opcode/ioctl 或 cache 盘
+格式；IPC ABI **v24**，cache format **v4**。
+
+Codex 自检：206 tests；clippy / make 零警告；真实 Redis gate 1 passed；vng+loop
+输出 `STEP55_POSIX_DTYPE_MKNOD_PASS`（含初次/重启 d_type、限制矩阵、CAP_MKNOD，
+umount 56 ms）。回归 `STEP50_DOUBLE_PACK_PASS`（51 ms）和
+`STEP54_VFS_PIPE_PASS`（156 ms）。所有 insmod/mount/loop/cache 操作仅在 vng guest。
+
+
+
+Cursor 验收自检（2026-09-21）：206 tests；clippy / make 零警告；
+`redis_url_gated_full_semantics_and_restart` PASS；vng
+`STEP55_POSIX_DTYPE_MKNOD_PASS`（umount_ms=14，后迁入 `tests/` 复跑 umount 14）。
+同提交将根目录 `test-*` 迁入 `tests/`，并由 `_repo_root.sh` 固定仓库根 cwd。
 
 ## 8. 路线图（未做）
 
@@ -1895,9 +1926,8 @@ fenced writer ESTALE）。
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **常规双包** | 自 Step 55 起恢复 ≈ 2× 既往单步；见 remaining-capabilities §2 |
-| 2 | **Step 55 POSIX-DTYPE + MKNOD-MIN** | 见 remaining-capabilities §8 |
-| 3 | 其后 | 视需要继续双包 |
+| 1 | **Step 55 验收** | 两项实现已交付，见 remaining-capabilities §9 |
+| 2 | 其后 | 视 Cursor 验收后继续双包 |
 
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -1946,21 +1976,24 @@ mkdir -p "$data_dir"
 7. **内核编码**：不能有编译警告（`-Werror` 级别要求）。`make -C kestrelfs` 输出必须零 warning。
 8. **Rust 编码**：`cargo clippy --all-targets -- -D warnings` 必须通过。
 9. **vng 站立规则**：凡改动 `kestrelfs/*.c` 或依赖 mount 的行为，必须用 `vng --exec`（当前环境加 `--run`）或演进后的仓库脚本完成自动验证；人类 sudo 只作补充。
-10. **daemon 启动**：`--data-dir` 由用例自选；日志重定向到 `"$data_dir/daemon.log"`（或等价日志文件），禁止 `>/dev/null` 丢弃输出。
+10. **测试布局**：step/vng/门控脚本与 C helper **只写入 `tests/`**；source `tests/_repo_root.sh`；禁止在仓库根新增 `test-*`。详见 `tests/README.md`。
+11. **daemon 启动**：`--data-dir` 由用例自选；日志重定向到 `"$data_dir/daemon.log"`（或等价日志文件），禁止 `>/dev/null` 丢弃输出。
 
 ---
 
 ## 10. 交接检查清单
 
 - [x] Step 50 双包已由 Cursor 验收并提交
-- [x] IPC ABI = 23；cache format = v4
+- [x] IPC ABI = 24；cache format = v4
 - [x] Step 8–53 已验收状态已写清
 - [x] Step 51 双包已由 Cursor 验收并提交
 - [x] Step 52 双包已由 Cursor 验收并提交
 - [x] 权威配置表：`docs/configuration.md`
 - [x] Step 53 双包已由 Cursor 验收并提交
 - [x] Step 54 过夜大包已由 Cursor 验收并提交
-- [x] 当前待验收：Step 55 常规双包（POSIX-DTYPE + MKNOD-MIN；见 remaining-capabilities §8）
+- [x] Step 55 双包已由 Cursor 验收并提交
+- [x] 测试脚本约定：仅 `tests/`（见 `tests/README.md`）
+- [x] 当前待验收：Step 56 常规双包（见 remaining-capabilities §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

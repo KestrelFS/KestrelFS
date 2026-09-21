@@ -98,6 +98,10 @@ pub enum MetaError {
     /// A rename flag or flag combination is not supported.
     #[error("unsupported rename flags: {0:#x}")]
     UnsupportedRenameFlags(u32),
+    /// CREATE_DATA requested a special inode representation other than the
+    /// exact metadata-only S_IFCHR whiteout marker.
+    #[error("unsupported create node mode: {0:#o}")]
+    UnsupportedNodeType(u32),
     /// I/O error during persistence operations (FileMetaStore).
     #[error("I/O error")]
     Io,
@@ -120,6 +124,16 @@ pub const RENAME_EXCHANGE: u32 = 2;
 /// Atomically replace the source name with a persistent 0:0 character-device
 /// whiteout after moving its inode to the destination.
 pub const RENAME_WHITEOUT: u32 = 4;
+
+/// One authoritative directory entry. Carrying the child's mode in the same
+/// MetaStore snapshot lets READDIR_DATA report Linux d_type without an N+1
+/// lookup race or one backend round trip per name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub inode_id: u64,
+    pub name: String,
+    pub mode: u32,
+}
 
 /// Result of probing a shared MetaStore for cache-coherence changes after a
 /// previously observed durable revision.
@@ -254,8 +268,10 @@ pub trait MetaStore: Send + Sync {
         Ok(())
     }
 
-    /// Creates a new regular file under `parent`. The operation forces the
-    /// file type and preserves `mode & 0o7777`. Returns its inode id.
+    /// Creates a new regular file under `parent`, or the exact metadata-only
+    /// `S_IFCHR` whiteout marker used by restricted mknod. Regular creation
+    /// forces the file type and preserves `mode & 0o7777`; character mode with
+    /// any permission bits is rejected. Returns the new inode id.
     ///
     /// # Errors
     ///
@@ -298,15 +314,15 @@ pub trait MetaStore: Send + Sync {
 
     /// Lists directory entries for the given directory inode.
     ///
-    /// Returns a vector of `(child_inode_id, name)` pairs. The order is
-    /// unspecified (implementation-defined). An empty vector is valid for
-    /// an empty directory.
+    /// Returns child inode id, name, and authoritative mode from one metadata
+    /// snapshot. The order is unspecified (implementation-defined). An empty
+    /// vector is valid for an empty directory.
     ///
     /// # Errors
     ///
     /// - [`MetaError::NotFound`] if `inode` does not exist.
     /// - [`MetaError::NotADirectory`] if `inode` is not a directory.
-    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>>;
+    async fn readdir(&self, inode: u64) -> Result<Vec<DirectoryEntry>>;
 
     /// Creates a new directory under `parent`, forcing the directory type and
     /// preserving `mode & 0o7777`. The parent's directory link count grows by
@@ -854,6 +870,11 @@ impl MetaStore for MemStore {
                 name.len()
             )));
         }
+        if mode & crate::fs_model::S_IFMT == crate::fs_model::S_IFCHR
+            && mode != crate::fs_model::S_IFCHR
+        {
+            return Err(MetaError::UnsupportedNodeType(mode));
+        }
 
         let mut inner = self.inner.write().await;
 
@@ -873,7 +894,11 @@ impl MetaStore for MemStore {
         // Allocate new inode
         let new_inode_id = self.allocate_inode_id();
         let now = current_unix_time();
-        let new_inode = Inode::new_file_with_mode(new_inode_id, 0, now, mode);
+        let new_inode = if mode == crate::fs_model::S_IFCHR {
+            Inode::new_whiteout(new_inode_id, now)
+        } else {
+            Inode::new_file_with_mode(new_inode_id, 0, now, mode)
+        };
 
         // Insert inode and directory entry
         inner.inodes.insert(new_inode_id, new_inode);
@@ -1018,7 +1043,7 @@ impl MetaStore for MemStore {
         Ok(enqueue_confirmed_garbage(&mut inner, candidates))
     }
 
-    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
+    async fn readdir(&self, inode: u64) -> Result<Vec<DirectoryEntry>> {
         let inner = self.inner.read().await;
 
         // Check inode exists
@@ -1030,16 +1055,18 @@ impl MetaStore for MemStore {
         }
 
         // Get directory entries (may be empty for empty directory)
-        let entries = inner
-            .dir_entries
-            .get(&inode)
-            .map(|children| {
-                children
-                    .iter()
-                    .map(|(name, &child_inode)| (child_inode, name.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut entries = Vec::new();
+        if let Some(children) = inner.dir_entries.get(&inode) {
+            entries.reserve(children.len());
+            for (name, &child_inode) in children {
+                let child = inner.inodes.get(&child_inode).ok_or(MetaError::Io)?;
+                entries.push(DirectoryEntry {
+                    inode_id: child_inode,
+                    name: name.clone(),
+                    mode: child.mode,
+                });
+            }
+        }
 
         Ok(entries)
     }
@@ -1892,6 +1919,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_exact_whiteout_marker_and_report_readdir_mode() {
+        let store = MemStore::new();
+        let marker = store
+            .create(ROOT_INODE, "mknod-whiteout", S_IFCHR)
+            .await
+            .unwrap();
+
+        let attrs = store.getattr(marker).await.unwrap();
+        assert_eq!(attrs.mode, S_IFCHR);
+        assert_eq!(attrs.size, 0);
+        assert_eq!(attrs.nlink, 1);
+        assert!(store.readdir(ROOT_INODE).await.unwrap().iter().any(|entry| {
+            entry.inode_id == marker
+                && entry.name == "mknod-whiteout"
+                && entry.mode == S_IFCHR
+        }));
+
+        assert!(matches!(
+            store
+                .create(ROOT_INODE, "not-exact-whiteout", S_IFCHR | 0o600)
+                .await,
+            Err(MetaError::UnsupportedNodeType(_))
+        ));
+        assert!(matches!(
+            store.lookup(ROOT_INODE, "not-exact-whiteout").await,
+            Err(MetaError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
     async fn set_attrs_preserve_type_and_update_retained_orphan() {
         let store = MemStore::new();
         let file = store.create(ROOT_INODE, "chmod-file", 0o640).await.unwrap();
@@ -2511,8 +2568,10 @@ mod tests {
         assert_eq!(attrs.size, 0);
         assert_eq!(attrs.nlink, 1);
         let entries = store.readdir(ROOT_INODE).await.unwrap();
-        assert!(entries.iter().any(|(ino, name)| {
-            *ino == marker && name == "whiteout-source"
+        assert!(entries.iter().any(|entry| {
+            entry.inode_id == marker
+                && entry.name == "whiteout-source"
+                && entry.mode == S_IFCHR
         }));
     }
 

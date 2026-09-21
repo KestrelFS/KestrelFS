@@ -64,7 +64,7 @@ Step 48 在上述 rwsem 生命周期内，把 read hit 的 buffered
 `READ_DATA`/fill，允许同 inode 不同 folio 真正重叠提交 hit BIO。VFS
 `read_folio` 仍同步等待自己的 completion；metadata/index/journal/fill 写入仍用
 同步等待，未提供用户态异步接口或单请求多 BIO 流水线。IPC ABI v21、format v4
-未变；验证见 `test-step48-cache-async-vng.sh`。
+未变；验证见 `tests/test-step48-cache-async-vng.sh`。
 
 Step 49（已验收）让普通 write/writev 经 VFS folio 的
 `write_begin`/`write_end` 标 dirty；注册可写回 BDI 后，`writepages` 对每个
@@ -76,7 +76,7 @@ fsync。失败时 redirty folio、记录 mapping/superblock 错误并返回错�
 不宣称仅内存脏页已经持久。写入 dirtying 前后与实际提交前都按 inode 保守
 失效 NVMe 读索引；truncate 先写回再更改 size。Step 49 本身仍拒绝可写
 `MAP_SHARED`。
-IPC ABI v21、cache format v4 不变；测试见 `test-step49-cache-write-vng.sh`。
+IPC ABI v21、cache format v4 不变；测试见 `tests/test-step49-cache-write-vng.sh`。
 
 Step 50 在相同 write-through aops 上启用可写 `MAP_SHARED`。共享 VMA 的
 `page_mkwrite` 在 filemap 页首次变脏前检查挂载 page-cache epoch；若 Redis
@@ -87,7 +87,7 @@ writable VMA 的 close 也同步等待映射范围，防止普通 `munmap` 静�
 后者没有向 `munmap` 返回 errno 的 VFS 通道，因此失败会保留 mapping errseq/脏页，
 由后续 `fsync`/`flush` 暴露，而不会标记为已持久。IPC ABI 因同一步的 whiteout
 inode 类型变为 v22；缓存磁盘布局不变，仍为 format v4。测试见
-`test-step50-vng.sh` 与 `test-step50-map-shared.c`。
+`tests/test-step50-vng.sh` 与 `tests/test-step50-map-shared.c`。
 
 Step 51 将普通 buffered write 从 write-through 改为 write-behind：
 `write_iter` 在 folio 成功标脏后不再主动 `filemap_write_and_wait()`，由内核 BDI
@@ -103,7 +103,7 @@ flusher、内存回收或显式同步路径调用既有 `writepages` → `WRITE_
 静默丢弃本地延迟写。这里复用内核通用 flusher，并未增加异步 WRITE_DATA opcode
 或自有线程。
 IPC ABI 仍为 v22，cache format 仍为 v4；验证见
-`test-step51-write-behind-vng.sh`。
+`tests/test-step51-write-behind-vng.sh`。
 
 Step 52 没有改变数据路径或一致性协议，而是用两个并行 vng guest 验证现有最小
 多节点闭环。两个节点各有独立 daemon、挂载、page cache 与 loop cache，共享同一
@@ -376,7 +376,7 @@ mutation 会等待慢 reader，也没有 per-entry refcount/RCU。
 
 ## Step 22 vng 验证与粗测
 
-`test-step22-cache-vng.sh` 只在 vng guest 内创建 loop、加载模块和挂载，daemon
+`tests/test-step22-cache-vng.sh` 只在 vng guest 内创建 loop、加载模块和挂载，daemon
 使用按 PID 隔离的 data-dir 并写 `daemon.log`。辅助程序用 4 KiB 对齐用户 buffer
 验证完整块直达，也用 `file_offset=1`、`user_shift=1` 和越过 EOF 的请求覆盖非对齐
 head/tail 与 EOF clamp；随后停 daemon 再读，证明 hit 不经过 IPC。
@@ -390,7 +390,7 @@ copy 3.80 s（16.84 MiB/s），pinned-page direct 0.73 s（87.34 MiB/s），约 
 
 ## Step 23 vng 满盘回收验证
 
-`test-step23-eviction-vng.sh` 在 vng guest 内用 `cache_size_mib=3` 创建只有 256 个
+`tests/test-step23-eviction-vng.sh` 在 vng guest 内用 `cache_size_mib=3` 创建只有 256 个
 data slot 的 loop cache。它先用 1 MiB 文件 A 填满全部 slot，再命中 A[0] 将其提升
 为 MRU，随后以 128 KiB 文件 B 触发恰好 32 次回收。停 daemon 后验证 B、A[0] 和
 A 尾块仍命中，而被驱逐的 A[1] 必须读取失败；rmmod/insmod 后重复边界断言，并
@@ -403,7 +403,7 @@ A 尾块仍命中，而被驱逐的 A[1] 必须读取失败；rmmod/insmod 后�
 
 ## Step 24 vng 数据完整性验证
 
-`test-step24-checksum-vng.sh` 在 vng guest 的 16 MiB loop 上填充两个独立 entry，
+`tests/test-step24-checksum-vng.sh` 在 vng guest 的 16 MiB loop 上填充两个独立 entry，
 分别 raw 修改 slot 0 和 slot 1 的 data byte。它覆盖 pinned-page 完整块以及
 `file_offset=1/user_shift=1` 的 buffered 非对齐读取：daemon 停止时坏 entry 必须
 miss、未损坏 entry 仍必须命中；daemon 恢复后坏范围从 ObjectStore 重填，随后
@@ -416,8 +416,8 @@ miss、未损坏 entry 仍必须命中；daemon 恢复后坏范围从 ObjectStor
 
 ## Step 25 vng 崩溃恢复验证
 
-`test-step25-cache-txn-vng.sh` 只在 vng guest 中建立 loop 设备并加载模块。辅助程序
-`test-step25-cache-txn.c` 离线构造与内核完全相同的 v4 `PREPARED` journal 和
+`tests/test-step25-cache-txn-vng.sh` 只在 vng guest 中建立 loop 设备并加载模块。辅助程序
+`tests/test-step25-cache-txn.c` 离线构造与内核完全相同的 v4 `PREPARED` journal 和
 index 状态，分别模拟 fill 在 index 已落盘后、invalidate 在 index 清零前、evict
 在 index 清零后的崩溃。重载后均断言 `cache_journal_recoveries=1`，目标 slot 被
 清空并 miss，未涉及 entry 仍可在 daemon 停止时命中；daemon 恢复后 miss 可正常
@@ -432,7 +432,7 @@ reserved byte而不更新 CRC，三者必须 fail closed；恢复合法 superblo
 
 ## Step 26 vng 并发 hit 与失效验证
 
-`test-step26-cache-async-vng.sh` 只在 vng guest 的 loop cache 上运行。它用同一 build、
+`tests/test-step26-cache-async-vng.sh` 只在 vng guest 的 loop cache 上运行。它用同一 build、
 同一持久 cache 和相同 1 MiB × 16 次 × 8 reader workload，先以
 `cache_parallel_reads=0` 验证串行峰值为 1，再以默认并行模式验证峰值至少为 2。
 随后两个 reader 同时进入 pinned-page hit 区间，rewrite 在写侧等待；旧 reader
@@ -471,7 +471,7 @@ KESTRELFS_CACHE_WIPE_CONFIRM=/dev/loop0 \
 wipe 只清前 2 MiB metadata：这是“丢弃 cache 索引并允许内核重新 format”，不是整盘
 安全擦除；MetaStore/ObjectStore 权威数据不受影响。
 
-`test-step27-ops-recovery-vng.sh` 在 vng guest+loop 中填充一个真实 entry，检查 clean
+`tests/test-step27-ops-recovery-vng.sh` 在 vng guest+loop 中填充一个真实 entry，检查 clean
 v4 摘要和合法 PREPARED journal，再损坏 journal 验证 CRC 诊断。脚本覆盖两种缺确认
 拒绝、普通文件拒绝、显式 wipe 后 unformatted、重新加载 format、daemon 停止时旧
 entry 不可命中、恢复 daemon 后重填以及再次停 daemon 命中。2026-09-15 自检输出
@@ -480,8 +480,8 @@ entry 不可命中、恢复 daemon 后重填以及再次停 daemon 命中。2026
 
 ## Step 28 read_iter / iov_iter 验证
 
-`test-step28-cache-vfs-vng.sh` 在 vng guest+loop 中显式加载模块，并用独立 data-dir
-保留 daemon.log。辅助程序 `test-step28-cache-vfs.c` 经真实 `preadv()` 构造：
+`tests/test-step28-cache-vfs-vng.sh` 在 vng guest+loop 中显式加载模块，并用独立 data-dir
+保留 daemon.log。辅助程序 `tests/test-step28-cache-vfs.c` 经真实 `preadv()` 构造：
 
 - 两个页对齐 iovec，其中第二段跨两个用户页，确认三个 block 走 pinned BIO；
 - file offset、用户地址与 iovec 边界均非对齐的三段读，确认安全 buffered fallback；
@@ -496,7 +496,7 @@ cache。2026-09-15 自检输出 `STEP28_IOVEC_PASS`、`STEP28_UNALIGNED_PASS`、
 
 ## Step 29 批量驱逐验证
 
-`test-step29-cache-evict-vng.sh` 在 vng guest+loop 中以 `cache_size_mib=3` 建立
+`tests/test-step29-cache-evict-vng.sh` 在 vng guest+loop 中以 `cache_size_mib=3` 建立
 256 个 data slot，并显式传 `cache_evict_batch=16`。脚本用 1 MiB 文件 A 填满
 cache，命中 A[0] 将其移到 MRU 尾部，再读取 16-block 文件 B。它要求一次 batch
 事务退休 16 个 victim，且这些连续 slot 的清零合并为一次 index-page 写；对应
@@ -515,7 +515,7 @@ vng guest 内执行；脚本显式 insmod、使用 loop、合法 namespace、独
 
 ## Step 35 远端 coherence 验证
 
-`test-step35-cache-coherence-vng.sh` 需要 `REDIS_URL` 指向一次性测试数据库；脚本用
+`tests/test-step35-cache-coherence-vng.sh` 需要 `REDIS_URL` 指向一次性测试数据库；脚本用
 随机 prefix，不把 URL 或凭据写入仓库。所有模块、mount 和 cache-device 操作仍只
 在 vng guest 进行：创建 PID 隔离的 loop image/data-dir，显式 `insmod` 并传合法
 namespace，daemon 输出保留到 `daemon.log`。
@@ -544,7 +544,7 @@ STEP35_CACHE_COHERENCE_PASS
 
 ## Step 52 两节点闭环与性能基线
 
-`test-step52-dist-vng.sh` 并行启动两个 vng guest；guest 脚本显式 `insmod`，只使用
+`tests/test-step52-dist-vng.sh` 并行启动两个 vng guest；guest 脚本显式 `insmod`，只使用
 独立 loop cache，并把 daemon 输出保存在各自 PID 隔离 data-dir 的 `daemon.log`。
 2026-09-20 的共享 Redis+MinIO 自检输出：
 
@@ -556,20 +556,20 @@ STEP52_DIST_DAEMON_FREE_NEW_HIT_PASS
 STEP52_DIST_TWO_NODE_PASS
 ```
 
-`test-step52-perf-vng.sh` 在单 guest 中分别测 write-behind 返回、page-cache 热读与
+`tests/test-step52-perf-vng.sh` 在单 guest 中分别测 write-behind 返回、page-cache 热读与
 drop_caches 后 daemon-free cache hit，并输出 `STEP52_PERF_*_PASS`。完整 workload、
 复现命令、一次通过样本和非 SLA 边界见 [`perf-baseline.md`](perf-baseline.md)。
 
 ## Step 54 splice、orphan retry 与写回预暂存验证
 
-`test-step54-vfs-pipe-vng.sh` 在单个 vng guest + loop 中显式 insmod，使用共享 Redis
+`tests/test-step54-vfs-pipe-vng.sh` 在单个 vng guest + loop 中显式 insmod，使用共享 Redis
 metadata 与本地对象目录。它逐字节校验 file→pipe、pipe→file 和 sendfile；再写入
 2 MiB 并要求 `write_pipe_staged_bytes` 增长至少 2 MiB、WRITE_DATA submission 增长。
 orphan 负例保持 fd 打开两秒，确认对象不被清扫且 fd 仍可读；正例暂停 daemon，令
 final-close IPC 超时并由内核排队，恢复 daemon 后要求 periodic replay 与对象删除。
 2026-09-21 自检输出 `STEP54_VFS_PIPE_PASS`，本轮 512 submissions、umount 163 ms。
 
-`test-step54-lease-vng.sh` 复用两个独立 vng guest + Redis/S3 配方。正常 session
+`tests/test-step54-lease-vng.sh` 复用两个独立 vng guest + Redis/S3 配方。正常 session
 心跳下 Step 53 Pub/Sub/dirty revision 可见性仍通过；随后删除 B 的精确 session key，
 B 的下一次 create 必须失败且路径不存在。自检输出
 `STEP54_LEASE_HEARTBEAT_NOTIFY_PASS`、`STEP54_LEASE_EXPIRED_FAIL_CLOSED_PASS` 和

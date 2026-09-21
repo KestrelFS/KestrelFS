@@ -53,7 +53,7 @@ pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 23;
+pub const ABI_VERSION: u32 = 24;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -781,9 +781,9 @@ pub const LIFECYCLE_DEFER_RECLAIM: u32 = 1;
 /// and READDIR_DATA entry names. Mirrors `KESTRELFS_NAME_DATA_MAX`.
 pub const NAME_DATA_MAX: usize = 255;
 
-/// Bytes preceding each variable-length READDIR_DATA entry name: inode u64
-/// followed by name_len u16.
-pub const READDIR_DATA_ENTRY_HEADER_SIZE: usize = 10;
+/// Bytes preceding each variable-length READDIR_DATA entry name: inode u64,
+/// name_len u16, Linux DT_* u8, and one zero reserved byte.
+pub const READDIR_DATA_ENTRY_HEADER_SIZE: usize = 12;
 /// Maximum UTF-8 symlink target size, mirrored from the C ABI.
 pub const SYMLINK_TARGET_MAX: usize = 4095;
 
@@ -1138,6 +1138,7 @@ const _: () = assert!(NAME_DATA_MAX <= u16::MAX as usize);
 const _: () = assert!(NAME_DATA_MAX == RENAME_DATA_NAME_MAX);
 const _: () =
     assert!(READDIR_DATA_ENTRY_HEADER_SIZE + NAME_DATA_MAX <= DATA_BUFFER_SIZE);
+const _: [(); 12] = [(); READDIR_DATA_ENTRY_HEADER_SIZE];
 const _: () = assert!(8 + 2 + 2 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(NAME_DATA_MAX + SYMLINK_TARGET_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(SYMLINK_TARGET_MAX <= u16::MAX as usize);

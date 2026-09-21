@@ -936,7 +936,8 @@ fn decode_name_data(
     }
 }
 
-/// Handles `KESTRELFS_OP_CREATE` requests: creates a new file or directory.
+/// Handles `KESTRELFS_OP_CREATE` requests: creates a regular file or the
+/// restricted metadata-only whiteout marker.
 ///
 /// Decodes the request payload (parent_inode, mode, name), calls
 /// [`MetaStore::create`], and returns the new inode's id + attributes.
@@ -1146,7 +1147,7 @@ async fn handle_readdir(event: &KestrelfsEvent, store: &Arc<dyn MetaStore>) -> K
             // Sort entries by inode for stable ordering (HashMap is non-deterministic)
             let mut sorted_entries: Vec<(u64, &str)> = entries
                 .iter()
-                .map(|(inode, name)| (*inode, name.as_str()))
+                .map(|entry| (entry.inode_id, entry.name.as_str()))
                 .collect();
             sorted_entries.sort_by_key(|(inode, _)| *inode);
             
@@ -1196,22 +1197,31 @@ async fn handle_readdir_data(
         }
     };
 
-    let mut entries: Vec<(u64, String)> = entries;
-    entries.sort_by_key(|(inode, _)| *inode);
+    let mut entries = entries;
+    entries.sort_by_key(|entry| entry.inode_id);
     let mut encoded = Vec::with_capacity(abi::DATA_BUFFER_SIZE);
     let mut entry_count = 0u32;
 
-    for (inode, name) in entries.iter().skip(req.offset as usize) {
-        let name = name.as_bytes();
+    for entry in entries.iter().skip(req.offset as usize) {
+        let name = entry.name.as_bytes();
         if name.is_empty() || name.len() > abi::NAME_DATA_MAX {
             return KestrelfsEvent::error_response(event.req_id, -libc::EIO);
         }
+        let dtype = match entry.mode & fs_model::S_IFMT {
+            fs_model::S_IFREG => libc::DT_REG,
+            fs_model::S_IFDIR => libc::DT_DIR,
+            fs_model::S_IFLNK => libc::DT_LNK,
+            fs_model::S_IFCHR => libc::DT_CHR,
+            _ => return KestrelfsEvent::error_response(event.req_id, -libc::EIO),
+        };
         let record_len = abi::READDIR_DATA_ENTRY_HEADER_SIZE + name.len();
         if encoded.len() + record_len > abi::DATA_BUFFER_SIZE {
             break;
         }
-        encoded.extend_from_slice(&inode.to_le_bytes());
+        encoded.extend_from_slice(&entry.inode_id.to_le_bytes());
         encoded.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        encoded.push(dtype);
+        encoded.push(0);
         encoded.extend_from_slice(name);
         entry_count += 1;
     }
@@ -1774,6 +1784,7 @@ fn meta_error_to_errno(err: &MetaError) -> i32 {
         MetaError::IsADirectory => -libc::EPERM,
         MetaError::TooManyLinks => -libc::EMLINK,
         MetaError::UnsupportedRenameFlags(_) => -libc::EINVAL,
+        MetaError::UnsupportedNodeType(_) => -libc::EOPNOTSUPP,
         MetaError::Io => -libc::EIO,
         MetaError::StaleSession => -libc::ESTALE,
     }
@@ -3796,7 +3807,7 @@ mod tests {
     fn decode_readdir_data_test_response(
         response: &KestrelfsEvent,
         data_buffer: &[u8; abi::DATA_BUFFER_SIZE],
-    ) -> Vec<(u64, String)> {
+    ) -> Vec<(u64, u8, String)> {
         assert_eq!(response.opcode, abi::OP_RESULT_OK);
         let count = u32::from_le_bytes(response.payload[0..4].try_into().unwrap()) as usize;
         let data_len =
@@ -3812,6 +3823,8 @@ mod tests {
             let name_len = u16::from_le_bytes(
                 data_buffer[cursor + 8..cursor + 10].try_into().unwrap(),
             ) as usize;
+            let dtype = data_buffer[cursor + 10];
+            assert_eq!(data_buffer[cursor + 11], 0);
             cursor += abi::READDIR_DATA_ENTRY_HEADER_SIZE;
             assert!(name_len <= abi::NAME_DATA_MAX);
             assert!(cursor + name_len <= data_len);
@@ -3819,7 +3832,7 @@ mod tests {
                 .unwrap()
                 .to_string();
             cursor += name_len;
-            entries.push((inode, name));
+            entries.push((inode, dtype, name));
         }
         assert_eq!(cursor, data_len);
         entries
@@ -3952,7 +3965,9 @@ mod tests {
         .await;
         assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
             .iter()
-            .any(|(inode, name)| *inode == file_inode && name == &old_name));
+            .any(|(inode, dtype, name)| {
+                *inode == file_inode && *dtype == libc::DT_REG && name == &old_name
+            }));
 
         let rename = raw_rename_data_req(
             804,
@@ -4030,7 +4045,9 @@ mod tests {
         .await;
         assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
             .iter()
-            .any(|(inode, name)| *inode == file_inode && name == &new_name));
+            .any(|(inode, dtype, name)| {
+                *inode == file_inode && *dtype == libc::DT_REG && name == &new_name
+            }));
 
         let unlink = raw_name_data_req(
             abi::OP_UNLINK_DATA,
@@ -4080,7 +4097,55 @@ mod tests {
         .await;
         let entries = decode_readdir_data_test_response(&response, &data_buffer);
         for expected_entry in expected {
-            assert!(entries.contains(&expected_entry));
+            assert!(entries.iter().any(|(inode, dtype, name)| {
+                *inode == expected_entry.0
+                    && *dtype == libc::DT_REG
+                    && name == &expected_entry.1
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn readdir_data_reports_file_dir_symlink_and_whiteout_types() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::MemObjectStore::new());
+        store
+            .create(fs_model::ROOT_INODE, "dtype-file", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        store
+            .mkdir(fs_model::ROOT_INODE, "dtype-dir", fs_model::S_IFDIR | 0o755)
+            .await
+            .unwrap();
+        store
+            .symlink(fs_model::ROOT_INODE, "dtype-link", "dtype-file")
+            .await
+            .unwrap();
+        store
+            .create(fs_model::ROOT_INODE, "dtype-whiteout", fs_model::S_IFCHR)
+            .await
+            .unwrap();
+
+        let mut data_buffer = [0u8; abi::DATA_BUFFER_SIZE];
+        let request = raw_readdir_data_req(810, fs_model::ROOT_INODE, 0);
+        let response = build_response_with_data(
+            &request,
+            &store,
+            &object_store,
+            data_buffer.as_mut_ptr(),
+        )
+        .await;
+        let entries = decode_readdir_data_test_response(&response, &data_buffer);
+        for (name, expected_type) in [
+            ("dtype-file", libc::DT_REG),
+            ("dtype-dir", libc::DT_DIR),
+            ("dtype-link", libc::DT_LNK),
+            ("dtype-whiteout", libc::DT_CHR),
+        ] {
+            assert!(entries
+                .iter()
+                .any(|(_, dtype, entry_name)| *dtype == expected_type && entry_name == name));
         }
     }
 
@@ -4136,7 +4201,7 @@ mod tests {
         )
         .await;
         assert!(decode_readdir_data_test_response(&readdir_response, &data_buffer)
-            .contains(&(inode, max_name.clone())));
+            .contains(&(inode, libc::DT_REG, max_name.clone())));
 
         let unlink = raw_name_data_req(
             abi::OP_UNLINK_DATA,

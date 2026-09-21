@@ -1410,7 +1410,7 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
-    async fn readdir(&self, inode: u64) -> Result<Vec<(u64, String)>> {
+    async fn readdir(&self, inode: u64) -> Result<Vec<crate::meta::DirectoryEntry>> {
         let loaded = self.load_snapshot().await?;
         MemStore::from_snapshot(loaded.snapshot)
             .readdir(inode)
@@ -2164,6 +2164,11 @@ mod tests {
 
         let file = store.create(directory, "data", 0o2640).await.unwrap();
         assert_eq!(peer.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);
+        let mknod_whiteout = store
+            .create(directory, "mknod-whiteout", S_IFCHR)
+            .await
+            .unwrap();
+        assert_eq!(peer.getattr(mknod_whiteout).await.unwrap().mode, S_IFCHR);
         let persistent_mode_file = store
             .create(directory, "mode-persist", 0o2750)
             .await
@@ -2452,6 +2457,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restarted.getattr(restored_whiteout).await.unwrap().mode, S_IFCHR);
+        assert_eq!(
+            restarted.lookup(directory, "mknod-whiteout").await.unwrap(),
+            mknod_whiteout
+        );
+        assert_eq!(restarted.getattr(mknod_whiteout).await.unwrap().mode, S_IFCHR);
         assert_eq!(restarted.pending_garbage().await.unwrap(), pending);
         restarted.acknowledge_garbage(&pending).await.unwrap();
         assert!(restarted.pending_garbage().await.unwrap().is_empty());
