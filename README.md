@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 56 ORPHAN-RETRY-PERSIST + OPS-METRICS 已验收；IPC ABI v24；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 57 WRITE-DATA-PARALLEL + DOC-SWEEP 已验收；IPC ABI v25；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -67,7 +67,8 @@
 > Step 56 已验收实现把内核 final-close proof 原子交接到 daemon `data_dir` 的持久队列；
 > 未完成持久交接时模块引用阻止正常 `rmmod`，重载后仍可继续 finalize→GC，并补齐
 > orphan retry 只读计数与现有 cache/coherence/write-pipe/session 观测说明。
-> 真正并发 WRITE_DATA 与生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
+> Step 57 已验收实现以 8 条独立 16 KiB lane 让不同 inode 的 WRITE_DATA 重叠，
+> 同 inode 仍严格有序；生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -140,8 +141,9 @@ KestrelFS 刻意把**控制面**与**数据面**拆到不同语言与特权边�
   victim 并合并同一 index page 的清零写。Step 42 在 Step 35 全量回退之上允许
   Redis daemon 批量持久化失效相关 inode，脏历史不可证明完整时仍全量失效。Step 36 在已打开
   文件失去最终目录项时保留 cache/inode，最后 close 才失效并回收。
-  Step 43 让普通 write/writev/pwritev 直接消费 `iov_iter`，继续复用 16 KiB bounce
-  WRITE_DATA、写前 cache 失效与同步错误/部分写语义。
+  Step 43 让普通 write/writev/pwritev 直接消费 `iov_iter`；Step 57 已验收实现把
+  writeback 切到 8 条独立 16 KiB lane，不同 inode 可重叠、同 inode 保持顺序，
+  并继续保留写前 cache 失效与同步错误/部分写语义。
   详见
   [`docs/phase4-nvme-cache.md`](docs/phase4-nvme-cache.md)。
 - 仅在必要时（miss、元数据查找）经无锁共享内存 IPC 与 Rust daemon 通信。
@@ -169,7 +171,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–56 已验收（ABI v24 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–57 已验收（ABI v25 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -184,7 +186,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── kestrelfs/                 # 内核模块（C）— 树外构建
 │   ├── Makefile, super.c, inode.c, dir.c, file.c, cache.c
 │   ├── chardev.c, ipc_ring.c
-│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v24）
+│   ├── kestrelfs.h, kestrelfs_ipc.h   # ★ ABI 契约（ABI v25）
 │   └── chardev_test.c
 ├── docs/remaining-capabilities.md  # 规划 / 决策 / 当前提示词 / 实现日志
 ├── docs/phase4-nvme-cache.md       # Phase 4 归属、索引、失效设计
@@ -194,7 +196,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── tests/                         # ★ step/vng/门控脚本与 C helper
 │   ├── README.md                 # 测试布局与运行约定
 │   ├── _repo_root.sh             # 将 cwd 固定到仓库根
-│   └── test-stepNN-*.sh/.c       # 含 Step 15–56 回归与门控
+│   └── test-stepNN-*.sh/.c       # 含 Step 15–57 回归与门控
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,orphan_retry,fs_model,device,ring,ioctl}.rs
 ```
@@ -419,18 +421,20 @@ sudo rmmod kestrelfs
 
 ```bash
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
+  --exec ./tests/test-step57-write-parallel-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
   --exec ./tests/test-step56-orphan-metrics-vng.sh
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step28-cache-vfs-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step27-ops-recovery-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step26-cache-async-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step33-posix-rename-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step36-posix-lifecycle-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step37-posix-chmod-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step28-cache-vfs-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step27-ops-recovery-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step25-cache-txn-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step24-checksum-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step26-cache-async-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step33-posix-rename-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step36-posix-lifecycle-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step37-posix-chmod-vng.sh"
 # Step 35 需要 guest 可达的测试 Redis；REDIS_URL 不写入仓库或日志。
 vng --run --network user --cwd "$PWD" \
-  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 $PWD/test-step35-cache-coherence-vng.sh"
+  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 $PWD/tests/test-step35-cache-coherence-vng.sh"
 # … Step 23/22/20/19/15 等脚本见 HANDOFF.md §7
 ```
 
@@ -448,8 +452,9 @@ offset 64      : req_ctrl  (head/tail/capacity)            — 64 B
 offset 128     : resp_ctrl (head/tail/capacity)            — 64 B
 offset 192     : req_slots[1024]   (内核 → Rust)           — 64 KiB
 offset 65728   : resp_slots[1024]  (Rust → 内核)           — 64 KiB
-offset 131264  : data_buffer（ABI v8+ bounce，批量 I/O 与长名）— 16 KiB
-                                         合计: 147648 B（约 144 KiB）
+offset 131264  : data_buffer（READ_DATA 与长名）             — 16 KiB
+offset 147648  : write_data_buffers[8]（ABI v25 写 lane）    — 128 KiB
+                                         合计: 278720 B（约 272 KiB）
 ```
 
 精确大小由 `KESTRELFS_SHM_REGION_SIZE` / `SHM_REGION_SIZE` 在 C/Rust 两侧断言。
@@ -490,7 +495,8 @@ Step 34 支持 create/mkdir mode 与
   symlink 目标目前要求 UTF-8，最长 4095 字节。
 - Step 30 会持久重试 GC delete；后端永久故障时队列会持续增长，尚无
   dead-letter、容量上限或管理接口。
-- 数据/名字 IPC 由一把全局 mutex 串行化。
+- READ_DATA 与名字 IPC 仍由一把全局 mutex 串行化；Step 57 的 8 条写 lane
+  允许不同 inode 的 WRITE_DATA 重叠，同 inode 由 per-inode mutex 保持提交顺序。
 - Step 31 已验收的 Redis 元数据为 v2 分记录 HASH/SET，点查不再全量读取；但
   mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
   引用确认也仍需聚合扫描。Step 53 已验收路径支持 `redis://` / `rediss://`、私有 CA、
@@ -517,11 +523,12 @@ Step 34 支持 create/mkdir mode 与
   probe 与异步清页调度窗口影响。epoch 清理会先撤销 writable PTE 并写回 dirty
   folio，失败时保留数据并让后续 read/mmap fail closed。Step 54 通过 filemap helper
   覆盖普通文件 file→pipe、pipe→file 与 sendfile，并把 folio→staging 复制移出全局
-  bounce mutex；仍没有独立异步 WRITE_DATA opcode 或跨 folio 并发提交。
+  bounce mutex；Step 57 进一步允许不同 inode 的同步 WRITE_DATA completion 重叠，
+  但同 inode 仍有序，也没有用户态 io_uring/异步 API。
 - Step 47 的 flock/POSIX/OFD 文件锁仅为同一挂载节点的 advisory 锁；
   flock 与 POSIX/OFD 锁类独立，不提供跨节点、跨 daemon 或跨挂载协调，亦不支持强制锁。
-- dirty folio 仍由 aops 经全局 bounce 锁逐 4 KiB 写回 `WRITE_DATA`；Step 54 只让
-  folio 数据预暂存可在锁外准备，cache ordering、bounce copy 与 IPC 仍串行。后台
+- dirty folio 仍由 aops 逐 4 KiB 写回；Step 57 改用 8 条独立 lane，cache ordering
+  与同 inode 提交保持串行，不同 inode 的 bounce copy 与 IPC 可重叠。后台
   writeback 自身同步等待 daemon，失败会 redirty folio 并记录 mapping/superblock
   errseq。延迟的是 write(2) 的完成点，并非 daemon IPC 或 WRITE_DATA completion。
 - Step 44 对普通文件 fsync/fdatasync 统一同步引用对象与元数据；syncfs 同步所有

@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–54）
+## 当前边界（Step 18–57）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -115,13 +115,22 @@ B 停止 daemon 后仍能从新 entry 命中，证明旧 entry 没有越过失�
 不完整时继续全量 fail closed。IPC ABI v22、cache format v4 均未改变。粗测方法与
 环境见 `perf-baseline.md`。
 
-Step 54 不改 cache format。普通文件新增 filemap splice-read 与 iter splice-write，
+Step 54 当时不改 cache format。普通文件新增 filemap splice-read 与 iter splice-write，
 所以 file→pipe、pipe→file 和 sendfile 继续经过同一 page cache、write-behind、
 fsync 与 coherence epoch 规则。writepages 在取得全局 bounce mutex 前把锁定 folio
 复制到私有 staging；不同 inode/folio 的准备阶段可重叠，mutex 内只保留 cache
 ordering、bounce memcpy 与同步 WRITE_DATA。它缩短临界区但没有让单一 bounce 上的
-WRITE_DATA 并发，亦未增加异步 opcode。新增 orphan retry peek/ack ioctl 使 IPC ABI
+WRITE_DATA 并发，亦未增加异步 opcode；这一限制随后由 Step 57 的独立写 lane 解除。
+新增 orphan retry peek/ack ioctl 使 IPC ABI
 bump 到 v23；共享内存/event/opcode 和 cache format v4 均未变化。
+
+Step 57 将写回从旧的单 bounce `WRITE_DATA` 切到 ABI v25
+`WRITE_DATA_PARALLEL`：共享区追加 8 条独立 16 KiB write lane。每个 regular inode
+持有自己的提交顺序锁，同 inode 的 cache invalidate、COW slice 和 completion 仍按序；
+不同 inode 可各占一条 lane 并重叠等待 ObjectStore/MetaStore。daemon 只并发执行 REQ
+环中连续的 parallel-write 批次，响应仍按请求顺序发布；FSYNC/SYNC_FS 或任意非写
+请求会形成批次边界。READ_DATA 与名字 opcode 继续使用原 16 KiB data buffer 和
+全局 mutex。cache format 仍为 v4；这不是用户态异步 API 或 io_uring 导出。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive
@@ -263,8 +272,8 @@ VFS read/readv -> read_iter
 ```
 
 hook 位于 `kestrelfs_data_ipc_lock` 之前，因此 hit 不占 bounce buffer，也不会与
-单 in-flight data/name IPC 串行化。miss 沿用既有 `READ_DATA` 编码（当前整体协议为
-ABI v14），共享内存布局和同步模型均不改变。只有请求的整个 EOF-clamped 范围都
+单 in-flight READ_DATA/name IPC 串行化。miss 沿用既有 `READ_DATA` 编码（当前整体协议为
+ABI v25）；写回另用 8 条独立 lane。只有请求的整个 EOF-clamped 范围都
 有索引时才按 hit 返回；否则整次请求安全回退到 READ_DATA，避免把部分结果暴露给
 调用者。
 

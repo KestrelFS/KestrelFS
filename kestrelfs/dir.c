@@ -620,6 +620,11 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 		ret = mutex_lock_interruptible(&state->lifecycle_lock);
 		if (ret)
 			return ret;
+		ret = mutex_lock_interruptible(&state->write_data_lock);
+		if (ret) {
+			mutex_unlock(&state->lifecycle_lock);
+			return ret;
+		}
 		defer_reclaim = inode->i_nlink == 1 && state->open_handles > 0;
 	}
 	if (inode && inode->i_nlink == 1 && !defer_reclaim) {
@@ -654,8 +659,10 @@ static int kestrelfs_inode_unlink(struct inode *dir, struct dentry *dentry)
 	}
 
 out_unlock_lifecycle:
-	if (state)
+	if (state) {
+		mutex_unlock(&state->write_data_lock);
 		mutex_unlock(&state->lifecycle_lock);
+	}
 	return ret;
 }
 
@@ -749,6 +756,11 @@ static int kestrelfs_inode_rename(struct mnt_idmap *idmap,
 		ret = mutex_lock_interruptible(&replaced_state->lifecycle_lock);
 		if (ret)
 			return ret;
+		ret = mutex_lock_interruptible(&replaced_state->write_data_lock);
+		if (ret) {
+			mutex_unlock(&replaced_state->lifecycle_lock);
+			return ret;
+		}
 		defer_reclaim = replaced->i_nlink == 1 &&
 			replaced_state->open_handles > 0;
 	}
@@ -846,8 +858,10 @@ out_unlock:
 	}
 
 out_unlock_lifecycle:
-	if (replaced_state)
+	if (replaced_state) {
+		mutex_unlock(&replaced_state->write_data_lock);
 		mutex_unlock(&replaced_state->lifecycle_lock);
+	}
 	return ret;
 }
 

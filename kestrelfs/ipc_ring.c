@@ -101,6 +101,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/jiffies.h>
+#include <linux/bitmap.h>
 
 #include "kestrelfs.h"
 #include "kestrelfs_ipc.h"
@@ -185,6 +186,26 @@ static struct {
 	unsigned long first_seen;
 	bool valid;
 } resp_head_of_line;
+
+/* A response may be claimed by its waiter before older responses are
+ * claimed. Record that fact by physical slot so a later head-of-line claim
+ * can advance tail across the whole contiguous claimed prefix. Bits are
+ * cleared before a slot becomes reusable, so ring wrap cannot inherit state.
+ * Guarded by req_push_lock together with resp_ctrl.tail.
+ */
+static DECLARE_BITMAP(resp_claimed, KESTRELFS_RING_SLOTS);
+
+static u64 kestrelfs_advance_claimed_responses(
+		struct kestrelfs_shared_region *region, u64 tail, u64 head)
+{
+	while (tail != head &&
+	       test_bit(tail & KESTRELFS_RING_MASK, resp_claimed)) {
+		__clear_bit(tail & KESTRELFS_RING_MASK, resp_claimed);
+		tail++;
+	}
+	smp_store_release(&region->resp_ctrl.tail, tail);
+	return tail;
+}
 
 /*
  * kestrelfs_req_push() - publish one request event into the REQ
@@ -320,18 +341,12 @@ EXPORT_SYMBOL_GPL(kestrelfs_req_push);
  *      wedging every response published after it).
  *   3. Linearly scan every unconsumed slot in [tail, head) looking
  *      for slot->req_id == @req_id.
- *   4. If found: copy it out. If the found slot happens to be
- *      exactly at index `tail`, we can safely advance tail past it
- *      (smp_store_release) since we know it is now fully consumed.
- *      If the found slot is NOT at the current tail (i.e. some
- *      other, still-unclaimed response(s) sit in front of it), we
- *      deliberately do NOT advance tail - some other concurrent
- *      caller is still expected to claim those earlier slots. The
- *      ring's tail therefore only ever advances past *contiguously
- *      claimed* slots; a caller whose response is buried behind an
- *      as-yet-unclaimed one will simply keep polling and eventually
- *      succeed once the front slot(s) are claimed by their rightful
- *      owners and tail catches up.
+ *   4. If found: copy it out and mark its physical slot in the kernel-only
+ *      `resp_claimed` bitmap. Advance tail across the longest contiguous
+ *      claimed prefix. Thus a later response may be returned immediately
+ *      without being mistaken for an orphan after its waiter exits, while
+ *      the producer still cannot reuse a slot before every older response
+ *      has been claimed.
  *
  * This function takes req_push_lock as well (despite operating on
  * the *response* ring, not the request ring) to keep the "advance
@@ -404,8 +419,9 @@ int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event)
 				(unsigned long long)tail,
 				KESTRELFS_RESP_ORPHAN_TIMEOUT_MS);
 
-			smp_store_release(&region->resp_ctrl.tail, tail + 1);
-			tail = tail + 1;
+			__set_bit(tail & KESTRELFS_RING_MASK, resp_claimed);
+			tail = kestrelfs_advance_claimed_responses(region, tail,
+							       head);
 			resp_head_of_line.valid = false;
 		}
 	} else {
@@ -424,24 +440,14 @@ int kestrelfs_check_resp(u64 req_id, struct kestrelfs_event *out_event)
 		       sizeof(*out_event));
 		ret = 0;
 
-		if (scan == tail) {
-			/*
-			 * Our match was the oldest unconsumed slot:
-			 * safe to advance tail past it immediately.
-			 * smp_store_release() ensures our completed
-			 * read above is ordered before this
-			 * publication, so no other observer can ever
-			 * see an advanced tail before the data it
-			 * guarded was actually consumed.
-			 */
-			smp_store_release(&region->resp_ctrl.tail, tail + 1);
-		}
-		/*
-		 * Match was found further back in the ring (some
-		 * earlier slot(s) belong to other, still-pending
-		 * waiters) - deliberately leave tail untouched; see
-		 * function comment above.
+		/* Mark an out-of-order match as consumed. If this request (or
+		 * older waiters) completed the contiguous prefix, reclaim every
+		 * such slot now. This avoids leaving a successfully consumed
+		 * response behind until the orphan timeout.
 		 */
+		__set_bit(idx, resp_claimed);
+		tail = kestrelfs_advance_claimed_responses(region, tail, head);
+		resp_head_of_line.valid = false;
 		break;
 	}
 

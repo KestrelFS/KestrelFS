@@ -44,8 +44,9 @@ cache_namespace=$(printf '%s' "$descriptor" | sha256sum | awk '{print $1}')
 | `cache_async_hit_submissions` / `cache_async_hit_peak` | 异步 completion BIO 提交数 / 峰值在途数 |
 | `cache_coherence_invalidations` | daemon 请求并成功完成的全 cache 失效数 |
 | `cache_coherence_inode_batches` / `cache_coherence_inode_entries` | 有界 inode 失效批次 / 退休 entry 数 |
-| `write_pipe_staged_bytes` / `write_pipe_submissions` | 在 bounce mutex 外预暂存的 folio 字节 / 随后提交的 WRITE_DATA chunk 数 |
-| `write_pipe_lock_wait_ns` / `write_pipe_lock_hold_ns` | 写回等待 / 持有全局 bounce mutex 的累计纳秒数 |
+| `write_pipe_staged_bytes` / `write_pipe_submissions` | 在共享 lane 外预暂存的 folio 字节 / 随后提交的 WRITE_DATA_PARALLEL chunk 数 |
+| `write_pipe_lock_wait_ns` / `write_pipe_lock_hold_ns` | 写回等待 per-inode 顺序锁与可用 lane / 持有 lane 所覆盖提交区间的累计纳秒数（历史名称保留） |
+| `write_data_parallel_active` / `write_data_parallel_peak` | 当前 / 本次模块加载以来峰值 WRITE_DATA_PARALLEL lane owner；峰值大于 1 证明不同 inode 提交发生重叠 |
 | `orphan_retry_queued` / `orphan_retry_acked` | 本次模块加载后产生的内核 final-close proof / 已由 daemon 持久接收的累计数 |
 | `orphan_retry_pending` | 尚未由 daemon 持久接收的 proof 数；非零时模块持有引用，正常 `rmmod` 会被拒绝 |
 

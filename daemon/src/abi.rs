@@ -51,9 +51,12 @@ pub const EVENT_PAYLOAD_SIZE: usize = 32;
 /// Mirrors `KESTRELFS_DATA_BUFFER_SIZE` (16 KiB).
 pub const DATA_BUFFER_SIZE: usize = 16 * 1024;
 
+/// Dedicated 16 KiB lanes used by `OP_WRITE_DATA_PARALLEL`.
+pub const WRITE_DATA_LANES: usize = 8;
+
 /// Mirrors `KESTRELFS_ABI_VERSION`. The daemon refuses to attach to a
 /// kernel module reporting any other value (see [`super::device::open`]).
-pub const ABI_VERSION: u32 = 24;
+pub const ABI_VERSION: u32 = 25;
 
 /// Mirrors `KESTRELFS_SHM_MAGIC` ("KSRS" packed into a little-endian u32).
 pub const SHM_MAGIC: u32 = 0x4B53_5253;
@@ -127,6 +130,8 @@ pub const OP_GETATTR_TIMES: u32 = 24;
 pub const OP_FSYNC: u32 = 25;
 /// Request: mount-wide object and metadata durability barrier.
 pub const OP_SYNC_FS: u32 = 26;
+/// Request: write bytes from one exclusively-owned parallel write lane.
+pub const OP_WRITE_DATA_PARALLEL: u32 = 27;
 /// Response: generic success. Mirrors `KESTRELFS_OP_RESULT_OK`.
 pub const OP_RESULT_OK: u32 = 64;
 /// Response: generic failure, see `error_code`. Mirrors
@@ -241,6 +246,17 @@ impl KestrelfsEvent {
             inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
             offset: u64::from_le_bytes(self.payload[8..16].try_into().unwrap()),
             length: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
+        }
+    }
+
+    /// Decodes ABI v25 `OP_WRITE_DATA_PARALLEL`: the v8 data fields plus
+    /// a dedicated write-lane index at payload offset 20.
+    pub fn decode_parallel_write_req(&self) -> ParallelWriteReq {
+        ParallelWriteReq {
+            inode_id: u64::from_le_bytes(self.payload[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(self.payload[8..16].try_into().unwrap()),
+            length: u32::from_le_bytes(self.payload[16..20].try_into().unwrap()),
+            lane: u32::from_le_bytes(self.payload[20..24].try_into().unwrap()),
         }
     }
 
@@ -887,6 +903,15 @@ pub struct DataReq {
     pub length: u32,
 }
 
+/// Decoded ABI v25 write request backed by one exclusive shared-memory lane.
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelWriteReq {
+    pub inode_id: u64,
+    pub offset: u64,
+    pub length: u32,
+    pub lane: u32,
+}
+
 /// Decoded KESTRELFS_OP_TRUNCATE request.
 #[derive(Debug, Clone)]
 pub struct TruncateReq {
@@ -1105,6 +1130,7 @@ pub struct KestrelfsSharedRegion {
     pub req_slots: [KestrelfsEvent; RING_SLOTS],
     pub resp_slots: [KestrelfsEvent; RING_SLOTS],
     pub data_buffer: [u8; DATA_BUFFER_SIZE],
+    pub write_data_buffers: [[u8; DATA_BUFFER_SIZE]; WRITE_DATA_LANES],
 }
 
 /// Mirrors `KESTRELFS_SHM_REGION_SIZE` (`sizeof(struct
@@ -1116,19 +1142,25 @@ pub const SHM_REGION_SIZE: usize = std::mem::size_of::<KestrelfsSharedRegion>();
 
 // True compile-time counterparts to the C `_Static_assert`s. Array lengths
 // must match exactly or rustc rejects the ABI mirror.
-const _: [(); 147_648] = [(); SHM_REGION_SIZE];
+const _: [(); 278_720] = [(); SHM_REGION_SIZE];
 const _: [(); 131_264] = [(); std::mem::offset_of!(
     KestrelfsSharedRegion,
     data_buffer
 )];
+const _: [(); 147_648] = [(); std::mem::offset_of!(
+    KestrelfsSharedRegion,
+    write_data_buffers
+)];
 const _: () = assert!(8 + 8 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(8 + 8 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
+const _: () = assert!(WRITE_DATA_LANES > 1);
 const _: () = assert!(8 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 4 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 4 + 8 + 8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 + 8 + 2 + 2 + 4 + 4 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(8 <= EVENT_PAYLOAD_SIZE);
 const _: () = assert!(std::mem::size_of::<u64>() <= EVENT_PAYLOAD_SIZE);
-const _: () = assert!(OP_FSYNC == 25 && OP_SYNC_FS == 26);
+const _: () = assert!(OP_FSYNC == 25 && OP_SYNC_FS == 26 && OP_WRITE_DATA_PARALLEL == 27);
 const _: () = assert!(2 * RENAME_DATA_NAME_MAX <= DATA_BUFFER_SIZE);
 const _: () = assert!(
     RENAME_NOREPLACE == 1 && RENAME_EXCHANGE == 2 && RENAME_WHITEOUT == 4
@@ -1174,7 +1206,7 @@ pub fn compile_time_layout_asserts() {
     );
 
     assert_eq!(
-        SHM_REGION_SIZE, 147_648,
+        SHM_REGION_SIZE, 278_720,
         "kestrelfs_shared_region size drifted from the value verified \
          against the running kernel module during Phase 2 development \
          (see README/design notes); if this legitimately changed, the \
@@ -1186,6 +1218,11 @@ pub fn compile_time_layout_asserts() {
         std::mem::offset_of!(KestrelfsSharedRegion, data_buffer),
         131_264,
         "data_buffer must immediately follow both event rings"
+    );
+    assert_eq!(
+        std::mem::offset_of!(KestrelfsSharedRegion, write_data_buffers),
+        147_648,
+        "parallel write lanes must immediately follow data_buffer"
     );
 
     assert_eq!(

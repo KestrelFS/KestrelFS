@@ -32,6 +32,7 @@
  *   |   struct kestrelfs_event req_slots[N]           |
  *   |   struct kestrelfs_event resp_slots[N]          |
  *   |   __u8 data_buffer[16384]                        |
+ *   |   __u8 write_data_buffers[8][16384]              |
  *   +------------------------------------------------+
  *
  * SYNCHRONIZATION / MEMORY ORDERING
@@ -105,11 +106,13 @@
 #define KESTRELFS_CACHELINE_SIZE	64
 
 /*
- * Single shared bounce buffer for bulk file I/O and names. Data/name IPC is
- * synchronous and serialized, so exactly one *_DATA request owns these bytes
- * at a time.
+ * Single shared bounce buffer for reads and names. Those IPCs remain
+ * synchronous and serialized, so exactly one request owns these bytes at a
+ * time. WRITE_DATA_PARALLEL has a separate fixed lane pool so writes to
+ * different inodes can overlap without aliasing this buffer.
  */
 #define KESTRELFS_DATA_BUFFER_SIZE	(16 * 1024)
+#define KESTRELFS_WRITE_DATA_LANES	8
 
 /* ------------------------------------------------------------------
  * Event opcodes
@@ -149,6 +152,7 @@
 #define KESTRELFS_OP_GETATTR_TIMES	24	/* req: fetch persistent atime/mtime */
 #define KESTRELFS_OP_FSYNC		25	/* req: inode_id u64@0; rest zero */
 #define KESTRELFS_OP_SYNC_FS		26	/* req: all-zero payload; mount-wide barrier */
+#define KESTRELFS_OP_WRITE_DATA_PARALLEL 27 /* req: write from an owned lane */
 #define KESTRELFS_OP_RESULT_OK		64	/* resp: generic success */
 #define KESTRELFS_OP_RESULT_ERROR	65	/* resp: generic failure, see error_code */
 
@@ -311,6 +315,25 @@
  * Introduced in KESTRELFS_ABI_VERSION 8.  READ_CHUNK and WRITE_CHUNK remain in
  * the ABI for legacy unit/self-tests, but normal regular-file VFS I/O uses the
  * DATA opcodes.
+ */
+
+/*
+ * Payload layout for KESTRELFS_OP_WRITE_DATA_PARALLEL
+ * ---------------------------------------------------
+ *
+ *   offset  0, 8 bytes, little-endian u64: inode_id
+ *   offset  8, 8 bytes, little-endian u64: file_offset
+ *   offset 16, 4 bytes, little-endian u32: length
+ *   offset 20, 4 bytes, little-endian u32: lane
+ *   offset 24..32: reserved, must be zero
+ *
+ * Bytes live in shared_region.write_data_buffers[lane]. The kernel retains
+ * exclusive ownership of that lane until the matching response is consumed.
+ * At most KESTRELFS_WRITE_DATA_LANES requests can therefore be in flight.
+ * The daemon may execute consecutive requests concurrently but publishes
+ * responses in request order, preserving the response-ring FIFO contract.
+ * Per-inode kernel serialization preserves writeback and durability order;
+ * different inodes may overlap. Introduced in ABI v25.
  */
 
 /*
@@ -872,8 +895,11 @@ struct kestrelfs_ring_ctrl {
  *  24 - Step 55: READDIR_DATA records add d_type plus one reserved byte;
  *       CREATE_DATA mode S_IFCHR is the metadata representation of the only
  *       supported mknod target, Linux whiteout device 0:0.
+ *  25 - Step 57: Added WRITE_DATA_PARALLEL (opcode 27) and eight dedicated
+ *       16 KiB write lanes after the legacy data buffer. Different inodes may
+ *       overlap while the original buffer remains serialized for reads/names.
  */
-#define KESTRELFS_ABI_VERSION		24
+#define KESTRELFS_ABI_VERSION		25
 
 /*
  * struct kestrelfs_shared_region - the entire mmap'd layout.
@@ -886,7 +912,8 @@ struct kestrelfs_ring_ctrl {
  * @resp_ctrl:    head/tail for the Rust->kernel response ring.
  * @req_slots:    fixed-size array of request event slots.
  * @resp_slots:   fixed-size array of response event slots.
- * @data_buffer:  serialized 16 KiB bounce buffer for all *_DATA operations.
+ * @data_buffer:  serialized 16 KiB bounce buffer for reads and names.
+ * @write_data_buffers: eight independently owned 16 KiB write lanes.
  *
  * This whole struct is what gets mmap()-ed by the Rust daemon over
  * the /dev/kestrel_ctl char device. Its total size
@@ -905,6 +932,8 @@ struct kestrelfs_shared_region {
 	struct kestrelfs_event		req_slots[KESTRELFS_RING_SLOTS];
 	struct kestrelfs_event		resp_slots[KESTRELFS_RING_SLOTS];
 	__u8				data_buffer[KESTRELFS_DATA_BUFFER_SIZE];
+	__u8				write_data_buffers[KESTRELFS_WRITE_DATA_LANES]
+						  [KESTRELFS_DATA_BUFFER_SIZE];
 };
 
 #define KESTRELFS_SHM_MAGIC		0x4B535253u	/* "KSRS" */
@@ -1006,7 +1035,8 @@ _Static_assert(sizeof(struct kestrelfs_shared_region) ==
 		KESTRELFS_CACHELINE_SIZE +
 		(2 * KESTRELFS_CACHELINE_SIZE) +
 		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)) +
-		KESTRELFS_DATA_BUFFER_SIZE,
+		KESTRELFS_DATA_BUFFER_SIZE +
+		(KESTRELFS_WRITE_DATA_LANES * KESTRELFS_DATA_BUFFER_SIZE),
 		"kestrelfs_shared_region layout drifted, check padding");
 
 _Static_assert(__builtin_offsetof(struct kestrelfs_shared_region, data_buffer) ==
@@ -1015,11 +1045,23 @@ _Static_assert(__builtin_offsetof(struct kestrelfs_shared_region, data_buffer) =
 		(2 * KESTRELFS_RING_SLOTS * sizeof(struct kestrelfs_event)),
 		"data_buffer must immediately follow both rings");
 
+_Static_assert(__builtin_offsetof(struct kestrelfs_shared_region,
+				  write_data_buffers) ==
+		__builtin_offsetof(struct kestrelfs_shared_region, data_buffer) +
+		KESTRELFS_DATA_BUFFER_SIZE,
+		"parallel write lanes must immediately follow data_buffer");
+
 _Static_assert(KESTRELFS_DATA_BUFFER_SIZE <= (__u32)-1,
 		"KESTRELFS_DATA_BUFFER_SIZE must fit in the DATA opcode u32 length");
 
 _Static_assert(8 + 8 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"READ_DATA/WRITE_DATA request fields overflow the event payload");
+
+_Static_assert(8 + 8 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
+		"WRITE_DATA_PARALLEL request fields overflow the event payload");
+
+_Static_assert(KESTRELFS_WRITE_DATA_LANES > 1,
+		"parallel write lane pool must permit overlap");
 
 _Static_assert(8 + 8 + 2 + 2 + 4 + 4 <= KESTRELFS_EVENT_PAYLOAD_SIZE,
 		"RENAME_DATA request fields overflow the event payload");

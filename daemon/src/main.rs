@@ -68,6 +68,7 @@ use abi::{AttrFields, KestrelfsEvent};
 use clap::Parser;
 use device::KestrelDevice;
 use fs_model::{Inode, Slice};
+use futures_util::future::join_all;
 use gc_worker::{DeleteCompletion, GcScheduler, GcWorker};
 use meta::{CoherenceProbe, MetaError, MetaStore};
 use object_store::ObjectStore;
@@ -640,49 +641,53 @@ fn drain_and_respond(
     // runtime is used here at all) - it never hands ring access to a
     // different thread, preserving that same single-consumer
     // invariant for the duration of this whole drain.
-    let mut responded = 0u64;
+    let mut events = Vec::new();
     let drained = unsafe {
         ring::drain_requests(dev.region_ptr(), |event: &KestrelfsEvent| {
             println!(
                 "kestrelfs-daemon: <- REQ  seq={} req_id={} opcode={} flags={}",
                 event.seq, event.req_id, event.opcode, event.flags
             );
-
-            // SAFETY: the ABI places the bounce buffer inside this live
-            // mapping. DATA requests are synchronous and kernel-serialized,
-            // so only the currently drained request may access it.
-            let data_buffer = std::ptr::addr_of_mut!((*dev.region_ptr()).data_buffer).cast::<u8>();
-            let response = runtime.block_on(build_response_with_data(
-                event,
-                store,
-                object_store,
-                data_buffer,
-            ));
-
-            // SAFETY: same reasoning as the `drain_requests` call
-            // below - `dev.region_ptr()` is valid for the duration of
-            // this call, and this daemon is the RESP ring's sole
-            // producer thread, satisfying `push_response`'s safety
-            // requirement. This closure body is already lexically
-            // inside the `unsafe` block wrapping `drain_requests`
-            // below, so no additional `unsafe { }` is needed (and
-            // rustc rightly warns if one is added).
-            let pushed = ring::push_response(dev.region_ptr(), response);
-
-            if pushed {
-                responded += 1;
-                println!(
-                    "kestrelfs-daemon: -> RESP req_id={} opcode={}",
-                    event.req_id, response.opcode
-                );
-            } else {
-                eprintln!(
-                    "kestrelfs-daemon: RESP ring full, dropping response for req_id={}",
-                    event.req_id
-                );
-            }
+            events.push(*event);
         })
     };
+
+    let mut responded = 0u64;
+    let mut cursor = 0usize;
+    while cursor < events.len() {
+        if events[cursor].opcode == abi::OP_WRITE_DATA_PARALLEL {
+            let mut end = cursor + 1;
+            while end < events.len() && events[end].opcode == abi::OP_WRITE_DATA_PARALLEL {
+                end += 1;
+            }
+            println!(
+                "kestrelfs-daemon: WRITE-DATA-PARALLEL batch={} ",
+                end - cursor
+            );
+            let responses = runtime.block_on(join_all(events[cursor..end].iter().map(|event| {
+                handle_parallel_write_data(event, store, object_store, dev.region_ptr())
+            })));
+            for (event, response) in events[cursor..end].iter().zip(responses) {
+                push_one_response(dev, event, response, &mut responded);
+            }
+            cursor = end;
+            continue;
+        }
+
+        // SAFETY: the legacy bounce buffer remains owned by at most one
+        // serialized read/name request. Parallel writes use disjoint lanes.
+        let data_buffer = unsafe {
+            std::ptr::addr_of_mut!((*dev.region_ptr()).data_buffer).cast::<u8>()
+        };
+        let response = runtime.block_on(build_response_with_data(
+            &events[cursor],
+            store,
+            object_store,
+            data_buffer,
+        ));
+        push_one_response(dev, &events[cursor], response, &mut responded);
+        cursor += 1;
+    }
 
     if drained > 0 {
         println!("kestrelfs-daemon: drained {drained} REQ event(s)");
@@ -692,6 +697,28 @@ fn drain_and_respond(
         if let Err(e) = dev.notify_resp() {
             eprintln!("kestrelfs-daemon: KESTRELFS_IOC_NOTIFY_RESP failed: {e}");
         }
+    }
+}
+
+fn push_one_response(
+    dev: &KestrelDevice,
+    request: &KestrelfsEvent,
+    response: KestrelfsEvent,
+    responded: &mut u64,
+) {
+    // SAFETY: the synchronous event-loop thread is the sole RESP producer.
+    let pushed = unsafe { ring::push_response(dev.region_ptr(), response) };
+    if pushed {
+        *responded += 1;
+        println!(
+            "kestrelfs-daemon: -> RESP req_id={} opcode={}",
+            request.req_id, response.opcode
+        );
+    } else {
+        eprintln!(
+            "kestrelfs-daemon: RESP ring full, dropping response for req_id={}",
+            request.req_id
+        );
     }
 }
 
@@ -2142,6 +2169,47 @@ async fn handle_write_data(
     .await
 }
 
+/// Handles ABI v25 writes from one of the dedicated shared-memory lanes.
+/// Consecutive requests are polled concurrently by `drain_and_respond`, while
+/// their responses are still published in REQ order.
+async fn handle_parallel_write_data(
+    event: &KestrelfsEvent,
+    store: &Arc<dyn MetaStore>,
+    object_store: &Arc<dyn ObjectStore>,
+    region: *mut abi::KestrelfsSharedRegion,
+) -> KestrelfsEvent {
+    let req = event.decode_parallel_write_req();
+    if event.flags != 0
+        || event.payload[24..].iter().any(|byte| *byte != 0)
+        || req.length as usize > abi::DATA_BUFFER_SIZE
+        || req.lane as usize >= abi::WRITE_DATA_LANES
+    {
+        return KestrelfsEvent::error_response(event.req_id, -libc::EINVAL);
+    }
+
+    let mut data = vec![0u8; req.length as usize];
+    // SAFETY: device setup validated the ABI v25 mapping. The kernel owns
+    // this lane until it consumes our matching response, and length/lane were
+    // checked above. Copying before the first await releases shared memory
+    // from the slow ObjectStore/MetaStore portion of the request.
+    unsafe {
+        let lanes = std::ptr::addr_of!((*region).write_data_buffers).cast::<u8>();
+        let source = lanes.add(req.lane as usize * abi::DATA_BUFFER_SIZE);
+        std::ptr::copy_nonoverlapping(source, data.as_mut_ptr(), data.len());
+    }
+
+    handle_write_bytes(
+        event.req_id,
+        req.inode_id,
+        req.offset,
+        data,
+        "OP_WRITE_DATA_PARALLEL",
+        store,
+        object_store,
+    )
+    .await
+}
+
 /// Stores one write as a new COW slice. Both the legacy inline opcode and the
 /// ABI v8 bounce-buffer opcode use this path, preserving MetaStore/ObjectStore
 /// semantics.
@@ -2603,6 +2671,83 @@ mod tests {
         event.payload[8..16].copy_from_slice(&offset.to_le_bytes());
         event.payload[16..20].copy_from_slice(&length.to_le_bytes());
         event
+    }
+
+    fn raw_parallel_write_req(
+        req_id: u64,
+        inode_id: u64,
+        offset: u64,
+        length: u32,
+        lane: u32,
+    ) -> KestrelfsEvent {
+        let mut event = KestrelfsEvent::zeroed(abi::OP_WRITE_DATA_PARALLEL, req_id);
+        event.payload[0..8].copy_from_slice(&inode_id.to_le_bytes());
+        event.payload[8..16].copy_from_slice(&offset.to_le_bytes());
+        event.payload[16..20].copy_from_slice(&length.to_le_bytes());
+        event.payload[20..24].copy_from_slice(&lane.to_le_bytes());
+        event
+    }
+
+    #[tokio::test]
+    async fn parallel_write_lanes_round_trip_different_inodes() {
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        let objects: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
+        let first = store
+            .create(fs_model::ROOT_INODE, "parallel-first", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let second = store
+            .create(fs_model::ROOT_INODE, "parallel-second", fs_model::S_IFREG | 0o644)
+            .await
+            .unwrap();
+        let layout = std::alloc::Layout::new::<abi::KestrelfsSharedRegion>();
+        // SAFETY: zero is a valid representation for this C-layout structure,
+        // including its AtomicU32/AtomicU64 fields. The allocation uses the
+        // type's exact size/alignment and is freed with the same layout below.
+        let region = unsafe { std::alloc::alloc_zeroed(layout).cast::<abi::KestrelfsSharedRegion>() };
+        assert!(!region.is_null());
+        let first_data = vec![0x5a; 4096];
+        let second_data = vec![0xa5; 4096];
+        // SAFETY: lanes 0/1 exist and both copies are bounded to 4 KiB.
+        unsafe {
+            let lanes = std::ptr::addr_of_mut!((*region).write_data_buffers).cast::<u8>();
+            std::ptr::copy_nonoverlapping(first_data.as_ptr(), lanes, first_data.len());
+            std::ptr::copy_nonoverlapping(
+                second_data.as_ptr(),
+                lanes.add(abi::DATA_BUFFER_SIZE),
+                second_data.len(),
+            );
+        }
+        let first_req = raw_parallel_write_req(41_000, first, 0, 4096, 0);
+        let second_req = raw_parallel_write_req(41_001, second, 0, 4096, 1);
+        let (first_resp, second_resp) = tokio::join!(
+            handle_parallel_write_data(&first_req, &store, &objects, region),
+            handle_parallel_write_data(&second_req, &store, &objects, region)
+        );
+        assert_eq!(first_resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(second_resp.opcode, abi::OP_RESULT_OK);
+        assert_eq!(
+            read_from_slices(first, 0, 4096, &store, &objects)
+                .await
+                .unwrap(),
+            first_data
+        );
+        assert_eq!(
+            read_from_slices(second, 0, 4096, &store, &objects)
+                .await
+                .unwrap(),
+            second_data
+        );
+
+        let invalid = raw_parallel_write_req(41_002, first, 0, 1, abi::WRITE_DATA_LANES as u32);
+        assert_eq!(
+            handle_parallel_write_data(&invalid, &store, &objects, region)
+                .await
+                .error_code,
+            -libc::EINVAL
+        );
+        // SAFETY: no handler retains the pointer after awaiting above.
+        unsafe { std::alloc::dealloc(region.cast::<u8>(), layout) };
     }
 
     #[tokio::test]

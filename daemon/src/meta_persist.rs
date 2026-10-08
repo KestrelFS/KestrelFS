@@ -73,6 +73,10 @@ pub(crate) struct MetaSnapshot {
 pub struct FileMetaStore {
     mem: MemStore,
     path: PathBuf,
+    // Parallel WRITE_DATA requests may mutate different inodes at once. Keep
+    // the whole MemStore mutation + snapshot rename sequence ordered so two
+    // writers never race on the single `meta.tmp` path.
+    mutation_sync: tokio::sync::Mutex<()>,
 }
 
 impl FileMetaStore {
@@ -104,7 +108,11 @@ impl FileMetaStore {
             MemStore::new()
         };
 
-        Ok(FileMetaStore { mem, path })
+        Ok(FileMetaStore {
+            mem,
+            path,
+            mutation_sync: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// Loads a MemStore from disk (internal helper).
@@ -207,6 +215,7 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()> {
+        let _guard = self.mutation_sync.lock().await;
         self.mem.append_slice(inode, slice).await?;
         self.sync_to_disk()
             .await

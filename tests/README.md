@@ -18,6 +18,10 @@ Step 56 的持久 orphan/指标用例为 `tests/test-step56-orphan-metrics-vng.s
 guest 内创建 loop、显式 insmod，并验证 open-skip、rmmod guard、模块重载 GC 与
 `orphan_retry_*` 计数增长。
 
+Step 57 的并行写回用例为 `tests/test-step57-write-parallel-vng.sh`，辅助程序为
+`tests/test-step57-write-parallel.c`；它验证不同 inode lane 峰值至少为 2、同 inode
+顺序、重启持久化以及小于 1 秒的卸载。
+
 ## 运行方式
 
 始终在**仓库根**调用（脚本会自行 `cd` 到根）：

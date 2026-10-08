@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 56（ORPHAN-RETRY-PERSIST + OPS-METRICS）已验收；IPC ABI v24、cache format v4。测试脚本统一位于 `tests/`。下一步见 remaining-capabilities §8。
+> **最后更新**：Step 57（WRITE-DATA-PARALLEL + DOC-SWEEP）已验收；IPC ABI v25、cache format v4。测试脚本统一位于 `tests/`。下一步见 remaining-capabilities §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 56 已验收；下一步常规双包 Step 57（见 remaining-capabilities §8） |
+| 当前阶段 | Step 57 已验收；下一步常规双包 Step 58（见 remaining-capabilities §8） |
 
 ---
 
@@ -57,10 +57,10 @@
 ```
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
-- **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（144.2 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节），以及 ring 后方一块 16 KiB data/name bounce buffer。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环，逐条处理 REQ 事件，批量推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
+- **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（278720 B，约 272 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节）、一块 16 KiB read/name bounce buffer，以及 8 条 16 KiB parallel-write lane。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环；普通请求保持顺序处理，连续 `WRITE_DATA_PARALLEL` 批次可并发等待后端并按 REQ 顺序推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
-- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 48 已落地 hit BIO 的异步 completion，同 inode 冷 folio 可并发提交。Step 49/50 落地 dirty folio/writepages/WRITE_DATA 与可写 MAP_SHARED；Step 51 去掉普通 write_iter 的强制等待，交给 BDI flusher 或显式同步推进，保留 NVMe cache 失效、page-cache epoch 与 mapping errseq 语义。Step 54 为普通文件接入 filemap splice/sendfile，并把 folio 数据准备移到全局 bounce mutex 之外；同步 WRITE_DATA 本身仍串行。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用；LRU 尾部近期热点不进入小批次。Step 42 的 ABI v20 ioctl 可在一次写侧临界区退休最多 64 个 inode，仍保留全 cache fail-closed 回退。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无用户态异步读接口或生产级多节点 lease。禁止把普通文件（包括 ZFS dataset 中的文件）当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`；配置参数唯一权威表见 `docs/configuration.md`。
+- **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 48 已落地 hit BIO 的异步 completion，同 inode 冷 folio可并发提交。Step 49/50 落地 dirty folio/writepages 与可写 MAP_SHARED；Step 51 去掉普通 write_iter 的强制等待，交给 BDI flusher或显式同步推进。Step 54 为普通文件接入 splice/sendfile 并在共享 buffer 外预暂存；Step 57 已验收实现以 8 条 lane 让不同 inode 的同步 writeback IPC 重叠，同 inode 仍有序。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无用户态异步读接口或生产级多节点 lease。禁止把普通文件当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`；配置参数唯一权威表见 `docs/configuration.md`。
 
 ---
 
@@ -104,64 +104,13 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 ├── tools/                       # cache 离线运维工具（不进入内核/IPC）
 │   ├── Makefile
 │   └── kestrelfs-cache-admin.c  # v4 inspect + 双确认 metadata wipe
-├── STEP8_VERIFICATION.md        # Step 8 持久化验证指南
-├── STEP9_MANUAL_TEST.md         # Step 9 mkdir/unlink 手工测试指南
-├── test-persistence.sh          # 持久化集成测试脚本（需 sudo）
-├── test-step19-cache-vng.sh     # Step 19 loop 格式化/复用/fail-closed/mount 回归
-├── test-step20-cache-vng.sh     # Step 20/21 loop fill/reload/hit/失效/namespace 回归
-├── test-step22-cache-vng.sh     # Step 22 pinned-page hit/fallback/A-B vng 回归
-├── test-step22-cache-io.c       # Step 22 对齐 IO 校验/粗测辅助程序
-├── test-step23-eviction-vng.sh  # Step 23 小 cache 满盘/LRU/reload 回归
-├── test-step24-checksum-vng.sh  # Step 24 data/index 破坏与 v2 拒绝回归
-├── test-step25-cache-txn-vng.sh # Step 25 半提交/journal/superblock fail-closed 回归
-├── test-step25-cache-txn.c      # Step 25/29 v4 单条与 batch journal 故障注入辅助程序
-├── test-step26-cache-async-vng.sh # Step 26 串行/并行 A-B 与并发失效回归
-├── test-step26-cache-concurrency.c # Step 26 reader/rewrite 数据一致性辅助程序
-├── test-step27-ops-recovery-vng.sh # Step 27 inspect/wipe/reformat/refill 回归
-├── test-step28-cache-vfs-vng.sh # Step 28 read_iter/iovec/EOF/daemon-free hit 回归
-├── test-step28-cache-vfs.c      # Step 28 preadv 与 iovec guard 辅助程序
-├── test-step29-cache-evict-vng.sh # Step 29 批量 LRU/index 合并写/崩溃恢复回归
-├── test-step32-posix-core-vng.sh # Step 32 硬链接/重启/nlink/末引用 GC 回归
-├── test-step33-posix-rename-vng.sh # Step 33 RENAME_NOREPLACE / EEXIST 原子性
-├── test-step33-renameat2.c       # renameat2 小助手（供 Step 33 vng 使用）
-├── test-step34-posix-attr-vng.sh # Step 34 mode/目录 nlink/重启恢复回归
-├── test-step34-posix-attr.c      # open/mkdir 原始 mode 测试辅助程序
-├── test-step35-cache-coherence-vng.sh # Step 35 Redis revision→全 cache 失效回归
-├── test-step36-posix-lifecycle-vng.sh # Step 36 open-unlink/cache/last-close GC 回归
-├── test-step36-posix-lifecycle.c # Step 36 fd 生命周期测试助手
-├── test-step37-posix-chmod-vng.sh # Step 37 文件/目录 chmod、重启及 orphan 回归
-├── test-step37-posix-chmod.c # Step 37 open-unlink fchmod 测试助手
-├── test-step38-posix-exchange-vng.sh # Step 38 原子 EXCHANGE/失败原子性/重启回归
-├── test-step39-posix-chown-vng.sh # Step 39 文件/目录 chown、重启及 orphan 回归
-├── test-step39-posix-chown.c # Step 39 open-unlink fchown 测试助手
-├── test-step40-posix-utimes-vng.sh # Step 40 文件/目录时间、重启及 orphan 回归
-├── test-step40-posix-utimes.c # Step 40 open-unlink futimens 测试助手
-├── test-step45-kernel-aops-vng.sh # Step 45 folio/pagecache 与写后失效回归
-├── test-step46-kernel-mmap-vng.sh # mmap/失效/共享写能力回归（Step 50 更新）
-├── test-step46-kernel-mmap.c # Step 46 mmap/COW/截断测试助手
-├── test-step47-kernel-locks-vng.sh # Step 47 本地文件锁/进程退出回归
-├── test-step47-kernel-locks.c # Step 47 flock/POSIX/OFD 测试助手
-├── test-step48-cache-async-vng.sh # Step 48 异步 hit BIO/冷 folio/失效回归
-├── test-step48-cache-async.c # Step 48 同 inode 并发读测试助手
-├── test-step49-cache-write-vng.sh # Step 49 folio writeback/fsync/失败恢复回归
-├── test-step49-cache-write.c # Step 49 写回/重启/错误测试助手
-├── test-step50-vng.sh # Step 50 可写 MAP_SHARED + WHITEOUT 双包回归
-├── test-step50-map-shared.c # Step 50 mmap 写/同步/COW/重启测试助手
-├── test-step51-write-behind-vng.sh # Step 51 延迟写回/错误/重启回归
-├── test-step51-write-behind.c # Step 51 write-behind 测试助手
-├── test-step52-dist-vng.sh # Step 52 双 vng Redis+S3 编排（Step 53 复用）
-├── test-step52-dist-node-vng.sh # Step 52/53 单节点 guest 测试
-├── test-step52-dist-io.c # Step 52/53 跨节点 generation 辅助程序
-├── test-step52-perf-vng.sh # Step 52 vng 粗测回归
-├── test-step52-perf.c # Step 52 定时与校验辅助程序
-├── test-step53-dist-notify-vng.sh # Step 53 Pub/Sub 延迟双 vng 门控
-├── test-step53-redis-tls.sh # Step 53 自签 CA rediss 门控
-├── test-step54-lease-vng.sh # Step 54 双 vng Redis session fencing
-├── test-step54-vfs-pipe-vng.sh # Step 54 orphan/splice/write prestage vng
-├── test-step54-vfs.c # Step 54 splice/sendfile 数据校验助手
-├── tests/ # ★ step/vng/门控脚本与 C helper（见 tests/README.md）
-├── test-vm-virtme.sh            # virtme-ng 虚拟机测试脚本
-├── test-vm-interactive.sh       # QEMU 交互式测试脚本（busybox initramfs）
+├── STEP8_VERIFICATION.md        # 历史 Step 8 持久化验证指南
+├── STEP9_MANUAL_TEST.md         # 历史 Step 9 mkdir/unlink 手工指南
+├── tests/                       # ★ 所有 step/vng/门控脚本与 C helper
+│   ├── README.md                # 测试布局与运行约定
+│   ├── _repo_root.sh            # 脚本统一切换到仓库根
+│   ├── test-step15-*.sh … test-step57-*.sh
+│   └── test-stepNN-*.c          # 对应 guest/helper 程序
 ├── QEMU-TEST.md                 # QEMU 测试说明
 └── README.md                    # 项目中文概览与使用说明
 ```
@@ -231,6 +180,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/综合 Step 54** | **最小 Redis session fencing + kernel-proven orphan sweep + splice/sendfile + WRITE_DATA 预暂存** | **23** | **✅ 已验收** |
 | **Phase 4/POSIX Step 55** | **精确 READDIR_DATA d_type + 受限 persistent whiteout mknod** | **24** | **✅ 已验收** |
 | **Phase 4/运维 Step 56** | **orphan retry 持久交接 + rmmod guard + 最小运维指标** | **24（未变）** | **✅ 已验收** |
+| **Phase 4/内核+文档 Step 57** | **不同 inode WRITE_DATA 并行 lane + 文档清扫** | **25** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -304,8 +254,10 @@ Cursor 对照代码、206 tests 与 `STEP55_POSIX_DTYPE_MKNOD_PASS` 确认 Step 
 
 Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已验收。 orphan retry 持久交接 + rmmod guard + 最小运维指标；ABI **v24** 未变；format **v4**。
 
-待验收：见 `docs/remaining-capabilities.md` §8（Step 57 常规双包）。
-> **当前 ABI**：`KESTRELFS_ABI_VERSION = 24`（`READDIR_DATA` 条目含 `DT_*`；受限 mknod 复用 CREATE_DATA）
+Cursor 对照代码、209 tests 与 `STEP57_WRITE_PARALLEL_PASS` 确认 Step 57 已验收。 8×16 KiB write lane + `WRITE_DATA_PARALLEL`；ABI **v25**；format **v4**；SHM **278720**。
+
+待验收：见 `docs/remaining-capabilities.md` §8（Step 58 常规双包）。
+> **当前工作树 ABI**：`KESTRELFS_ABI_VERSION = 25`（新增 8 条 parallel-write lane 与 opcode 27）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
 
@@ -321,7 +273,7 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 
 ### 5.3 当前 ABI 版本
 
-**`KESTRELFS_ABI_VERSION = 24`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致）
+**`KESTRELFS_ABI_VERSION = 25`**（内核 `kestrelfs_ipc.h` 与 Rust `abi.rs` 一致；Step 57 已验收）
 
 版本演进：
 1. 初始 Phase 2 桥接
@@ -352,6 +304,8 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 24. Phase 4/POSIX Step 55：`READDIR_DATA` entry header 从 10 扩为 12 bytes，新增
     Linux `DT_*` 与 zero reserved；`CREATE_DATA` 的既有 mode 字段允许精确
     `S_IFCHR` whiteout marker
+25. Phase 4/内核 Step 57：共享区在原 data buffer 后新增 8 × 16 KiB write lane；
+    新增 `OP_WRITE_DATA_PARALLEL`，payload 为 inode/offset/length/lane
 
 ### 5.4 已实现 Opcode 列表
 
@@ -384,6 +338,7 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 | 24 | `OP_GETATTR_TIMES` | 获取持久 atime/mtime，供 VFS inode 重建 | 19 |
 | 25 | `OP_FSYNC` | 同步 inode 全部引用对象与元数据；payload inode_id u64@0 | 21 |
 | 26 | `OP_SYNC_FS` | 挂载级引用对象与元数据同步；payload 全零 | 21 |
+| 27 | `OP_WRITE_DATA_PARALLEL` | 从 8 条独占 16 KiB lane 之一写入；不同 inode 可重叠 | 25 |
 | 64 | `OP_RESULT_OK` | 响应：成功 | 1 |
 | 65 | `OP_RESULT_ERROR` | 响应：失败（error_code 携带负 errno） | 1 |
 
@@ -416,7 +371,7 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 | 10 | **mknod 仅开放 whiteout marker** | Step 50 的 `RENAME_WHITEOUT` 与 Step 55 受限 `.mknod` 都持久化 `S_IFCHR` 0:0 marker；mknod 要求 `CAP_MKNOD`，其它字符/块设备、FIFO/socket 均不支持。Step 55 readdir 对 file/dir/symlink/whiteout 分别返回 `DT_REG/DT_DIR/DT_LNK/DT_CHR`。 | `kestrelfs/dir.c`、`kestrelfs/inode.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
-| 13 | **write-behind 仍以同步 WRITE_DATA 为底层提交** | Step 51 让普通异步 write 标脏后先返回；Step 54 将 folio→私有 staging 的复制移到全局 bounce mutex 之外，不同 inode/folio 可并行准备，但 cache ordering、bounce memcpy 与同步 `WRITE_DATA` 仍串行。`O_SYNC`/`O_DSYNC`、fsync/fdatasync、MS_SYNC、truncate、close/VMA close 仍会等待 daemon；失败 redirty 并进入 mapping/superblock errseq。 | `kestrelfs/file.c`、`kestrelfs/inode.c` |
+| 13 | **write-behind 的底层提交仍同步等待** | Step 57 用 8 条 write lane 让不同 inode 的 `WRITE_DATA_PARALLEL` 重叠；同 inode 由 per-inode mutex 保持 cache 失效、slice 与完成顺序。每个 folio 的 writeback 仍同步等待 daemon；`O_SYNC`/`O_DSYNC`、fsync/fdatasync、MS_SYNC、truncate、close/VMA close 仍会等待，失败 redirty 并进入 mapping/superblock errseq。没有用户态异步 API。 | `kestrelfs/file.c`、`daemon/src/main.rs` |
 | 14 | **时间属性为秒级显式持久化** | Step 40 持久化显式 atime/mtime；纳秒截断为 0，负 epoch 返回 `EOVERFLOW`，自动读 atime 与 ctime 不持久化。SIZE+显式时间/其它属性及 time+MODE/UID/GID 组合返回 `EOPNOTSUPP`；普通 truncate 随带的 VFS 隐式 mtime/ctime 由 TRUNCATE 处理。 | `daemon/src/meta.rs`、`kestrelfs/file.c`、`kestrelfs/dir.c` |
 | 15 | **symlink target 当前要求 UTF-8 且 ≤4095 字节** | Linux 原生 symlink target 可为任意非 NUL 字节；当前 MetaStore 使用 `String`，ABI 解码拒绝非 UTF-8，target 上限为 4095 字节。悬空链接与相对链接均支持。 | `daemon/src/meta.rs`、`daemon/src/abi.rs` |
 | 16 | **GC 引用确认是 O(全量 slice)** | 每次产生删除候选及每次读取待删队列时扫描所有剩余 slice 构建 block key 引用集合，正确处理共享 key，但 inode/slice 或积压队列很大时成本较高；后续可用引用计数优化。 | `daemon/src/meta.rs` `confirmed_garbage_keys()` / `pending_garbage()` |
@@ -438,7 +393,9 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 | 33 | **文件锁仅本地 advisory** | Step 47 已把 flock、POSIX 字节锁与 OFD 锁交给 Linux 本地锁管理器；同一挂载节点上的进程可协调，flock 与 POSIX/OFD 锁类彼此独立。不同挂载或节点不共享锁状态；无跨 daemon 分布式锁、远端 lease 或强制锁。 | `kestrelfs/file.c` |
 | 30 | **fsync 的持久性受后端配置限制** | Step 44 fsync 与 fdatasync 同样同步对象和元数据；syncfs 检查所有引用且同步本地对象目录树。Mem 返回仅进程内成功；Redis 仅保证已 ACK 的 mutation 可见，崩溃耐久取决于 AOF/RDB 配置（RDB 不保证逐次 fsync 耐久；本步没有 WAIT/WAITAOF）；S3 以已完成 PUT ACK 为边界；没有分布式跨后端原子事务或目录 file op 的 fsync。 | `daemon/src/main.rs`、`daemon/src/object_store.rs`、`daemon/src/meta_persist.rs` |
 
-> ABI v8 起共享内存区域为 **147648 字节**（ring 后含 16 KiB data bounce buffer）；README 中旧的 **131264 字节**描述已过时。
+> ABI v25 共享内存区域为 **278720 字节**：双 ring 后保留 16 KiB read/name
+> `data_buffer`，随后是 **8 × 16 KiB** parallel-write lanes。147648 B 是 ABI v8–v24
+> 的旧总大小；131264 B 只是 data buffer 的 offset，从来不是当前总大小。
 
 > rename 成功后内核不手动调用 `d_move()`；dentry 更新交给 VFS rename 流程完成。
 
@@ -659,7 +616,7 @@ sudo rmmod kestrelfs
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 对最终代码执行通过：unlink、rename overwrite、truncate COW GC
@@ -693,7 +650,7 @@ Step 53 自签 CA TLS 门控使用同一 `REDIS_URL` 作为上游，在本机启
 
 ```bash
 REDIS_URL='redis://:<PASSWORD>@192.168.18.253:8379/15' \
-  ./test-step53-redis-tls.sh
+  ./tests/test-step53-redis-tls.sh
 ```
 
 2026-09-14 已对 `192.168.18.253:8379` 的真实 Redis 执行上述门控测试：
@@ -801,7 +758,7 @@ sudo rmmod kestrelfs
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 人类补充验证参数可见性与恒 miss 回退时，仍沿用固定启动约定。Step 18 不会
@@ -839,11 +796,11 @@ sudo rmmod kestrelfs
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
 ```
 
 2026-09-14 对最终实现执行通过，挂载回归 `umount_ms=88`，最终输出
-`STEP19_CACHE_PASS`；最终版另跑 `test-step15-gc-vng.sh`，GC 全部通过，
+`STEP19_CACHE_PASS`；最终版另跑 `tests/test-step15-gc-vng.sh`，GC 全部通过，
 `umount_ms=90`，输出 `VNG_GC_PASS`。
 
 宿主机开发盘清单中仍有
@@ -861,8 +818,8 @@ rewrite/truncate/unlink/rename-overwrite 后禁止脏命中：
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 执行通过：恢复 4 个盘上 index entry；停 daemon 后 reload hit 数据
@@ -871,7 +828,7 @@ GC 回归输出 `VNG_GC_PASS`，umount 92 ms。
 
 ### 7.15 Phase 4 Step 21 cache namespace identity 验证
 
-`test-step20-cache-vng.sh` 已扩展 namespace 断言：用规范化 local descriptor 的
+`tests/test-step20-cache-vng.sh` 已扩展 namespace 断言：用规范化 local descriptor 的
 SHA-256 作为 identity A，在同一 loop 填充并卸载；随后 identity B 加载必须返回
 错误且日志包含 `cache namespace identity mismatch`；最后重新用 A 加载并在停掉
 daemon 后读出持久化数据。脚本内每次 cache_device `insmod` 都显式传
@@ -881,9 +838,9 @@ daemon 后读出持久化数据。脚本内每次 cache_device `insmod` 都显�
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 当前实现执行通过：identity B 被拒绝，identity A 随后恢复 4 个 index
@@ -907,7 +864,7 @@ insmod kestrelfs/kestrelfs.ko cache_device=/dev/loop0 cache_size_mib=64 \
 
 ### 7.16 Phase 4 Step 22 pinned-user-page cache hit 验证
 
-`test-step22-cache-vng.sh` 在 guest 内编译 `test-step22-cache-io.c`，创建独立 loop、
+`tests/test-step22-cache-vng.sh` 在 guest 内编译 `tests/test-step22-cache-io.c`，创建独立 loop、
 data-dir 和 daemon.log，并显式传 `cache_device`、`cache_namespace`。它覆盖：
 
 - 1 MiB+123 B 文件从 READ_DATA miss 填充后，对齐连续 block 直达 pinned pages；
@@ -919,10 +876,10 @@ data-dir 和 daemon.log，并显式传 `cache_device`、`cache_namespace`。它�
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step22-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step22-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 自检通过：新用例观察到 `direct_blocks=511`、`copied_blocks=3`，
@@ -933,7 +890,7 @@ daemon 停止 hit 成功，最终复跑 umount 69 ms，`STEP22_CACHE_HIT_PASS`�
 
 ### 7.17 Phase 4 Step 23 block-LRU eviction 验证
 
-`test-step23-eviction-vng.sh` 只在 vng guest 内创建 16 MiB loop，并以
+`tests/test-step23-eviction-vng.sh` 只在 vng guest 内创建 16 MiB loop，并以
 `cache_size_mib=3` 得到 2 MiB metadata + 256 个 4 KiB data slot。1 MiB 文件 A
 填满 cache 后再命中 A[0]，随后读取 128 KiB 文件 B，必须观察到恰好 32 次 eviction；
 停 daemon 后 B、A[0]、A 尾块仍命中，A[1] 必须 miss。模块重载后还要恢复 256 个
@@ -942,11 +899,11 @@ entry 并重复 hit/miss 边界。
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step23-eviction-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step22-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step23-eviction-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step22-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 自检通过：`cache_evictions=32`、`restored 256 cache index entries`、
@@ -957,7 +914,7 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 ### 7.18 Phase 4 Step 24 data/index checksum 验证
 
-`test-step24-checksum-vng.sh` 在 vng guest 的 loop 上填充两个 4 KiB entry，再用
+`tests/test-step24-checksum-vng.sh` 在 vng guest 的 loop 上填充两个 4 KiB entry，再用
 raw block write 分别损坏 data slot。完整对齐读取覆盖 pinned-page CRC，
 `file_offset=1/user_shift=1` 覆盖 buffered CRC；daemon 停止时坏 entry 必须 miss，
 另一个 entry 仍命中，恢复 daemon 后可从权威 ObjectStore 重填。随后分别破坏
@@ -966,12 +923,12 @@ index 字段、伪造 v2 version，要求模块加载 fail closed 且不迁移�
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step23-eviction-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step22-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step24-checksum-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step23-eviction-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step22-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 v3 最终格式自检通过：pinned 与 buffered 两段均观察到
@@ -984,8 +941,8 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 ### 7.19 Phase 4 Step 25 CACHE-TXN 验证
 
-`test-step25-cache-txn-vng.sh` 在 guest loop 上格式化 v4 并填充两个独立 entry，
-再用 `test-step25-cache-txn.c` 离线构造合法 `PREPARED` journal，模拟 fill 在 index
+`tests/test-step25-cache-txn-vng.sh` 在 guest loop 上格式化 v4 并填充两个独立 entry，
+再用 `tests/test-step25-cache-txn.c` 离线构造合法 `PREPARED` journal，模拟 fill 在 index
 落盘后、invalidate 在 index 清零前、evict 在 index 清零后的 crash point。重载
 必须把目标 slot 恢复为 miss，未涉及 entry 仍命中；另外破坏 journal CRC、回退
 version=v3、破坏 superblock CRC，均须 fail closed。
@@ -993,13 +950,13 @@ version=v3、破坏 superblock CRC，均须 fail closed。
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step25-cache-txn-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step24-checksum-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step23-eviction-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step22-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step20-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step19-cache-vng.sh"
-vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step25-cache-txn-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step24-checksum-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step23-eviction-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step22-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step20-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step19-cache-vng.sh"
+vng --run --network user --cwd "$PWD" --exec "$PWD/tests/test-step15-gc-vng.sh"
 ```
 
 2026-09-14 工作树自检输出 `STEP25_FILL_RECOVERY_PASS`、
@@ -1014,7 +971,7 @@ vng --run --network user --cwd "$PWD" --exec "$PWD/test-step15-gc-vng.sh"
 
 ### 7.20 Phase 4 Step 26 CACHE-ASYNC 验证
 
-`test-step26-cache-async-vng.sh` 在 guest loop 上用同一 build、持久 cache 和
+`tests/test-step26-cache-async-vng.sh` 在 guest loop 上用同一 build、持久 cache 和
 1 MiB × 16 次 × 8 reader workload 对比 `cache_parallel_reads=0/1`。串行模式必须
 观察到 `cache_parallel_hit_peak=1`，并行模式必须至少为 2。随后两个 reader 同时
 进入 pinned-page hit，rewrite 取得写侧前必须等待；reader 校验完整旧数据，rewrite
@@ -1024,14 +981,14 @@ UAF、general protection fault 或 hung task。
 ```bash
 make -C kestrelfs
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step26-cache-async-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step25-cache-txn-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step24-checksum-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step23-eviction-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step22-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step20-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step19-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step15-gc-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step26-cache-async-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step25-cache-txn-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step24-checksum-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step23-eviction-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step22-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step20-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step19-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step15-gc-vng.sh
 ```
 
 2026-09-15 工作树自检输出 `STEP26_PARALLEL_HIT_PASS peak=8`、
@@ -1068,15 +1025,15 @@ PREPARED journal / recovery-required。wipe 环境变量必须精确等于 DEVIC
 make -C kestrelfs
 make -C tools
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step27-ops-recovery-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step26-cache-async-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step25-cache-txn-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step24-checksum-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step23-eviction-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step22-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step20-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step19-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step15-gc-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step27-ops-recovery-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step26-cache-async-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step25-cache-txn-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step24-checksum-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step23-eviction-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step22-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step20-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step19-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step15-gc-vng.sh
 ```
 
 2026-09-15 工作树自检输出 `STEP27_INSPECT_PASS`、
@@ -1101,19 +1058,19 @@ daemon.log：
 make -C kestrelfs
 make -C tools
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step28-cache-vfs-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step27-ops-recovery-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step26-cache-async-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step25-cache-txn-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step24-checksum-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step23-eviction-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step22-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step20-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step19-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step15-gc-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step28-cache-vfs-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step27-ops-recovery-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step26-cache-async-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step25-cache-txn-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step24-checksum-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step23-eviction-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step22-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step20-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step19-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step15-gc-vng.sh
 ```
 
-`test-step28-cache-vfs.c` 用真实 `preadv()` 验证页对齐多 iovec、单段跨页、非对齐
+`tests/test-step28-cache-vfs.c` 用真实 `preadv()` 验证页对齐多 iovec、单段跨页、非对齐
 多段与 EOF 短读，并检查每个 iovec 前后 guard 未被覆盖。2026-09-15 工作树自检
 输出 `STEP28_IOVEC_PASS`、`STEP28_UNALIGNED_PASS`、`STEP28_EOF_PASS`、
 `STEP28_DAEMON_FREE_HIT_PASS direct_delta=3 copy_delta=5` 和
@@ -1123,13 +1080,13 @@ vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step15-gc-vng
 
 ### 7.23 Phase 4 Step 29 CACHE-EVICT 验证
 
-`test-step29-cache-evict-vng.sh` 在 guest loop 上用 `cache_size_mib=3` 建立 256 个
+`tests/test-step29-cache-evict-vng.sh` 在 guest loop 上用 `cache_size_mib=3` 建立 256 个
 data slot，填满后把 A[0] 提升为 MRU，再以 16-block 文件 B 触发默认批量回收。
 sysfs 必须观测 `cache_evictions=16`、`cache_eviction_batches=1`、
 `cache_eviction_batch_slots=16`、`cache_eviction_index_writes=1`；停止 daemon 后 B、
 A[0]/A 尾块仍 hit，而旧 LRU A[1] miss。正常 reload 后重复该边界并恢复 256 entries。
 
-脚本还用扩展后的 `test-step25-cache-txn.c` 构造 16-victim PREPARED batch journal，
+脚本还用扩展后的 `tests/test-step25-cache-txn.c` 构造 16-victim PREPARED batch journal，
 只预清 8 个 index 后模拟 crash。离线 admin 必须报告
 `journal_batch_count=16` / `recovery-required`；模块重载必须输出 `count=16 to miss`，
 清完整批且保留未涉及的 A[0] hit。
@@ -1138,17 +1095,17 @@ A[0]/A 尾块仍 hit，而旧 LRU A[1] miss。正常 reload 后重复该边界�
 make -C kestrelfs
 make -C tools
 cargo build --release --manifest-path daemon/Cargo.toml
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step29-cache-evict-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step28-cache-vfs-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step27-ops-recovery-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step26-cache-async-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step25-cache-txn-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step24-checksum-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step23-eviction-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step22-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step20-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step19-cache-vng.sh
-vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./test-step15-gc-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step29-cache-evict-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step28-cache-vfs-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step27-ops-recovery-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step26-cache-async-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step25-cache-txn-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step24-checksum-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step23-eviction-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step22-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step20-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step19-cache-vng.sh
+vng --run --network user --rwdir "$PWD" --cwd "$PWD" --exec ./tests/test-step15-gc-vng.sh
 ```
 
 2026-09-15 工作树自检输出 `STEP29_BATCH_EVICTION_PASS victims=16 index_writes=1`、
@@ -1237,7 +1194,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec ./test-step32-posix-core-vng.sh
+  --exec ./tests/test-step32-posix-core-vng.sh
   STEP32_LINK_CREATE_PASS
   STEP32_LINK_RESTART_PASS
   STEP32_LINK_SURVIVING_REFERENCE_PASS
@@ -1267,7 +1224,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec ./test-step33-posix-rename-vng.sh
+  --exec ./tests/test-step33-posix-rename-vng.sh
   STEP33_NOREPLACE_SUCCESS_PASS
   STEP33_NOREPLACE_EEXIST_ATOMIC_PASS
   STEP33_NOREPLACE_HARDLINK_VFS_EEXIST_NOOP_PASS
@@ -1306,7 +1263,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec ./test-step34-posix-attr-vng.sh
+  --exec ./tests/test-step34-posix-attr-vng.sh
   STEP34_FILE_MODE_PASS
   STEP34_MKDIR_MODE_NLINK_PASS
   STEP34_RENAME_DIR_NLINK_PASS
@@ -1346,7 +1303,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 ./test-step35-cache-coherence-vng.sh"
+  --exec "env REDIS_URL=redis://10.0.2.2:6379/15 ./tests/test-step35-cache-coherence-vng.sh"
   STEP35_READER_CACHE_HIT_PASS hits_delta=1
   STEP35_REMOTE_REVISION_INVALIDATE_PASS
   STEP35_DAEMON_FREE_NEW_HIT_PASS
@@ -1376,7 +1333,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec ./test-step36-posix-lifecycle-vng.sh
+  --exec ./tests/test-step36-posix-lifecycle-vng.sh
   STEP36_OPEN_UNLINK_RETAIN_PASS
   STEP36_UNLINKED_CACHE_HIT_PASS
   STEP36_LAST_CLOSE_GC_PASS
@@ -1404,7 +1361,7 @@ cargo clippy --manifest-path daemon/Cargo.toml --all-targets -- -D warnings
 make -C kestrelfs
   success; 0 warnings
 vng --run --network user --rwdir "$PWD" --cwd "$PWD" \
-  --exec ./test-step37-posix-chmod-vng.sh
+  --exec ./tests/test-step37-posix-chmod-vng.sh
   STEP37_FILE_DIR_CHMOD_PASS
   STEP37_UNSUPPORTED_ATTRS_PASS
   STEP37_ORPHAN_CHMOD_PASS
@@ -1435,7 +1392,7 @@ make -C kestrelfs
 REDIS_URL=... cargo test --manifest-path daemon/Cargo.toml \
   redis_url_gated_full_semantics_and_restart -- --nocapture
   1 passed; 0 failed
-vng ... --exec ./test-step38-posix-exchange-vng.sh
+vng ... --exec ./tests/test-step38-posix-exchange-vng.sh
   STEP38_FILE_EXCHANGE_PASS
   STEP38_CACHE_IDENTITY_PASS
   STEP38_DIRECTORY_EXCHANGE_PASS
@@ -1472,7 +1429,7 @@ make -C kestrelfs
 REDIS_URL=... cargo test --manifest-path daemon/Cargo.toml \
   redis_url_gated_full_semantics_and_restart -- --nocapture
   1 passed; 0 failed
-vng ... --exec ./test-step39-posix-chown-vng.sh
+vng ... --exec ./tests/test-step39-posix-chown-vng.sh
   STEP39_FILE_DIR_CHOWN_PASS
   STEP39_UNSUPPORTED_ATTRS_PASS
   STEP39_ORPHAN_FCHOWN_PASS
@@ -1508,7 +1465,7 @@ make -C kestrelfs
 REDIS_URL=... cargo test --manifest-path daemon/Cargo.toml \
   redis_url_gated_full_semantics_and_restart -- --nocapture
   1 passed; 0 failed
-vng ... --exec ./test-step40-posix-utimes-vng.sh
+vng ... --exec ./tests/test-step40-posix-utimes-vng.sh
   STEP40_FILE_DIR_UTIMES_PASS
   STEP40_ORPHAN_FUTIMENS_PASS
   STEP40_UTIMES_RESTART_PASS
@@ -1879,7 +1836,8 @@ file→pipe、pipe→file 和 sendfile，并沿用 page cache/write-behind/fsync
 先在 folio lock/writeback 保护下复制到私有 staging，再竞争全局 bounce mutex；mutex
 内只保留 cache ordering、bounce memcpy 与同步 WRITE_DATA。只读 sysfs 计数
 `write_pipe_staged_bytes`、`write_pipe_submissions`、`write_pipe_lock_wait_ns`、
-`write_pipe_lock_hold_ns` 用于证明路径被执行；WRITE_DATA 本身仍单 in-flight。
+`write_pipe_lock_hold_ns` 用于证明路径被执行；这是 Step 54 当时状态，Step 57 已验收
+实现已改由 8 条独立写 lane 支持不同 inode 的同步提交重叠。
 
 Codex 自检：`cargo test` **203 passed**，clippy `-D warnings` 与
 `make -C kestrelfs` 零警告；真实 Redis 三项 gate 全过。双 vng Redis+S3 输出
@@ -1950,13 +1908,46 @@ Cursor 验收自检（2026-09-21）：208 tests；clippy / make 零警告；vng
 `STEP56_DOUBLE_PACK_PASS`（open-skip、rmmod-guard、queued/acked delta=1、reload-GC、
 `STEP56_METRICS_PASS`）。
 
+### 7.51 Phase 4/内核+文档 Step 57 WRITE-DATA-PARALLEL + DOC-SWEEP（已验收）
+
+工作树 IPC ABI **v25** 在原 16 KiB `data_buffer` 后新增 8 条各 16 KiB 的专用
+write lane，共享区总长 **278720 bytes**。新增 opcode 27 `WRITE_DATA_PARALLEL`：
+payload 携带 inode、offset、length 与 lane，字节位于对应 lane；旧 `WRITE_DATA`
+保留。内核固定 lane pool 允许不同 inode 的 writeback 同步 IPC 重叠，同 inode 由
+`write_data_lock` 串行，truncate、unlink、rename-overwrite 与 fsync durability barrier
+也纳入同一顺序边界。daemon 并发 poll 连续 write batch、按请求顺序发布响应，并在
+首次 await 前复制 lane 数据。cache format **v4** 不变。
+
+为使多个同步 waiter 安全消费响应，内核响应环新增 kernel-only claimed bitmap：乱序
+领取只做标记，tail 仅跨连续已领取前缀推进。FileMetaStore 并发 append 以 mutation
+mutex 保护单一 `meta.tmp` 提交。只读 module 参数
+`write_data_parallel_{active,peak}` 提供并行度观测。
+
+Codex 工作树自检：daemon **209 tests passed**；clippy `-D warnings` 与
+`make -C kestrelfs` 零警告。vng+loop 输出
+`STEP57_WRITE_PARALLEL_PEAK_PASS peak=2`、`STEP57_WRITE_PARALLEL_DATA_PASS`、
+`STEP57_WRITE_PARALLEL_SAME_INODE_ORDER_PASS`、
+`STEP57_WRITE_PARALLEL_DURABILITY_PASS`、`STEP57_WRITE_PARALLEL_PASS`
+（umount 16 ms）。回归通过 `STEP51_WRITE_BEHIND_PASS`（12 ms）、
+`STEP50_DOUBLE_PACK_PASS`（56 ms）与 `STEP54_VFS_PIPE_PASS`（204 ms）。所有
+insmod/mount/loop 仅在 vng guest；新专项脚本与 C helper 仅位于 `tests/`。
+
+DOC-SWEEP 已同步 README、cache 设计、配置指标与测试索引，并把 HANDOFF 中过时的
+根目录测试路径统一到 `tests/`。限制仍是固定 8 lanes、每 folio IPC 同步等待、
+FileMetaStore metadata commit 串行；未引入 io_uring 用户态 API、跨机锁、自动 wipe
+或额外 write-back 语义。Cursor 验收报告见下；Codex 详情见 `docs/remaining-capabilities.md` §9。
+
+
+Cursor 验收自检（2026-09-21）：209 tests；clippy / make 零警告；vng
+`STEP57_WRITE_PARALLEL_PASS`（peak=2，umount_ms=18；data/same-inode-order/durability PASS）。
+
 ## 8. 路线图（未做）
 
 按 Cursor 既定策略的推荐优先级：
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 56 验收** | 双包实现已交付，见 remaining-capabilities §9 |
+| 1 | **Step 57 验收** | 双包实现已交付，见 remaining-capabilities §9 |
 | 2 | 其后 | 视 Cursor 验收后继续双包 |
 
 
@@ -2014,7 +2005,7 @@ mkdir -p "$data_dir"
 ## 10. 交接检查清单
 
 - [x] Step 50 双包已由 Cursor 验收并提交
-- [x] IPC ABI = 24；cache format = v4
+- [x] 工作树 IPC ABI = 25；cache format = v4
 - [x] Step 8–53 已验收状态已写清
 - [x] Step 51 双包已由 Cursor 验收并提交
 - [x] Step 52 双包已由 Cursor 验收并提交
@@ -2024,7 +2015,9 @@ mkdir -p "$data_dir"
 - [x] Step 55 双包已由 Cursor 验收并提交
 - [x] 测试脚本约定：仅 `tests/`（见 `tests/README.md`）
 - [x] Step 56 双包已由 Cursor 验收并提交
-- [x] 当前待验收：Step 57 常规双包（WRITE-DATA-PARALLEL + DOC-SWEEP；见 remaining-capabilities §8）
+- [x] Step 57 双包已由 Cursor 验收并提交
+- [x] IPC ABI = 25；cache format = v4；SHM = 278720
+- [x] 当前待验收：Step 58 常规双包（META-MUTATION-PARALLEL + FAILCLOSED-TEST；见 remaining-capabilities §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 
@@ -2036,8 +2029,6 @@ mkdir -p "$data_dir"
 
 ## 11. 文档债务
 
-以下文档与代码不一致，后续应更新（优先级低于功能开发）：
-
-| 文件 | 问题 | 代码实际值 |
-|---|---|---|
-| `README.md` 细节 | 未逐一列举全部 DATA opcode | 完整 opcode 表见 `HANDOFF.md` / `kestrelfs_ipc.h` |
+Step 57 已清理测试脚本路径、ABI/共享区尺寸及 Step 54–56 写回/观测表述。
+README 保持概览定位，不重复完整 opcode 表；opcode 权威清单仍为本文件 §5.4 与
+`kestrelfs/kestrelfs_ipc.h`。当前无已知可立即机械修正的文档债务。

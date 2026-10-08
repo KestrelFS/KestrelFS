@@ -27,6 +27,8 @@ struct iov_iter;
 /* Per-regular-inode state; deliberately kept on standard iget_locked(). */
 struct kestrelfs_inode_state {
 	struct mutex lifecycle_lock;
+	/* Orders WRITE_DATA_PARALLEL publication and completion for this inode. */
+	struct mutex write_data_lock;
 	unsigned int open_handles;
 	u64 pagecache_coherence_epoch;
 	struct inode *inode;

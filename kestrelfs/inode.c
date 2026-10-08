@@ -177,6 +177,7 @@ struct inode *kestrelfs_get_inode(struct super_block *sb, u64 ino,
 			return ERR_PTR(-ENOMEM);
 		}
 		mutex_init(&state->lifecycle_lock);
+		mutex_init(&state->write_data_lock);
 		inode->i_private = state;
 		kestrelfs_pagecache_register_inode(inode);
 		/* Folio reads and delayed data writeback share this mapping. */

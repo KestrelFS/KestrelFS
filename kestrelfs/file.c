@@ -44,11 +44,27 @@
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/bitmap.h>
 
 #include "kestrelfs.h"
 
-/* One shared bounce buffer means at most one bulk data IPC may be in flight. */
+/* Reads/names retain the legacy single bounce lock. Writes use the dedicated
+ * ABI v25 lane pool below and are ordered per inode.
+ */
 DEFINE_MUTEX(kestrelfs_data_ipc_lock);
+static DECLARE_WAIT_QUEUE_HEAD(kestrelfs_write_lane_wait);
+static DEFINE_SPINLOCK(kestrelfs_write_lane_lock);
+static unsigned long kestrelfs_write_lane_bitmap;
+static unsigned int kestrelfs_write_data_parallel_active;
+module_param_named(write_data_parallel_active,
+		   kestrelfs_write_data_parallel_active, uint, 0444);
+MODULE_PARM_DESC(write_data_parallel_active,
+		 "Current in-flight WRITE_DATA_PARALLEL lane owners");
+static unsigned int kestrelfs_write_data_parallel_peak;
+module_param_named(write_data_parallel_peak,
+		   kestrelfs_write_data_parallel_peak, uint, 0444);
+MODULE_PARM_DESC(write_data_parallel_peak,
+		 "Peak simultaneous WRITE_DATA_PARALLEL lane owners");
 static unsigned long kestrelfs_write_pipe_staged_bytes;
 module_param_named(write_pipe_staged_bytes,
 		   kestrelfs_write_pipe_staged_bytes, ulong, 0444);
@@ -69,6 +85,53 @@ module_param_named(write_pipe_submissions,
 		   kestrelfs_write_pipe_submissions, ulong, 0444);
 MODULE_PARM_DESC(write_pipe_submissions,
 		 "WRITE_DATA chunks submitted from pre-staged folios");
+
+static int kestrelfs_write_lane_try_acquire(void)
+{
+	unsigned long flags;
+	unsigned int lane;
+	int ret = -EAGAIN;
+
+	spin_lock_irqsave(&kestrelfs_write_lane_lock, flags);
+	lane = find_first_zero_bit(&kestrelfs_write_lane_bitmap,
+				   KESTRELFS_WRITE_DATA_LANES);
+	if (lane < KESTRELFS_WRITE_DATA_LANES) {
+		__set_bit(lane, &kestrelfs_write_lane_bitmap);
+		kestrelfs_write_data_parallel_active++;
+		if (kestrelfs_write_data_parallel_active >
+		    kestrelfs_write_data_parallel_peak)
+			kestrelfs_write_data_parallel_peak =
+				kestrelfs_write_data_parallel_active;
+		ret = lane;
+	}
+	spin_unlock_irqrestore(&kestrelfs_write_lane_lock, flags);
+	return ret;
+}
+
+static int kestrelfs_write_lane_acquire(void)
+{
+	int lane;
+
+	wait_event(kestrelfs_write_lane_wait,
+		   (lane = kestrelfs_write_lane_try_acquire()) >= 0);
+	return lane;
+}
+
+static void kestrelfs_write_lane_release(unsigned int lane)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kestrelfs_write_lane_lock, flags);
+	WARN_ON_ONCE(lane >= KESTRELFS_WRITE_DATA_LANES ||
+		     !test_bit(lane, &kestrelfs_write_lane_bitmap));
+	if (lane < KESTRELFS_WRITE_DATA_LANES &&
+	    test_bit(lane, &kestrelfs_write_lane_bitmap)) {
+		__clear_bit(lane, &kestrelfs_write_lane_bitmap);
+		kestrelfs_write_data_parallel_active--;
+	}
+	spin_unlock_irqrestore(&kestrelfs_write_lane_lock, flags);
+	wake_up(&kestrelfs_write_lane_wait);
+}
 static atomic64_t kestrelfs_pagecache_coherence_epoch = ATOMIC64_INIT(0);
 static DEFINE_MUTEX(kestrelfs_coherence_inodes_lock);
 static LIST_HEAD(kestrelfs_coherence_inodes);
@@ -501,13 +564,23 @@ int kestrelfs_sync_daemon(u32 opcode, u64 inode_id)
 static int kestrelfs_regular_fsync(struct file *file, loff_t start,
 				   loff_t end, int datasync)
 {
+	struct kestrelfs_inode_state *state = file_inode(file)->i_private;
 	int ret;
 
+	if (!state)
+		return -EIO;
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
 		return ret;
-	/* The daemon barrier follows successful folio writeback. */
-	return kestrelfs_sync_daemon(KESTRELFS_OP_FSYNC, file_inode(file)->i_ino);
+	/* Exclude another same-inode WRITE_DATA_PARALLEL between the successful
+	 * writeback wait and the daemon durability barrier.
+	 */
+	ret = mutex_lock_interruptible(&state->write_data_lock);
+	if (ret)
+		return ret;
+	ret = kestrelfs_sync_daemon(KESTRELFS_OP_FSYNC, file_inode(file)->i_ino);
+	mutex_unlock(&state->write_data_lock);
+	return ret;
 }
 
 static int kestrelfs_regular_flush(struct file *file, fl_owner_t id)
@@ -911,6 +984,7 @@ static int kestrelfs_write_folio(struct folio *folio,
 				 struct writeback_control *wbc, void *data)
 {
 	struct inode *inode = folio->mapping->host;
+	struct kestrelfs_inode_state *state = inode->i_private;
 	struct kestrelfs_shared_region *region;
 	u8 *staging = NULL;
 	loff_t offset = folio_pos(folio);
@@ -920,10 +994,15 @@ static int kestrelfs_write_folio(struct folio *folio,
 	size_t done = 0;
 	u64 wait_started;
 	u64 lock_started;
+	int lane = -1;
 	int ret = 0;
 
 	if (!length)
 		goto out_unlock;
+	if (!state) {
+		ret = -EIO;
+		goto out_unlock;
+	}
 	folio_start_writeback(folio);
 	/* The folio is locked and under writeback, so its bytes are stable. Copy
 	 * them before contending on the one shared bounce buffer. This leaves only
@@ -938,7 +1017,11 @@ static int kestrelfs_write_folio(struct folio *folio,
 	}
 	memcpy_from_folio(staging, folio, 0, length);
 	wait_started = ktime_get_ns();
-	mutex_lock(&kestrelfs_data_ipc_lock);
+	/* Serialize one inode's COW slices and durability order, but let
+	 * independent inodes reserve different shared-memory lanes.
+	 */
+	mutex_lock(&state->write_data_lock);
+	lane = kestrelfs_write_lane_acquire();
 	lock_started = ktime_get_ns();
 	kestrelfs_write_pipe_lock_wait_ns += lock_started - wait_started;
 	kestrelfs_write_pipe_staged_bytes += length;
@@ -960,11 +1043,12 @@ static int kestrelfs_write_folio(struct folio *folio,
 			((u64)(offset + done) % KESTRELFS_MODEL_CHUNK_SIZE);
 
 		chunk = min_t(u64, chunk, chunk_boundary);
-		memcpy(region->data_buffer, staging + done, chunk);
-		req.opcode = KESTRELFS_OP_WRITE_DATA;
+		memcpy(region->write_data_buffers[lane], staging + done, chunk);
+		req.opcode = KESTRELFS_OP_WRITE_DATA_PARALLEL;
 		put_unaligned_le64(inode->i_ino, &req.payload[0]);
 		put_unaligned_le64(offset + done, &req.payload[8]);
 		put_unaligned_le32(chunk, &req.payload[16]);
+		put_unaligned_le32(lane, &req.payload[20]);
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		if (ret)
 			break;
@@ -981,7 +1065,9 @@ static int kestrelfs_write_folio(struct folio *folio,
 	}
 out_mutex:
 	kestrelfs_write_pipe_lock_hold_ns += ktime_get_ns() - lock_started;
-	mutex_unlock(&kestrelfs_data_ipc_lock);
+	if (lane >= 0)
+		kestrelfs_write_lane_release(lane);
+	mutex_unlock(&state->write_data_lock);
 	kvfree(staging);
 out_writeback:
 	if (ret) {
@@ -1261,6 +1347,7 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (attr->ia_valid & ATTR_SIZE) {
 		u64 inode_id = inode->i_ino;
 		u64 new_size = attr->ia_size;
+		struct kestrelfs_inode_state *state = inode->i_private;
 		struct kestrelfs_event req = { 0 };
 		struct kestrelfs_event resp = { 0 };
 
@@ -1268,14 +1355,22 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		ret = filemap_write_and_wait(inode->i_mapping);
 		if (ret)
 			return ret;
-		/* Order a cold folio fill against truncate just like a write. */
-		ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+		if (!state)
+			return -EIO;
+		ret = mutex_lock_interruptible(&state->write_data_lock);
 		if (ret)
 			return ret;
+		/* Order a cold folio fill against truncate just like a write. */
+		ret = mutex_lock_interruptible(&kestrelfs_data_ipc_lock);
+		if (ret) {
+			mutex_unlock(&state->write_data_lock);
+			return ret;
+		}
 		/* Fail the mutation if its persistent invalidation cannot commit. */
 		ret = kestrelfs_cache_invalidate_inode(inode_id);
 		if (ret) {
 			mutex_unlock(&kestrelfs_data_ipc_lock);
+			mutex_unlock(&state->write_data_lock);
 			return ret;
 		}
 
@@ -1289,6 +1384,7 @@ int kestrelfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		/* Use unified sync call with total deadline (2 seconds) */
 		ret = kestrelfs_ipc_sync_call(&req, &resp);
 		mutex_unlock(&kestrelfs_data_ipc_lock);
+		mutex_unlock(&state->write_data_lock);
 		if (ret) {
 			pr_err("kestrelfs: TRUNCATE inode=%llu new_size=%llu failed: %d\n",
 			       inode_id, new_size, ret);
