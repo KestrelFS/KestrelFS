@@ -61,12 +61,20 @@ daemon 目前以结构化文本日志提供其余最小观测，不提供 Promet
 | `coherence revision A -> B; invalidated N dirty inode caches` | Redis durable revision 的细粒度 inode 失效 |
 | `writer session registered ... ttl_ms=...` | Redis writer session 已注册；日志只含随机 session id，不含 URL/凭据 |
 | `writer session was fenced or expired` / `heartbeat failed` | writer 已 fail closed / 心跳暂时失败并重试 |
+| `META-PERSIST parallel active=N peak=N sequence=N` | FileMetaStore 正在并行准备的版本与进程峰值；`peak>1` 证明不同 mutation 的 JSON/temp-file/fsync 阶段发生重叠 |
+| `META-PERSIST sequence=N failed: ...` | FileMetaStore 某版本写入或发布失败；对应 IPC 返回 EIO，不会假装提交成功 |
 
 `orphan_retry_pending` 是安全相关 gauge：它不为零时不要强制卸载模块。daemon 把 proof
 写入 `{data-dir}/.orphan-retries-v1.json`，执行 temp-file `fsync`、原子 rename 与目录
 `fsync` 后才 ACK 内核；部署必须在 daemon 重启时复用同一 `--data-dir`。状态文件损坏
 或版本未知会使 daemon 启动失败（fail closed），不会清空后继续运行。仍打开的 inode
 不会进入该文件；Redis session TTL 也不会被当作 fd 已关闭的证据。
+
+FileMetaStore 使用 `meta.json.tmp.<sequence>` 唯一临时文件并在发布前 fsync；最终
+rename 后同步 data-dir。不同版本可并行准备，发布只允许单调向前，旧快照不得覆盖
+已发布的新快照。启动时若 `meta.json` JSON/语义校验失败，或发现旧 `meta.tmp` / 新
+`meta.json.tmp.*` 半提交文件，daemon 会 fail closed，不会清空 namespace 后继续。
+运维应先保留现场并人工判断/恢复，不能把删除临时文件当作自动修复流程。
 
 ## 挂载参数
 
@@ -136,6 +144,8 @@ fencing generation、跨节点锁、range lease 或线性一致性。
   cache metadata，使旧 slot 不可寻址，**不是 data 区安全擦除**。
 - daemon 测试使用独立 `data_dir=/tmp/kestrelfs-<step>-$$`，并将输出保存在
   `"$data_dir/daemon.log"`；禁止丢到 `/dev/null`。
+- FileMetaStore 的损坏 `meta.json`、结构不一致快照或遗留临时提交默认拒绝启动；
+  不提供自动 reset、自动选择临时版本或静默 fresh fallback。
 
 cache format v4 的磁盘布局、不变量与恢复协议见
 [`phase4-nvme-cache.md`](phase4-nvme-cache.md)。

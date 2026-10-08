@@ -382,8 +382,9 @@ fn main() -> io::Result<()> {
     println!("kestrelfs-daemon: MetaStore initialized (seeded: /, /remote.txt, /writable.dat)");
 
     // Potentially slow ObjectStore deletes run away from the serial IPC ring
-    // consumer. Only this thread acknowledges successful deletes in MetaStore,
-    // so FileMetaStore remains a single-writer despite the background I/O.
+    // consumer. Only this thread acknowledges successful deletes in MetaStore;
+    // parallel write batches may overlap FileMetaStore persistence, whose
+    // ordered prepare/publish protocol keeps the snapshot coherent.
     let mut gc_worker = GcWorker::start(runtime.handle(), Arc::clone(&object_store));
     let gc_scheduler = gc_worker.scheduler();
     GC_SCHEDULER
@@ -2689,7 +2690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_write_lanes_round_trip_different_inodes() {
+    async fn step58_parallel_write_lanes_round_trip_and_reject_invalid_lane() {
         let store: Arc<dyn MetaStore> = Arc::new(MemStore::new());
         let objects: Arc<dyn ObjectStore> = Arc::new(object_store::MemObjectStore::new());
         let first = store
@@ -2746,6 +2747,7 @@ mod tests {
                 .error_code,
             -libc::EINVAL
         );
+        println!("STEP58_FAILCLOSED_LANE_PASS");
         // SAFETY: no handler retains the pointer after awaiting above.
         unsafe { std::alloc::dealloc(region.cast::<u8>(), layout) };
     }

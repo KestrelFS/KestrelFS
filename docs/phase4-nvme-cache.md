@@ -1,6 +1,6 @@
 # Phase 4：内核拥有的 NVMe 缓存
 
-## 当前边界（Step 18–57）
+## 当前边界（Step 18–58）
 
 KestrelFS 的本地缓存由内核模块拥有。缓存命中时，内核直接把块设备中的
 数据交给 VFS 调用者，不进入共享 ring，也不唤醒 Rust daemon。daemon 仍是
@@ -131,6 +131,13 @@ Step 57 将写回从旧的单 bounce `WRITE_DATA` 切到 ABI v25
 环中连续的 parallel-write 批次，响应仍按请求顺序发布；FSYNC/SYNC_FS 或任意非写
 请求会形成批次边界。READ_DATA 与名字 opcode 继续使用原 16 KiB data buffer 和
 全局 mutex。cache format 仍为 v4；这不是用户态异步 API 或 io_uring 导出。
+
+Step 58（待验收）解除 Step 57 后端的 FileMetaStore 单一磁盘临界区：内存 mutation
+与一致快照捕获仍短时有序，JSON 编码、唯一 temp 写入和 fsync 可由不同 inode 的
+parallel-write future 重叠；最终 rename/目录 fsync 在短 publish 锁内单调发布。
+较新快照包含所有更早 mutation，先发布时会令迟到旧快照仅删除自身 temp，禁止状态
+倒退。损坏 `meta.json`、语义不一致快照或遗留 temp 在启动时 fail closed。该步不改
+kernel cache hit/fill/invalidate、IPC ABI v25、278720-byte SHM 或 cache format v4。
 
 Step 27 增加独立用户态 `kestrelfs-cache-admin`，不改模块正常加载路径。`inspect`
 以只读方式解析 v4 superblock、journal 和完整 index 区；块设备还会请求 exclusive

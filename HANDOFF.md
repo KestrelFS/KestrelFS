@@ -1,6 +1,6 @@
 # KestrelFS 研发交接文档（HANDOFF）
 
-> **最后更新**：Step 57（WRITE-DATA-PARALLEL + DOC-SWEEP）已验收；IPC ABI v25、cache format v4。测试脚本统一位于 `tests/`。下一步见 remaining-capabilities §8。
+> **最后更新**：Step 58（META-MUTATION-PARALLEL + FAILCLOSED-TEST）已验收；IPC ABI v25、cache format v4。测试脚本统一位于 `tests/`。下一步见 remaining-capabilities §8。
 > **核对应法**：以 `git log --oneline -5` 与本文件进度表为准；若与代码冲突，以代码为准并更新本文档。规划/决策以 `docs/remaining-capabilities.md` 为准。
 
 ---
@@ -14,7 +14,7 @@
 | 一句话定位 | 高性能云原生分布式文件系统；C 内核模块 + Rust daemon 混合架构；对标/超越 JuiceFS（缓存命中路径零上下文切换） |
 | License | Apache-2.0 |
 | 上游 | `https://github.com/KestrelFS/KestrelFS`（以 README 为准） |
-| 当前阶段 | Step 57 已验收；下一步常规双包 Step 58（见 remaining-capabilities §8） |
+| 当前阶段 | Step 58 已验收；下一步常规双包 Step 59（见 remaining-capabilities §8） |
 
 ---
 
@@ -58,7 +58,7 @@
 
 - **内核模块** `kestrelfs.ko`：out-of-tree，注册 VFS 文件系统类型，实现 super/inode/dir/file operations。通过 `/dev/kestrel_ctl` 字符设备与 daemon 通信。
 - **字符设备** `/dev/kestrel_ctl`：单个 `mmap()` 共享内存区域（278720 B，约 272 KiB），内含两条独立无锁 SPSC 环形缓冲区（REQ 环 + RESP 环，各 1024 slot × 64 字节）、一块 16 KiB read/name bounce buffer，以及 8 条 16 KiB parallel-write lane。唤醒模型：内核→Rust 用 `wake_up_interruptible()` + `poll()`；Rust→内核用 `KESTRELFS_IOC_NOTIFY_RESP` ioctl。
-- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环；普通请求保持顺序处理，连续 `WRITE_DATA_PARALLEL` 批次可并发等待后端并按 REQ 顺序推回 RESP。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
+- **用户态 daemon** `kestrelfs-daemon`：Tokio 异步运行时。`poll()` 驱动事件循环；普通请求保持顺序处理，连续 `WRITE_DATA_PARALLEL` 批次可并发等待后端并按 REQ 顺序推回 RESP。Step 58 已验收路径让 FileMetaStore 的不同版本并行完成 JSON/temp/fsync，最终单调发布，损坏或遗留半提交状态启动时 fail closed。MetaStore 管理元数据（inode/dirent/slice）及待删除对象队列，ObjectStore 管理块数据；Step 30 在启动及运行中重试幂等删除；Step 31 把 Redis metadata 拆为 v2 分记录 HASH/SET，并以 Lua revision-CAS 原子提交复合 mutation；Step 42 实现为每个 revision 附加有界 dirty-inode 日志，正常变化按 inode 批量失效，历史不可用或 probe 失败时保守全失效。Step 36 可持久保留 nlink=0 orphan，并在最后 close 后原子进入 GC；Step 37/39 让 Mem/File/Redis 持久更新 inode mode/uid/gid；Step 40 扩展到显式 atime/mtime。
 - **数据模型**（JuiceFS-like 分层）：File → Chunk（64 MiB 固定窗口）→ Slice（变长写记录，COW 语义）→ Block（4 MiB 物理对象，存于 ObjectStore）。
 - **NVMe 缓存边界**：缓存由内核拥有；v4 superblock 持久化 32-byte namespace SHA-256 identity 并由 CRC32 保护，指定 cache_device 时必须传 64-hex `cache_namespace`，不匹配则在恢复索引前 fail closed。Step 22–26 落地最多 128 KiB pinned-page BIO、block-LRU、CRC32、单页 intent journal 和 rwsem 并行 hit；Step 27 提供离线 inspect/双确认 metadata wipe。Step 28 把动态 regular file 切到 `read_iter`，cache hit 和 READ_DATA miss 直接消费 `iov_iter`；Step 45 已把普通读改经 filemap `read_folio`/`readahead`；Step 46 已落地有限文件 mmap。Step 48 已落地 hit BIO 的异步 completion，同 inode 冷 folio可并发提交。Step 49/50 落地 dirty folio/writepages 与可写 MAP_SHARED；Step 51 去掉普通 write_iter 的强制等待，交给 BDI flusher或显式同步推进。Step 54 为普通文件接入 splice/sendfile 并在共享 buffer 外预暂存；Step 57 已验收实现以 8 条 lane 让不同 inode 的同步 writeback IPC 重叠，同 inode 仍有序。Step 29 在 v4 journal reserved 中记录最多 64 个 batch victim（默认 16 且至多总槽位 1/16），按 index page 合并清零，提交后才允许 slot 复用。正常 insmod/mount 路径仍不会自动 wipe/迁移。尚无用户态异步读接口或生产级多节点 lease。禁止把普通文件当 cache 设备。详细设计见 `docs/phase4-nvme-cache.md`；配置参数唯一权威表见 `docs/configuration.md`。
 
@@ -181,6 +181,7 @@ FerroFS/                         # 仓库根目录（产品名 KestrelFS）
 | **Phase 4/POSIX Step 55** | **精确 READDIR_DATA d_type + 受限 persistent whiteout mknod** | **24** | **✅ 已验收** |
 | **Phase 4/运维 Step 56** | **orphan retry 持久交接 + rmmod guard + 最小运维指标** | **24（未变）** | **✅ 已验收** |
 | **Phase 4/内核+文档 Step 57** | **不同 inode WRITE_DATA 并行 lane + 文档清扫** | **25** | **✅ 已验收** |
+| **Phase 4/控制面+测试 Step 58** | **FileMetaStore mutation 持久阶段并行 + fail-closed 回归** | **25（未变）** | **✅ 已验收** |
 
 Cursor 对照代码、151 tests、Redis 门控测与 `STEP32_POSIX_CORE_PASS` 确认 Step 32 已验收。
 硬链接持久 nlink + 末引用 GC；`iget_locked` 同挂载别名共享 VFS inode。ABI **v12**；format **v4**。
@@ -256,7 +257,9 @@ Cursor 对照代码、208 tests 与 `STEP56_DOUBLE_PACK_PASS` 确认 Step 56 已
 
 Cursor 对照代码、209 tests 与 `STEP57_WRITE_PARALLEL_PASS` 确认 Step 57 已验收。 8×16 KiB write lane + `WRITE_DATA_PARALLEL`；ABI **v25**；format **v4**；SHM **278720**。
 
-待验收：见 `docs/remaining-capabilities.md` §8（Step 58 常规双包）。
+Cursor 对照代码、214 tests 与 `STEP58_META_PARALLEL_PASS` / `STEP58_FAILCLOSED_PASS` 确认 Step 58 已验收。 FileMetaStore 持久阶段并行 + fail-closed；ABI **v25** 未变；format **v4**。
+
+待验收：见 `docs/remaining-capabilities.md` §8（Step 59 常规双包）。
 > **当前工作树 ABI**：`KESTRELFS_ABI_VERSION = 25`（新增 8 条 parallel-write lane 与 opcode 27）
 
 ### 5.2 关键 Bug 修复（按时间倒序）
@@ -366,8 +369,8 @@ Cursor 对照代码、209 tests 与 `STEP57_WRITE_PARALLEL_PASS` 确认 Step 57 
 | 5 | **按 ino 使用基础 iget，未恢复历史 iget5 自定义方案** | Step 32 为保证硬链接别名共享 VFS `i_nlink`，改用标准 `iget_locked(sb, ino)`；Step 36 的 open-handle 生命周期也只放在该标准 inode 的 `i_private`，没有恢复曾导致卸载死循环的 `iget5_locked()` 自定义 test/set。 | `kestrelfs/inode.c` `kestrelfs_get_inode()` |
 | 6 | **inode/open identity 仍是单挂载、daemon inode id** | 同一 superblock 内的硬链接别名复用 inode 与 open 计数；不同 mount 各自维护 VFS inode/open 计数，MetaStore 仍是持久属性权威。Step 36 跨 mount 的最终 unlink 判断尚不具备全局 open 计数。 | 同上、`daemon/src/meta.rs` |
 | 7 | **evict_inode 禁止发 IPC** | `kestrelfs_evict_inode()` 只做 `truncate_inode_pages_final` + `clear_inode`，绝不发 IPC（daemon 可能已关闭，会死锁）。 | `kestrelfs/inode.c` |
-| 8 | **JSON 全量落盘** | `FileMetaStore` 每次写操作后将整个元数据状态序列化为 JSON 写盘。简单但低效；inode 数量大时性能差。 | `daemon/src/meta_persist.rs` `sync_to_disk()` |
-| 9 | **meta.json 损坏 → 数据丢失** | 若 `meta.json` 反序列化失败（JSON 损坏），daemon 回退到全新 `MemStore::new()`（仅含 root + remote.txt + writable.dat），之前用户创建的文件元数据全部丢失。块数据仍在磁盘但无法访问。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` |
+| 8 | **FileMetaStore 仍是 JSON 全量快照** | Step 58 已验收路径把短时 mutation+snapshot 排序与 JSON/temp/fsync 分开，不同 inode 的磁盘准备可重叠且最终按版本单调发布；但每次 mutation 仍克隆并序列化全状态，最终 rename 仍短时串行。inode/slice 很多时写放大明显，尚无增量 WAL/分片或多进程协调。 | `daemon/src/meta_persist.rs` `mutate_and_persist()` / `persist_snapshot()` |
+| 9 | **FileMetaStore 损坏/半提交 fail closed** | Step 58 已验收路径不再对损坏 JSON 静默 fresh fallback；JSON/语义校验失败、旧 `meta.tmp` 或新 `meta.json.tmp.*` 遗留都会拒绝启动。这样不会把原 namespace 假装成空目录，但恢复需人工保留现场、判断权威版本；当前不自动选择 temp 或修复。rename 已成功但目录 fsync 报错时，调用者仍可能得到“不确定是否生效”的 EIO。 | `daemon/src/meta_persist.rs` `FileMetaStore::new()` / `persist_snapshot()` |
 | 10 | **mknod 仅开放 whiteout marker** | Step 50 的 `RENAME_WHITEOUT` 与 Step 55 受限 `.mknod` 都持久化 `S_IFCHR` 0:0 marker；mknod 要求 `CAP_MKNOD`，其它字符/块设备、FIFO/socket 均不支持。Step 55 readdir 对 file/dir/symlink/whiteout 分别返回 `DT_REG/DT_DIR/DT_LNK/DT_CHR`。 | `kestrelfs/dir.c`、`kestrelfs/inode.c`、`daemon/src/meta.rs` |
 | 11 | **目录 nlink 只表达直接子目录数** | Step 34 按 POSIX 常见不变量持久化 `2 + immediate_subdirectory_count`，覆盖 mkdir/rmdir 与目录 rename；它不是递归后代计数。不同 mount 的 VFS inode 仍各自刷新 MetaStore 权威值。 | `daemon/src/meta.rs`、`kestrelfs/dir.c` |
 | 12 | **READDIR_DATA 每批受 16 KiB 限制** | daemon 按 inode 排序并在 bounce 中打包尽可能多的完整变长条目；大目录仍需分页 IPC，但不再固定每次只返回 1 条。 | `daemon/src/main.rs` `handle_readdir_data()` |
@@ -378,7 +381,7 @@ Cursor 对照代码、209 tests 与 `STEP57_WRITE_PARALLEL_PASS` 确认 Step 57 
 | 17 | **orphan 自动清扫只覆盖内核已证明的 final-close 失败** | Step 56 已验收实现只接收 mount-local `open_handles==0` 且 `FINALIZE_ORPHAN` 失败的 proof。未持久接收的 proof 持有模块引用，正常 rmmod 被拒绝；daemon 经 temp fsync + rename + 目录 fsync 写入 `{data-dir}/.orphan-retries-v1.json` 后才 ACK，因而可跨 daemon 与模块重启回放。仍 open 的 inode 绝不入队，也不从 Redis session TTL 猜测；须复用同一 data-dir，强制卸载或遗失该目录仍可能泄漏，不同 mount 的全局 open 引用仍未聚合。 | `kestrelfs/file.c`、`daemon/src/orphan_retry.rs`、`daemon/src/main.rs` |
 | 18 | **Redis v2 写放大已降低，mutation 读放大仍在** | Step 31 把 metadata 拆为固定 HASH/SET，`lookup/getattr/read_slices/readlink` 定向读取，mutation 只写发生变化的 fields；但为复用 MemStore 的完整 rename/truncate/引用确认语义，每次 mutation 仍一致读取各聚合 HASH 并在客户端计算 diff，冲突最多重试 64 次。readdir 与 GC 引用确认也仍有聚合扫描。 | `daemon/src/meta_redis.rs` |
 | 19 | **远端 metadata/object 必须成对配置** | Step 17 已可用 Redis + S3 补齐共享数据面；若只启用 Redis 而仍用不同节点的 LocalFs，或只启用 S3 而各节点使用不同 FileMetaStore，仍会出现 metadata/object 视图不一致。 | `daemon/src/main.rs` 存储选择 |
-| 20 | **Redis schema 异常/旧 v1 fail closed** | 与 FileMetaStore 的“损坏后重置”不同，v2 control/record 非法、版本未知、control 缺失但残留 v2 key 或旧 `<prefix>:meta:v1` 存在时 daemon 启动失败；运行中 schema/control 被删除或破坏时 metadata 操作返回 EIO。没有 v1 自动迁移或自动 wipe。 | `daemon/src/meta_redis.rs` |
+| 20 | **Redis schema 异常/旧 v1 fail closed** | v2 control/record 非法、版本未知、control 缺失但残留 v2 key 或旧 `<prefix>:meta:v1` 存在时 daemon 启动失败；运行中 schema/control 被删除或破坏时 metadata 操作返回 EIO。FileMetaStore 自 Step 58 已验收路径起也对损坏/半提交 fail closed。两者都没有自动迁移或自动 wipe。 | `daemon/src/meta_redis.rs`、`daemon/src/meta_persist.rs` |
 | 21 | **Redis 连接硬化仍非生产 HA** | Step 53 已验收路径接受 `redis://` / `rediss://`，私有 CA 可经 `--redis-ca-cert` 注入；命令 connection manager 与 Pub/Sub 订阅均可自动重连。断线期间无法确认的单次请求仍可能返回 EIO，后续请求恢复；没有 mutation 幂等重放、独立健康检查、Sentinel/Cluster 拓扑管理。URL 可能含凭据，启动日志仍不打印 URL。 | `daemon/src/meta_redis.rs`、`daemon/src/main.rs`、`docs/configuration.md` |
 | 22 | **S3 GC 是持久队列 + at-least-once delete** | Step 41 用容量 32、每项最多 64 keys、delete 并发 4 的 worker 隔离慢 S3；背压/失败不丢 durable key，成功结果由串行 metadata 线程确认。多 daemon 仍可能重复处理同一 Redis `gc` SET，幂等 delete/revision-CAS ack 可容忍；尚无跨 Redis/S3 事务、dead-letter 或运维限额。 | `daemon/src/gc_worker.rs`、`daemon/src/object_store_s3.rs`、`daemon/src/meta_redis.rs`、`daemon/src/main.rs` |
 | 23 | **S3 原型不创建生产 bucket** | daemon 要求 bucket 已存在；只有设置 `S3_CREATE_BUCKET=1` 的门控测试会创建测试 bucket。自定义 endpoint 自动 force path-style；真实 AWS 默认使用 SDK endpoint/addressing。 | `daemon/src/object_store_s3.rs` |
@@ -1941,14 +1944,47 @@ FileMetaStore metadata commit 串行；未引入 io_uring 用户态 API、跨机
 Cursor 验收自检（2026-09-21）：209 tests；clippy / make 零警告；vng
 `STEP57_WRITE_PARALLEL_PASS`（peak=2，umount_ms=18；data/same-inode-order/durability PASS）。
 
+### 7.52 Phase 4/控制面+测试 Step 58 META-MUTATION-PARALLEL + FAILCLOSED-TEST（已验收）
+
+FileMetaStore 不再用一把 mutex 覆盖完整 mutation→JSON→`meta.tmp`→rename。工作树实现
+在短时 `prepare_sync` 内完成 MemStore mutation、一致快照和单调 sequence 分配；随后
+不同 mutation 可并行执行 JSON 编码、写入唯一 `meta.json.tmp.<sequence>` 和文件
+fsync。最终 `publish_sync` 只保护 rename 与 data-dir fsync；若较新 sequence 先发布，
+它的快照已包含所有较早 mutation，迟到旧版本只删除自己的 temp，不能倒退覆盖。
+同 inode 的内核 `write_data_lock` 与 FileMetaStore prepare 顺序继续保证 slice、truncate、
+unlink/rename-overwrite 和 fsync 的既有边界。Redis 保持 Lua revision-CAS，新增真实
+门控覆盖不同 inode 并发 append。
+
+恢复策略改为 fail closed：已有 `meta.json` 的 JSON 解析、root/dirent/slice/symlink/
+next-inode 语义校验任一失败即拒绝启动；发现旧 `meta.tmp` 或新
+`meta.json.tmp.*` 半提交文件也拒绝，不再静默创建 fresh namespace。日志
+`META-PERSIST parallel active=N peak=N sequence=N` 证明磁盘准备重叠，失败日志保留
+sequence 与底层错误。IPC ABI **v25**、SHM **278720**、cache format **v4** 均不变。
+
+Codex 工作树自检：`cargo test` **214 passed**；clippy `-D warnings`、
+`make -C kestrelfs` 零警告；真实 Redis gate `1 passed` 并输出
+`STEP58_META_REDIS_CAS_CONCURRENT_PASS`。daemon 门控输出损坏 JSON、语义损坏、遗留
+temp、非法 lane 四类 marker 与 `STEP58_FAILCLOSED_PASS`。vng+loop 专项输出
+`STEP58_META_PARALLEL_OVERLAP_PASS lane_peak=2`、data/same-inode/durability marker、
+`STEP58_META_PARALLEL_PASS`（umount 98 ms）；回归 `STEP57_WRITE_PARALLEL_PASS`
+（peak=2、umount 17 ms）及 `STEP51_WRITE_BEHIND_PASS`（umount 14 ms）。所有
+insmod/mount/loop 只在 vng guest，新脚本仅位于 `tests/`。详细报告见
+`docs/remaining-capabilities.md` §9。
+
+
+Cursor 验收自检（2026-10-08）：214 tests；clippy / make 零警告；
+`STEP58_FAILCLOSED_PASS`；Redis gate + `STEP58_META_REDIS_CAS_CONCURRENT_PASS`；
+vng `STEP58_META_PARALLEL_PASS`（lane_peak=2，umount_ms=12；overlap/data/order/durability PASS）。
+
 ## 8. 路线图（未做）
 
 按 Cursor 既定策略的推荐优先级：
 
 | 优先级 | 内容 | 说明 |
 |---|---|---|
-| 1 | **Step 57 验收** | 双包实现已交付，见 remaining-capabilities §9 |
-| 2 | 其后 | 视 Cursor 验收后继续双包 |
+| 1 | **常规双包** | ≈ 2× 既往单步；见 remaining-capabilities §2 |
+| 2 | **Step 59 READ-DATA-PARALLEL + DOC-SWEEP** | 见 remaining-capabilities §8 |
+| 3 | 其后 | 视需要继续双包 |
 
 
 > **⚠️ 明确**：规划与 Codex 提示词以 `docs/remaining-capabilities.md` 为准；本文件只保留已验收事实摘要。未下发新提示词前，不扩大范围。
@@ -2017,7 +2053,8 @@ mkdir -p "$data_dir"
 - [x] Step 56 双包已由 Cursor 验收并提交
 - [x] Step 57 双包已由 Cursor 验收并提交
 - [x] IPC ABI = 25；cache format = v4；SHM = 278720
-- [x] 当前待验收：Step 58 常规双包（META-MUTATION-PARALLEL + FAILCLOSED-TEST；见 remaining-capabilities §8）
+- [x] Step 58 双包已由 Cursor 验收并提交
+- [x] 当前待验收：Step 59 常规双包（READ-DATA-PARALLEL + DOC-SWEEP；见 remaining-capabilities §8）
 - [x] README 保持中文
 - [x] 测试约束：cache/mount 只在 vng+loop；daemon 日志写 `"$data_dir/daemon.log"`（§7.3 / §8 / §9.10）
 

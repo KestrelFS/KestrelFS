@@ -14,18 +14,22 @@
 //!
 //! # Atomicity
 //!
-//! Writes use the standard atomic rename pattern:
-//! 1. Serialize to `{path}.tmp`
-//! 2. `fsync()` the temp file
-//! 3. Rename `{path}.tmp` -> `{path}` (atomic on POSIX)
-//! 4. Explicit fsync/syncfs barriers also sync the renamed file and its
-//!    containing directory so the namespace entry survives a crash.
+//! Writes use versioned temporary files and the standard atomic rename pattern:
+//! 1. Apply one mutation and capture its ordered in-memory snapshot.
+//! 2. Serialize/write/fsync `{path}.tmp.<sequence>`; different mutations may
+//!    perform this expensive stage concurrently.
+//! 3. Under a short publish mutex, rename the newest prepared snapshot to
+//!    `{path}`, then fsync the containing directory. A snapshot that was
+//!    superseded by a newer published sequence is discarded, never allowed to
+//!    overwrite newer state.
 //!
 //! # Recovery
 //!
 //! On daemon startup:
-//! - If `meta.json` exists: load and populate MemStore
-//! - If missing or invalid: start with fresh MemStore (root + bootstrap files)
+//! - If `meta.json` exists: load, validate, and populate MemStore.
+//! - If missing: start with fresh MemStore (root + bootstrap files).
+//! - Invalid JSON/state or a leftover temporary commit fails closed. It is not
+//!   silently replaced with a fresh namespace.
 //!
 //! # Performance
 //!
@@ -37,12 +41,17 @@
 //! A production system would use Redis/TiKV instead (see meta.rs module docs).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 use crate::fs_model::{Inode, Slice};
 use crate::meta::{MetaError, MetaStore, MemStore, Result};
@@ -73,33 +82,54 @@ pub(crate) struct MetaSnapshot {
 pub struct FileMetaStore {
     mem: MemStore,
     path: PathBuf,
-    // Parallel WRITE_DATA requests may mutate different inodes at once. Keep
-    // the whole MemStore mutation + snapshot rename sequence ordered so two
-    // writers never race on the single `meta.tmp` path.
-    mutation_sync: tokio::sync::Mutex<()>,
+    /// Orders only the fast in-memory mutation + snapshot capture. Slow JSON
+    /// encoding, file write, and fsync happen after this lock is released.
+    prepare_sync: Mutex<()>,
+    /// Serializes the final rename and prevents an older snapshot from
+    /// replacing a newer one.
+    publish_sync: Mutex<PublishState>,
+    next_sequence: AtomicU64,
+    persist_active: AtomicUsize,
+    persist_peak: AtomicUsize,
+    #[cfg(test)]
+    persist_barrier: StdMutex<Option<Arc<tokio::sync::Barrier>>>,
+}
+
+#[derive(Default)]
+struct PublishState {
+    published_sequence: u64,
+}
+
+struct PersistActivity<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for PersistActivity<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl FileMetaStore {
     /// Creates a new FileMetaStore, loading from `path` if it exists.
     ///
-    /// If the file doesn't exist or is invalid JSON, starts with a fresh
-    /// MemStore (root + bootstrap files: remote.txt, writable.dat).
+    /// If the file doesn't exist, starts with a fresh MemStore (root +
+    /// bootstrap files: remote.txt, writable.dat). Existing invalid or
+    /// half-committed state is rejected.
     pub async fn new(path: PathBuf) -> std::io::Result<Self> {
+        Self::reject_incomplete_commit(&path).await?;
         let mem = if path.exists() {
-            match Self::load_from_disk(&path).await {
-                Ok(loaded) => {
-                    eprintln!("[meta_persist] Loaded metadata from {}", path.display());
-                    loaded
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[meta_persist] Failed to load {} ({}), starting fresh",
-                        path.display(),
-                        e
-                    );
-                    MemStore::new()
-                }
-            }
+            let loaded = Self::load_from_disk(&path).await.map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "metadata {} failed validation; refusing fresh fallback: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            eprintln!("[meta_persist] Loaded metadata from {}", path.display());
+            loaded
         } else {
             eprintln!(
                 "[meta_persist] No existing metadata at {}, starting fresh",
@@ -111,45 +141,234 @@ impl FileMetaStore {
         Ok(FileMetaStore {
             mem,
             path,
-            mutation_sync: tokio::sync::Mutex::new(()),
+            prepare_sync: Mutex::new(()),
+            publish_sync: Mutex::new(PublishState::default()),
+            next_sequence: AtomicU64::new(1),
+            persist_active: AtomicUsize::new(0),
+            persist_peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            persist_barrier: StdMutex::new(None),
         })
+    }
+
+    async fn reject_incomplete_commit(path: &Path) -> std::io::Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "metadata path has no file name")
+        })?;
+        let numbered_prefix = format!("{}.tmp.", file_name.to_string_lossy());
+        let legacy_tmp = path.with_extension("tmp");
+        if legacy_tmp.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("incomplete metadata commit remains at {}", legacy_tmp.display()),
+            ));
+        }
+        let mut entries = match fs::read_dir(parent).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name().to_string_lossy().starts_with(&numbered_prefix) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "incomplete metadata commit remains at {}",
+                        entry.path().display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Loads a MemStore from disk (internal helper).
     async fn load_from_disk(path: &Path) -> std::io::Result<MemStore> {
         let data = fs::read(path).await?;
         let snapshot: MetaSnapshot = serde_json::from_slice(&data)?;
+        Self::validate_snapshot(&snapshot)?;
 
         Ok(MemStore::from_snapshot(snapshot))
     }
 
-    /// Atomically writes current state to disk (tmp + rename).
-    async fn sync_to_disk(&self) -> std::io::Result<()> {
-        let snapshot = self.mem.snapshot().await;
-        let json = serde_json::to_vec_pretty(&snapshot)?;
-
-        let tmp_path = self.path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp_path).await?;
-        file.write_all(&json).await?;
-        file.sync_all().await?;
-        drop(file);
-
-        fs::rename(&tmp_path, &self.path).await?;
-
+    fn validate_snapshot(snapshot: &MetaSnapshot) -> std::io::Result<()> {
+        let invalid = |message: String| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+        };
+        let root = snapshot
+            .inodes
+            .get(&crate::fs_model::ROOT_INODE)
+            .ok_or_else(|| invalid("metadata snapshot has no root inode".into()))?;
+        if !root.is_dir() {
+            return Err(invalid("metadata root inode is not a directory".into()));
+        }
+        if snapshot
+            .inodes
+            .keys()
+            .max()
+            .is_some_and(|maximum| snapshot.next_inode_id <= *maximum)
+        {
+            return Err(invalid(
+                "metadata next_inode_id does not exceed existing inode ids".into(),
+            ));
+        }
+        for (parent, entries) in &snapshot.dir_entries {
+            if !snapshot.inodes.get(parent).is_some_and(Inode::is_dir) {
+                return Err(invalid(format!(
+                    "directory entry parent {parent} is absent or not a directory"
+                )));
+            }
+            for (name, inode) in entries {
+                if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                    return Err(invalid(format!("invalid persisted directory name {name:?}")));
+                }
+                if !snapshot.inodes.contains_key(inode) {
+                    return Err(invalid(format!(
+                        "directory entry {parent}/{name} references missing inode {inode}"
+                    )));
+                }
+            }
+        }
+        for inode in snapshot.slices.keys() {
+            if !snapshot.inodes.contains_key(inode) {
+                return Err(invalid(format!("slices reference missing inode {inode}")));
+            }
+        }
+        for (inode, target) in &snapshot.symlink_targets {
+            if target.is_empty()
+                || !snapshot
+                    .inodes
+                    .get(inode)
+                    .is_some_and(Inode::is_symlink)
+            {
+                return Err(invalid(format!(
+                    "symlink target references invalid inode {inode}"
+                )));
+            }
+        }
+        for (inode, metadata) in &snapshot.inodes {
+            if metadata.is_symlink() && !snapshot.symlink_targets.contains_key(inode) {
+                return Err(invalid(format!("symlink inode {inode} has no target")));
+            }
+        }
         Ok(())
     }
 
-    async fn sync_existing(&self) -> std::io::Result<()> {
-        match fs::File::open(&self.path).await {
-            Ok(file) => file.sync_all().await?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A fresh namespace has not yet created a metadata snapshot.
-                self.sync_to_disk().await?;
-            }
-            Err(error) => return Err(error),
+    fn begin_persist_activity(&self, sequence: u64) -> PersistActivity<'_> {
+        let active = self.persist_active.fetch_add(1, Ordering::AcqRel) + 1;
+        let previous_peak = self.persist_peak.fetch_max(active, Ordering::AcqRel);
+        if active > previous_peak {
+            println!(
+                "kestrelfs-daemon: META-PERSIST parallel active={active} peak={active} sequence={sequence}"
+            );
         }
+        PersistActivity {
+            active: &self.persist_active,
+        }
+    }
+
+    fn temporary_path(&self, sequence: u64) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .expect("validated metadata path has a file name")
+            .to_os_string();
+        name.push(format!(".tmp.{sequence}"));
+        self.path.with_file_name(name)
+    }
+
+    async fn persist_snapshot(
+        &self,
+        sequence: u64,
+        snapshot: MetaSnapshot,
+    ) -> std::io::Result<()> {
+        let _activity = self.begin_persist_activity(sequence);
+        #[cfg(test)]
+        {
+            let barrier = self.persist_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+        }
+        let json = serde_json::to_vec_pretty(&snapshot)?;
+        let tmp_path = self.temporary_path(sequence);
+        let write_result = async {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .await?;
+            file.write_all(&json).await?;
+            file.sync_all().await?;
+            drop(file);
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
+
+        let mut publish = self.publish_sync.lock().await;
+        if sequence <= publish.published_sequence {
+            fs::remove_file(&tmp_path).await?;
+            return Ok(());
+        }
+        fs::rename(&tmp_path, &self.path).await?;
+        // Once rename succeeds, never permit an older snapshot to overwrite
+        // it, even if the directory fsync below reports an uncertain result.
+        publish.published_sequence = sequence;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::File::open(parent).await?.sync_all().await
+    }
+
+    async fn mutate_and_persist<T, F>(&self, mutation: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let prepare = self.prepare_sync.lock().await;
+        let value = mutation.await?;
+        let snapshot = self.mem.snapshot().await;
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        drop(prepare);
+        self.persist_snapshot(sequence, snapshot)
+            .await
+            .map_err(|error| {
+                eprintln!(
+                    "kestrelfs-daemon: META-PERSIST sequence={sequence} failed: {error}"
+                );
+                MetaError::Io
+            })?;
+        Ok(value)
+    }
+
+    async fn persist_current_snapshot(&self) -> std::io::Result<()> {
+        let prepare = self.prepare_sync.lock().await;
+        let snapshot = self.mem.snapshot().await;
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        drop(prepare);
+        self.persist_snapshot(sequence, snapshot).await
+    }
+
+    async fn sync_existing(&self) -> std::io::Result<()> {
+        if !self.path.exists() {
+            self.persist_current_snapshot().await?;
+        }
+        let _publish = self.publish_sync.lock().await;
+        fs::File::open(&self.path).await?.sync_all().await?;
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent).await?.sync_all().await
+    }
+
+    #[cfg(test)]
+    fn set_persist_barrier(&self, barrier: Option<Arc<tokio::sync::Barrier>>) {
+        *self.persist_barrier.lock().unwrap() = barrier;
+    }
+
+    #[cfg(test)]
+    fn persistence_peak(&self) -> usize {
+        self.persist_peak.load(Ordering::Acquire)
     }
 }
 
@@ -172,12 +391,8 @@ impl MetaStore for FileMetaStore {
         atime: Option<u64>,
         mtime: Option<u64>,
     ) -> Result<crate::fs_model::Inode> {
-        let attrs = self
-            .mem
-            .set_attrs(inode, mode, uid, gid, atime, mtime)
-            .await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(attrs)
+        self.mutate_and_persist(self.mem.set_attrs(inode, mode, uid, gid, atime, mtime))
+            .await
     }
 
     async fn read_slices(&self, inode: u64, chunk_idx: u32) -> Result<Vec<Slice>> {
@@ -197,17 +412,13 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {
-        let inode_id = self.mem.create(parent, name, mode).await?;
-        self.sync_to_disk()
+        self.mutate_and_persist(self.mem.create(parent, name, mode))
             .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(inode_id)
     }
 
     async fn symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64> {
-        let inode_id = self.mem.symlink(parent, name, target).await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(inode_id)
+        self.mutate_and_persist(self.mem.symlink(parent, name, target))
+            .await
     }
 
     async fn readlink(&self, inode: u64) -> Result<String> {
@@ -215,20 +426,13 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn append_slice(&self, inode: u64, slice: Slice) -> Result<()> {
-        let _guard = self.mutation_sync.lock().await;
-        self.mem.append_slice(inode, slice).await?;
-        self.sync_to_disk()
+        self.mutate_and_persist(self.mem.append_slice(inode, slice))
             .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(())
     }
 
     async fn truncate(&self, inode: u64, new_size: u64) -> Result<Vec<String>> {
-        let garbage = self.mem.truncate(inode, new_size).await?;
-        self.sync_to_disk()
+        self.mutate_and_persist(self.mem.truncate(inode, new_size))
             .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(garbage)
     }
 
     async fn readdir(&self, inode: u64) -> Result<Vec<crate::meta::DirectoryEntry>> {
@@ -236,17 +440,13 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<u64> {
-        let inode_id = self.mem.mkdir(parent, name, mode).await?;
-        self.sync_to_disk()
+        self.mutate_and_persist(self.mem.mkdir(parent, name, mode))
             .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(inode_id)
     }
 
     async fn link(&self, parent: u64, name: &str, inode: u64) -> Result<u32> {
-        let nlink = self.mem.link(parent, name, inode).await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(nlink)
+        self.mutate_and_persist(self.mem.link(parent, name, inode))
+            .await
     }
 
     async fn unlink(&self, parent: u64, name: &str) -> Result<Vec<String>> {
@@ -259,18 +459,16 @@ impl MetaStore for FileMetaStore {
         name: &str,
         defer_reclaim: bool,
     ) -> Result<Vec<String>> {
-        let garbage = self.mem
-            .unlink_with_lifecycle(parent, name, defer_reclaim).await?;
-        self.sync_to_disk()
-            .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(garbage)
+        self.mutate_and_persist(
+            self.mem
+                .unlink_with_lifecycle(parent, name, defer_reclaim),
+        )
+        .await
     }
 
     async fn finalize_orphan(&self, inode: u64) -> Result<Vec<String>> {
-        let garbage = self.mem.finalize_orphan(inode).await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(garbage)
+        self.mutate_and_persist(self.mem.finalize_orphan(inode))
+            .await
     }
 
     async fn rename(
@@ -280,11 +478,8 @@ impl MetaStore for FileMetaStore {
         new_parent: u64,
         new_name: &str,
     ) -> Result<Vec<String>> {
-        let garbage = self.mem.rename(old_parent, old_name, new_parent, new_name).await?;
-        self.sync_to_disk()
+        self.mutate_and_persist(self.mem.rename(old_parent, old_name, new_parent, new_name))
             .await
-            .map_err(|_| MetaError::Io)?;
-        Ok(garbage)
     }
 
     async fn rename_with_flags(
@@ -297,7 +492,8 @@ impl MetaStore for FileMetaStore {
     ) -> Result<Vec<String>> {
         self.rename_with_lifecycle(
             old_parent, old_name, new_parent, new_name, flags, false,
-        ).await
+        )
+        .await
     }
 
     async fn rename_with_lifecycle(
@@ -309,14 +505,12 @@ impl MetaStore for FileMetaStore {
         flags: u32,
         defer_reclaim: bool,
     ) -> Result<Vec<String>> {
-        let garbage = self
-            .mem
-            .rename_with_lifecycle(
+        self.mutate_and_persist(
+            self.mem.rename_with_lifecycle(
                 old_parent, old_name, new_parent, new_name, flags, defer_reclaim,
-            )
-            .await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)?;
-        Ok(garbage)
+            ),
+        )
+        .await
     }
 
     async fn pending_garbage(&self) -> Result<Vec<String>> {
@@ -324,8 +518,8 @@ impl MetaStore for FileMetaStore {
     }
 
     async fn acknowledge_garbage(&self, keys: &[String]) -> Result<()> {
-        self.mem.acknowledge_garbage(keys).await?;
-        self.sync_to_disk().await.map_err(|_| MetaError::Io)
+        self.mutate_and_persist(self.mem.acknowledge_garbage(keys))
+            .await
     }
 }
 
@@ -769,15 +963,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_json_falls_back_to_fresh_store() {
+    async fn step58_invalid_json_fails_closed() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("meta.json");
 
         fs::write(&path, b"{ invalid json }").await.unwrap();
 
-        let store = FileMetaStore::new(path).await.unwrap();
+        let error = FileMetaStore::new(path).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        println!("STEP58_FAILCLOSED_CORRUPT_PASS");
+    }
 
-        let root = store.getattr(ROOT_INODE).await.unwrap();
-        assert!(root.is_dir());
+    #[tokio::test]
+    async fn step58_half_commit_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        {
+            let store = FileMetaStore::new(path.clone()).await.unwrap();
+            store
+                .create(ROOT_INODE, "committed-before-half", 0o644)
+                .await
+                .unwrap();
+        }
+        fs::write(dir.path().join("meta.json.tmp.999"), b"partial")
+            .await
+            .unwrap();
+
+        let error = FileMetaStore::new(path).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        println!("STEP58_FAILCLOSED_HALF_COMMIT_PASS");
+    }
+
+    #[tokio::test]
+    async fn step58_different_inode_persistence_overlaps_and_recovers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let store = Arc::new(FileMetaStore::new(path.clone()).await.unwrap());
+        let first = store.create(ROOT_INODE, "parallel-meta-a", 0o644).await.unwrap();
+        let second = store.create(ROOT_INODE, "parallel-meta-b", 0o644).await.unwrap();
+        store.set_persist_barrier(Some(Arc::new(tokio::sync::Barrier::new(2))));
+
+        let first_slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 4096,
+            written_at: current_unix_time(),
+        };
+        let second_slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 8192,
+            written_at: current_unix_time(),
+        };
+        let first_task = {
+            let store = Arc::clone(&store);
+            let slice = first_slice.clone();
+            tokio::spawn(async move { store.append_slice(first, slice).await })
+        };
+        let second_task = {
+            let store = Arc::clone(&store);
+            let slice = second_slice.clone();
+            tokio::spawn(async move { store.append_slice(second, slice).await })
+        };
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+        store.set_persist_barrier(None);
+        assert!(store.persistence_peak() >= 2);
+        drop(store);
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        let restored_first = restored.read_slices(first, 0).await.unwrap();
+        let restored_second = restored.read_slices(second, 0).await.unwrap();
+        assert_eq!(restored_first.len(), 1);
+        assert_eq!(restored_first[0].slice_id, first_slice.slice_id);
+        assert_eq!(restored_second.len(), 1);
+        assert_eq!(restored_second[0].slice_id, second_slice.slice_id);
+        println!("STEP58_META_PARALLEL_UNIT_PASS peak=2");
+    }
+
+    #[tokio::test]
+    async fn step58_same_inode_mutations_remain_ordered_and_durable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let store = Arc::new(FileMetaStore::new(path.clone()).await.unwrap());
+        let inode = store.create(ROOT_INODE, "ordered-meta", 0o644).await.unwrap();
+        let first = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 4096,
+            written_at: 1,
+        };
+        let second = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 4096,
+            length: 4096,
+            written_at: 2,
+        };
+        let (left, right) = tokio::join!(
+            store.append_slice(inode, first.clone()),
+            store.append_slice(inode, second.clone())
+        );
+        left.unwrap();
+        right.unwrap();
+        drop(store);
+
+        let restored = FileMetaStore::new(path).await.unwrap();
+        let slices = restored.read_slices(inode, 0).await.unwrap();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].slice_id, first.slice_id);
+        assert_eq!(slices[1].slice_id, second.slice_id);
+        assert_eq!(restored.getattr(inode).await.unwrap().size, 8192);
+        println!("STEP58_META_SAME_INODE_ORDER_PASS");
+    }
+
+    #[tokio::test]
+    async fn step58_semantically_invalid_snapshot_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("meta.json");
+        let store = FileMetaStore::new(path.clone()).await.unwrap();
+        store.sync_persistence().await.unwrap();
+        drop(store);
+
+        let bytes = fs::read(&path).await.unwrap();
+        let mut snapshot: MetaSnapshot = serde_json::from_slice(&bytes).unwrap();
+        snapshot.next_inode_id = ROOT_INODE;
+        fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap())
+            .await
+            .unwrap();
+
+        let error = FileMetaStore::new(path).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        println!("STEP58_FAILCLOSED_SEMANTIC_PASS");
     }
 }

@@ -22,6 +22,11 @@ Step 57 的并行写回用例为 `tests/test-step57-write-parallel-vng.sh`，辅
 `tests/test-step57-write-parallel.c`；它验证不同 inode lane 峰值至少为 2、同 inode
 顺序、重启持久化以及小于 1 秒的卸载。
 
+Step 58 的挂载用例为 `tests/test-step58-meta-parallel-vng.sh`，复用 Step 57 helper，
+同时要求 write lane 与 FileMetaStore disk-prepare 峰值至少为 2，并验证同 inode 顺序、
+重启持久化和快速卸载。`tests/test-step58-failclosed.sh` 运行 daemon 单测门控，覆盖
+损坏/语义非法 JSON、遗留半提交 temp 与非法 write lane 的明确拒绝。
+
 ## 运行方式
 
 始终在**仓库根**调用（脚本会自行 `cd` 到根）：

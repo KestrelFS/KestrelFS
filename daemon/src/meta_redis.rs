@@ -2158,9 +2158,37 @@ mod tests {
             store.create(directory, "concurrent-left", 0o644),
             peer.create(directory, "concurrent-right", 0o644)
         );
-        assert_ne!(left.unwrap(), right.unwrap());
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_ne!(left, right);
         store.lookup(directory, "concurrent-left").await.unwrap();
         store.lookup(directory, "concurrent-right").await.unwrap();
+        let left_slice = Slice {
+            chunk_index: 0,
+            slice_id: Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 17,
+            written_at: 1,
+        };
+        let right_slice = Slice {
+            chunk_index: 0,
+            slice_id: Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 19,
+            written_at: 1,
+        };
+        let (left_append, right_append) = tokio::join!(
+            store.append_slice(left, left_slice.clone()),
+            peer.append_slice(right, right_slice.clone())
+        );
+        left_append.unwrap();
+        right_append.unwrap();
+        assert_eq!(peer.read_slices(left, 0).await.unwrap()[0].slice_id, left_slice.slice_id);
+        assert_eq!(
+            store.read_slices(right, 0).await.unwrap()[0].slice_id,
+            right_slice.slice_id
+        );
+        println!("STEP58_META_REDIS_CAS_CONCURRENT_PASS");
 
         let file = store.create(directory, "data", 0o2640).await.unwrap();
         assert_eq!(peer.getattr(file).await.unwrap().mode, S_IFREG | 0o2640);

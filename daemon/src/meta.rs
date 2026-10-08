@@ -2883,4 +2883,41 @@ mod tests {
         let err = store.rename(ROOT_INODE, "nonexistent", ROOT_INODE, "newname").await.unwrap_err();
         assert!(matches!(err, MetaError::NotFound));
     }
+
+    #[tokio::test]
+    async fn step58_memstore_concurrent_different_inode_mutations_are_isolated() {
+        let store = MemStore::new();
+        let first = store.create(ROOT_INODE, "mem-parallel-a", 0o644).await.unwrap();
+        let second = store.create(ROOT_INODE, "mem-parallel-b", 0o644).await.unwrap();
+        let first_slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 0,
+            length: 4096,
+            written_at: 1,
+        };
+        let second_slice = Slice {
+            chunk_index: 0,
+            slice_id: uuid::Uuid::new_v4(),
+            chunk_offset: 8192,
+            length: 4096,
+            written_at: 2,
+        };
+
+        let (left, right) = tokio::join!(
+            store.append_slice(first, first_slice.clone()),
+            store.append_slice(second, second_slice.clone())
+        );
+        left.unwrap();
+        right.unwrap();
+        let first_slices = store.read_slices(first, 0).await.unwrap();
+        let second_slices = store.read_slices(second, 0).await.unwrap();
+        assert_eq!(first_slices.len(), 1);
+        assert_eq!(first_slices[0].slice_id, first_slice.slice_id);
+        assert_eq!(second_slices.len(), 1);
+        assert_eq!(second_slices[0].slice_id, second_slice.slice_id);
+        assert_eq!(store.getattr(first).await.unwrap().size, 4096);
+        assert_eq!(store.getattr(second).await.unwrap().size, 12_288);
+        println!("STEP58_META_MEM_CONCURRENT_PASS");
+    }
 }

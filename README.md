@@ -18,7 +18,7 @@
 
 **高性能云原生分布式文件系统**：采用务实的 **C 内核模块 + Rust 用户态守护进程** 混合架构，目标在缓存命中路径上超越 JuiceFS。
 
-> ⚠️ **项目状态：早期开发（Step 57 WRITE-DATA-PARALLEL + DOC-SWEEP 已验收；IPC ABI v25；cache format v4）。**
+> ⚠️ **项目状态：早期开发（Step 58 META-MUTATION-PARALLEL + FAILCLOSED-TEST 已验收；IPC ABI v25；cache format v4）。**
 >
 > Phase 1–3 已完成。Phase 3 提供可用的控制面原型（动态 VFS、16 KiB bounce
 > 数据/名字 IPC、`FileMetaStore`、可选 Redis 元数据、`LocalFsObjectStore`、
@@ -68,7 +68,9 @@
 > 未完成持久交接时模块引用阻止正常 `rmmod`，重载后仍可继续 finalize→GC，并补齐
 > orphan retry 只读计数与现有 cache/coherence/write-pipe/session 观测说明。
 > Step 57 已验收实现以 8 条独立 16 KiB lane 让不同 inode 的 WRITE_DATA 重叠，
-> 同 inode 仍严格有序；生产级一致性 lease 尚未实现。详见[路线图](#路线图)、
+> 同 inode 仍严格有序。Step 58 已验收实现让 FileMetaStore 的 JSON/temp/fsync 阶段
+> 随不同 inode 重叠，并让损坏或半提交 metadata 启动时 fail closed；生产级一致性
+> lease 尚未实现。详见[路线图](#路线图)、
 > `HANDOFF.md` 与 `docs/remaining-capabilities.md`。
 
 ---
@@ -171,7 +173,7 @@ socket/Netlink 拷贝。跨语言结构在 `kestrelfs_ipc.h` 单一定义，供�
 | **1. 最小 C 内核 VFS 骨架** | 树外模块、VFS 注册、super/inode/file | ✅ 已完成 |
 | **2. C↔Rust IPC 桥** | `/dev/kestrel_ctl`、mmap 双 SPSC 环、poll/ioctl、Rust 消费端 | ✅ 已完成 |
 | **3. Rust 控制面** | MetaStore + ObjectStore、动态 VFS、bounce I/O、symlink、truncate、GC、本地持久化、可选 Redis/S3 原型（ABI v11 / Step 1–17） | ✅ 原型完成 |
-| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–57 已验收（ABI v25 / format v4）|
+| **4. 内核拥有的 NVMe 缓存** | 内核直访本地块设备；命中绕过 Rust daemon | 🚧 Step 29–58 已验收（ABI v25 / format v4）|
 
 步骤级进度、opcode 与已知限制见 `HANDOFF.md`；后续排期与 Codex 提示词见
 `docs/remaining-capabilities.md`。
@@ -196,7 +198,7 @@ KestrelFS/   # 本地目录历史上可能叫 FerroFS
 ├── tests/                         # ★ step/vng/门控脚本与 C helper
 │   ├── README.md                 # 测试布局与运行约定
 │   ├── _repo_root.sh             # 将 cwd 固定到仓库根
-│   └── test-stepNN-*.sh/.c       # 含 Step 15–57 回归与门控
+│   └── test-stepNN-*.sh/.c       # 含 Step 15–58 回归与门控
 └── daemon/                    # Rust 控制面 daemon
     └── src/{main,abi,meta,meta_persist,meta_redis,object_store,object_store_s3,orphan_retry,fs_model,device,ring,ioctl}.rs
 ```
@@ -497,6 +499,10 @@ Step 34 支持 create/mkdir mode 与
   dead-letter、容量上限或管理接口。
 - READ_DATA 与名字 IPC 仍由一把全局 mutex 串行化；Step 57 的 8 条写 lane
   允许不同 inode 的 WRITE_DATA 重叠，同 inode 由 per-inode mutex 保持提交顺序。
+- FileMetaStore 仍为全量 JSON 快照；Step 58 已验收路径只把短时 mutation+snapshot
+  排序与昂贵 JSON/temp/fsync 分开，让不同 inode 的磁盘准备重叠，最终 rename 仍短时
+  串行。损坏/语义非法 `meta.json` 或遗留 temp 会拒绝启动，不自动 reset；目前没有
+  增量 WAL、分片 metadata 文件或多进程 FileMetaStore 协调。
 - Step 31 已验收的 Redis 元数据为 v2 分记录 HASH/SET，点查不再全量读取；但
   mutation 为复用完整语义仍会一致读取各聚合 HASH 后计算字段 diff，readdir 和 GC
   引用确认也仍需聚合扫描。Step 53 已验收路径支持 `redis://` / `rediss://`、私有 CA、

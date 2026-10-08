@@ -9,7 +9,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef REGION_SIZE
 #define REGION_SIZE (2U * 1024U * 1024U)
+#endif
 
 struct worker {
 	const char *path;

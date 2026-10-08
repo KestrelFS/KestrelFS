@@ -1,5 +1,5 @@
 #!/bin/bash
-# Step 57: different-inode WRITE_DATA overlap with same-inode ordering.
+# Step 58: FileMetaStore disk preparation overlaps for different write inodes.
 # Run only inside a vng guest; cache_device is a guest loop device.
 set -euo pipefail
 # shellcheck source=_repo_root.sh
@@ -7,10 +7,10 @@ set -euo pipefail
 . "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_repo_root.sh"
 
 test_id=$$
-image=/tmp/kestrel-step57-$test_id.img
-mnt=/tmp/mnt-kestrelfs-step57-$test_id
-data_dir=/tmp/kestrelfs-step57-$test_id
-helper=/tmp/kestrel-step57-helper-$test_id
+image=/tmp/kestrel-step58-$test_id.img
+mnt=/tmp/mnt-kestrelfs-step58-$test_id
+data_dir=/tmp/kestrelfs-step58-$test_id
+helper=/tmp/kestrel-step58-helper-$test_id
 loopdev=
 daemon_pid=
 namespace=$(printf 'v1;meta=file:%s/meta.json;objects=local:%s' \
@@ -34,7 +34,7 @@ stop_daemon() {
 
 fail() {
 	local status=$?
-	echo "STEP57_FAIL: line=$1 status=$status"
+	echo "STEP58_FAIL: line=$1 status=$status"
 	test ! -f "$data_dir/daemon.log" || tail -n 180 "$data_dir/daemon.log"
 	dmesg | tail -n 160
 	exit "$status"
@@ -53,7 +53,7 @@ trap cleanup EXIT
 
 rm -rf "$data_dir" "$mnt"
 mkdir -p "$data_dir" "$mnt"
-cc -O2 -Wall -Wextra -Werror -std=gnu11 -pthread \
+cc -O2 -Wall -Wextra -Werror -std=gnu11 -pthread -DREGION_SIZE=524288U \
 	tests/test-step57-write-parallel.c -o "$helper"
 truncate -s 128M "$image"
 modprobe loop 2>/dev/null || true
@@ -69,21 +69,22 @@ start_daemon
 busybox mount -t kestrelfs none "$mnt"
 
 timeout 60 "$helper" exercise "$mnt"
-peak=$(cat /sys/module/kestrelfs/parameters/write_data_parallel_peak)
-active=$(cat /sys/module/kestrelfs/parameters/write_data_parallel_active)
-test "$peak" -ge 2
-test "$active" -eq 0
+lane_peak=$(cat /sys/module/kestrelfs/parameters/write_data_parallel_peak)
+lane_active=$(cat /sys/module/kestrelfs/parameters/write_data_parallel_active)
+test "$lane_peak" -ge 2
+test "$lane_active" -eq 0
+grep -Eq 'META-PERSIST parallel active=[2-8] peak=[2-8]' "$data_dir/daemon.log"
 grep -Eq 'WRITE-DATA-PARALLEL batch=[2-8]' "$data_dir/daemon.log"
-echo "STEP57_WRITE_PARALLEL_PEAK_PASS peak=$peak"
-echo STEP57_WRITE_PARALLEL_DATA_PASS
-echo STEP57_WRITE_PARALLEL_SAME_INODE_ORDER_PASS
+echo "STEP58_META_PARALLEL_OVERLAP_PASS lane_peak=$lane_peak"
+echo STEP58_META_PARALLEL_DATA_PASS
+echo STEP58_META_SAME_INODE_ORDER_PASS
 
 busybox umount "$mnt"
 stop_daemon
 start_daemon
 busybox mount -t kestrelfs none "$mnt"
-timeout 180 "$helper" verify "$mnt"
-echo STEP57_WRITE_PARALLEL_DURABILITY_PASS
+timeout 60 "$helper" verify "$mnt"
+echo STEP58_META_PARALLEL_DURABILITY_PASS
 
 rm "$mnt/parallel-a" "$mnt/parallel-b" "$mnt/ordered-shared"
 start_ns=$(date +%s%N)
@@ -99,10 +100,10 @@ loopdev=
 dmesg >"$data_dir/dmesg.log"
 if grep -E 'BUG:|KASAN:|use-after-free|general protection fault|hung task' \
 	"$data_dir/dmesg.log"; then
-	echo STEP57_FAIL_KERNEL_DIAGNOSTIC
+	echo STEP58_FAIL_KERNEL_DIAGNOSTIC
 	exit 1
 fi
 trap - EXIT
 rm -f "$image" "$helper"
-echo "STEP57_WRITE_PARALLEL: peak=$peak umount_ms=$umount_ms"
-echo STEP57_WRITE_PARALLEL_PASS
+echo "STEP58_META_PARALLEL: lane_peak=$lane_peak umount_ms=$umount_ms"
+echo STEP58_META_PARALLEL_PASS
